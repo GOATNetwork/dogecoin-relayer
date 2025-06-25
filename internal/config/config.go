@@ -8,13 +8,15 @@ import (
 )
 
 type Config struct {
-	Log    LogConfig    `yaml:"log"`
-	Sqlite SqliteConfig `yaml:"sqlite"`
-	Gorm   GormConfig   `yaml:"gorm"`
-	Doge   DogeConfig   `yaml:"doge"`
-	P2P    P2PConfig    `yaml:"p2p"`
-	Http   HttpConfig   `yaml:"http"`
-	Scan   ScanConfig   `yaml:"scan"`
+	Log       LogConfig       `yaml:"log"`
+	Sqlite    SqliteConfig    `yaml:"sqlite"`
+	Gorm      GormConfig      `yaml:"gorm"`
+	Doge      DogeConfig      `yaml:"doge"`
+	P2P       P2PConfig       `yaml:"p2p"`
+	Http      HttpConfig      `yaml:"http"`
+	Scan      ScanConfig      `yaml:"scan"`
+	Consensus ConsensusConfig `yaml:"consensus"`
+	Tss       TssConfig       `yaml:"tss"`
 }
 
 type LogConfig struct {
@@ -45,6 +47,10 @@ type P2PConfig struct {
 	EnableMDNS            bool     `yaml:"enable_mdns"`
 	ListenWaitSeconds     int      `yaml:"listen_wait_seconds"`
 	ConnectionWaitSeconds int      `yaml:"connection_wait_seconds"`
+	KeyDir                string   `yaml:"key_dir"`
+
+	// hex from environment variable: PROPOSER_PRIVATE_KEY
+	ProposerPrivateKey string
 }
 
 type HttpConfig struct {
@@ -61,6 +67,23 @@ type DogeConfig struct {
 	NetworkType   string `yaml:"network_type"`
 }
 
+type ConsensusConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	Rpc             string `yaml:"rpc"`
+	ChainId         uint64 `yaml:"chain_id"`
+	ContractBridge  string `yaml:"contract_bridge"`
+	ContractManager string `yaml:"contract_manager"`
+
+	// hex from environment variable: PROPOSER_PRIVATE_KEY
+	ProposerPrivateKey string
+}
+
+type TssConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Url     string `yaml:"url"`
+	Kdd     uint64 `yaml:"kdd"`
+}
+
 func LoadConfig(filePath string) (*Config, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -74,6 +97,15 @@ func LoadConfig(filePath string) (*Config, error) {
 	if err != nil {
 		log.Fatalf("Failed to decode config file: %v", err)
 	}
+
+	if os.Getenv("PROPOSER_PRIVATE_KEY") == "" {
+		log.Fatalf("PROPOSER_PRIVATE_KEY is not set")
+	}
+
+	// set private key from environment variable
+	config.P2P.ProposerPrivateKey = os.Getenv("PROPOSER_PRIVATE_KEY")
+	config.Consensus.ProposerPrivateKey = os.Getenv("PROPOSER_PRIVATE_KEY")
+
 	// set log level
 	logLevel, err := log.ParseLevel(config.Log.Level)
 	if err != nil {

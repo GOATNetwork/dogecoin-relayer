@@ -25,3 +25,9 @@ make build
 ```bash
 make docker-build-x
 ```
+
+## Required Environment Variables
+
+```bash
+PROPOSER_PRIVATE_KEY
+```
