@@ -1,4 +1,4 @@
-# Goat Bridge Assistant
+# Dogecoin Relayer
 
 *please read the config.yaml file to set the correct parameters*
 
