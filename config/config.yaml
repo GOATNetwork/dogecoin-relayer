@@ -1,0 +1,41 @@
+# config.yaml
+
+log:
+  level: "debug"
+
+sqlite:
+  folder: "/app/data"
+
+gorm:
+  log_level: "info"  # optional: silent, error, warn, info
+  max_idle_conns: 10
+  max_open_conns: 100
+  conn_max_lifetime: 3600  # unit: second
+
+p2p:
+  enabled: true
+  listenAddr: /ip4/0.0.0.0/tcp/4001
+  bootstrapPeers:
+    - /ip4/127.0.0.1/tcp/4001/p2p/QmS4ghgMgfFvqPjB4WKXHaN15ZyT4K4JY8Y8Y8Y8Y8
+    - /ip4/127.0.0.1/tcp/4001/p2p/QmS4ghgMgfFvqPjB4WKXHaN15ZyT4K4JY8Y8Y8Y8Y8
+  enableMDNS: true
+  listenWaitSeconds: 30
+  connectionWaitSeconds: 120
+
+http:
+  enabled: true
+  port: 8080
+
+doge:
+  rpc_url: "http://localhost:18443"
+  rpc_user: ""
+  rpc_password: ""
+  start_height: 0
+  confirmations: 1
+  network_type: "regtest"
+
+scan:
+  enabled: true
+  interval: 60  # unit: second
+  timeout: 30  # unit: second
+

@@ -1,0 +1,31 @@
+# Binaries for programs and plugins
+*.exe
+*.dll
+*.so
+*.dylib
+$(BINARY_NAME)
+bin/
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependencies
+vendor/
+Gopkg.lock
+Gopkg.toml
+
+# IDE specific settings
+.idea/
+.vscode/
+*.iml
+
+# Mac OS specific settings
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Application specific
+.env
+data/

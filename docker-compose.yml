@@ -1,0 +1,49 @@
+services:
+  dogecoin-relayer-01:
+    build: .
+    image: goat-network/dogecoin-relayer:latest
+    container_name: dogecoin-relayer-01
+    ports:
+      - "8181:8080"
+      - "4011:4001"
+    volumes:
+      - ./data/node-01/db:/app/data
+      - ./data/node-01/config.yaml:/app/config/config.yaml
+    networks:
+      goat-network:
+        ipv4_address: 192.168.15.11
+
+  dogecoin-relayer-02:
+    build: .
+    image: goat-network/dogecoin-relayer:latest
+    container_name: dogecoin-relayer-02
+    ports:
+      - "8182:8080"
+      - "4012:4001"
+    volumes:
+      - ./data/node-02:/app/data
+      - ./data/node-02/config.yaml:/app/config/config.yaml
+    networks:
+      goat-network:
+        ipv4_address: 192.168.15.12
+  
+  dogecoin-relayer-03:
+    build: .
+    image: goat-network/dogecoin-relayer:latest
+    container_name: dogecoin-relayer-03
+    ports:
+      - "8183:8080"
+      - "4013:4001"
+    volumes:
+      - ./data/node-03:/app/data
+      - ./data/node-03/config.yaml:/app/config/config.yaml
+    networks:
+      goat-network:
+        ipv4_address: 192.168.15.13
+
+networks:
+  goat-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.15.0/24
