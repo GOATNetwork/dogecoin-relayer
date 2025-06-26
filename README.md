@@ -1,9 +1,17 @@
-# Goat Bridge Assistant
+# Dogecoin Relayer
 
 *please read the config.yaml file to set the correct parameters*
 
 ## Chapter 1: Local Test Run
 
+* set .env file
+
+```bash
+GITHUB_TOKEN=your_github_token_here
+GOPRIVATE=github.com/goatnetwork/tss
+```
+
+* run the binary
 ```bash
 go run main.go -config ./data/config.yaml
 ```
@@ -24,4 +32,10 @@ make build
 
 ```bash
 make docker-build-x
+```
+
+## Required Environment Variables
+
+```bash
+PROPOSER_PRIVATE_KEY
 ```

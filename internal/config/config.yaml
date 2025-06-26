@@ -14,13 +14,14 @@ gorm:
 
 p2p:
   enabled: true
-  listenAddr: /ip4/0.0.0.0/tcp/4001
-  bootstrapPeers:
+  listen_addr: /ip4/0.0.0.0/tcp/4001
+  bootstrap_peers:
     - /ip4/127.0.0.1/tcp/4001/p2p/QmS4ghgMgfFvqPjB4WKXHaN15ZyT4K4JY8Y8Y8Y8Y8
     - /ip4/127.0.0.1/tcp/4001/p2p/QmS4ghgMgfFvqPjB4WKXHaN15ZyT4K4JY8Y8Y8Y8Y8
-  enableMDNS: true
-  listenWaitSeconds: 30
-  connectionWaitSeconds: 120
+  enable_mdns: true
+  listen_wait_seconds: 30
+  connection_wait_seconds: 120
+  key_dir: "/app/p2p"
 
 http:
   enabled: true
@@ -38,4 +39,17 @@ scan:
   enabled: true
   interval: 60  # unit: second
   timeout: 30  # unit: second
+  range: 1000
+  confirmations: 1
 
+consensus:
+  enabled: true
+  rpc: "https://testnet3.rpc.goat.network"
+  chain_id: 48816
+  contract_bridge: "0x0000000000000000000000000000000000000000"
+  contract_manager: "0x0000000000000000000000000000000000000000"
+
+tss:
+  enabled: true
+  url: "http://localhost:8080"
+  kdd: 10

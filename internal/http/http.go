@@ -3,7 +3,7 @@ package http
 import (
 	"context"
 
-	"github.com/goat-network/dogecoin-relayer/config"
+	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"

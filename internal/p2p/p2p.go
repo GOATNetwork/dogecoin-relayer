@@ -3,7 +3,7 @@ package p2p
 import (
 	"context"
 
-	"github.com/goat-network/dogecoin-relayer/config"
+	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
@@ -14,6 +14,8 @@ type P2PModule struct {
 	cfg    config.P2PConfig
 	conn   *models.DBConnection
 	logger *log.Entry
+
+	Network *Network
 }
 
 var _ module.Module = (*P2PModule)(nil)
@@ -32,7 +34,12 @@ func (m *P2PModule) Init(cfg any, conn *models.DBConnection) error {
 func (m *P2PModule) Run(ctx context.Context) error {
 	m.logger.Info("P2P module running")
 
-	// TODO: start p2p server
+	network, err := NewNetwork(ctx, m.cfg)
+	if err != nil {
+		return err
+	}
+	m.Network = network
+	go m.Network.Start()
 
 	return nil
 }

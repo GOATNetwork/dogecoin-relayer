@@ -1,7 +1,7 @@
 package models
 
 import (
-	"github.com/goat-network/dogecoin-relayer/config"
+	"github.com/goat-network/dogecoin-relayer/internal/config"
 	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )

@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/goat-network/dogecoin-relayer/config"
+	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/pkg/global"
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
@@ -18,6 +18,7 @@ import (
 	_ "github.com/goat-network/dogecoin-relayer/internal/http"
 	_ "github.com/goat-network/dogecoin-relayer/internal/p2p"
 	_ "github.com/goat-network/dogecoin-relayer/internal/scan"
+	_ "github.com/goat-network/dogecoin-relayer/internal/tss"
 )
 
 func Run() {
@@ -56,6 +57,9 @@ func Run() {
 	if cfg.Scan.Enabled {
 		enabledModules = append(enabledModules, "scan")
 	}
+	if cfg.Tss.Enabled {
+		enabledModules = append(enabledModules, "tss")
+	}
 
 	log.Infof("Enabled modules: %v", enabledModules)
 
@@ -75,15 +79,25 @@ func Run() {
 		switch moduleName {
 		case "scan":
 			moduleConfig = cfg.Scan
+		case "p2p":
+			moduleConfig = cfg.P2P
+		case "http":
+			moduleConfig = cfg.Http
+		case "consensus":
+			moduleConfig = cfg.Consensus
+		case "tss":
+			moduleConfig = cfg.Tss
+		default:
+			log.Fatalf("Module %s not found, skipping...", moduleName)
+			continue
 		}
 		if err := m.Init(moduleConfig, conn); err != nil {
-			log.Errorf("Failed to initialize module %s: %v", moduleName, err)
-			continue
+			log.Fatalf("Failed to initialize module %s: %v", moduleName, err)
 		}
 
 		go func(mod module.Module) {
 			if err := mod.Run(ctx); err != nil {
-				log.Errorf("Error running module %s: %v", mod.Name(), err)
+				log.Fatalf("Error running module %s: %v", mod.Name(), err)
 			}
 		}(m)
 	}
