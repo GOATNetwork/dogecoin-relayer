@@ -81,7 +81,7 @@ type ConsensusConfig struct {
 type TssConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Url     string `yaml:"url"`
-	Kdd     uint64 `yaml:"kdd"`
+	Kdd     uint32 `yaml:"kdd"`
 }
 
 func LoadConfig(filePath string) (*Config, error) {

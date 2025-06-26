@@ -18,6 +18,7 @@ import (
 	_ "github.com/goat-network/dogecoin-relayer/internal/http"
 	_ "github.com/goat-network/dogecoin-relayer/internal/p2p"
 	_ "github.com/goat-network/dogecoin-relayer/internal/scan"
+	_ "github.com/goat-network/dogecoin-relayer/internal/tss"
 )
 
 func Run() {
@@ -55,6 +56,9 @@ func Run() {
 	}
 	if cfg.Scan.Enabled {
 		enabledModules = append(enabledModules, "scan")
+	}
+	if cfg.Tss.Enabled {
+		enabledModules = append(enabledModules, "tss")
 	}
 
 	log.Infof("Enabled modules: %v", enabledModules)

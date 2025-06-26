@@ -4,6 +4,14 @@
 
 ## Chapter 1: Local Test Run
 
+* set .env file
+
+```bash
+GITHUB_TOKEN=your_github_token_here
+GOPRIVATE=github.com/goatnetwork/tss
+```
+
+* run the binary
 ```bash
 go run main.go -config ./data/config.yaml
 ```

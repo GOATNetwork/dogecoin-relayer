@@ -7,12 +7,27 @@ GOCLEAN=$(GOCMD) clean
 GOTEST=$(GOCMD) test
 GOGET=$(GOCMD) get
 BINARY_NAME=dogecoin-relayer
+GITHUB_TOKEN=$(shell grep ^GITHUB_TOKEN .env | cut -d '=' -f2)
+GOPRIVATE=$(shell grep ^GOPRIVATE .env | cut -d '=' -f2)
 
 # Build binary
 all: build
 
+tidy:
+	@if [ -z "$(GITHUB_TOKEN)" ]; then \
+		echo "❌  GITHUB_TOKEN is not set"; exit 1; \
+	fi
+	@echo "machine github.com login ${GITHUB_TOKEN} password x-oauth-basic" > ~/.netrc && chmod 600 ~/.netrc
+	GOPRIVATE=$(GOPRIVATE) $(GOCMD) mod tidy
+	rm -f ~/.netrc
+
 build:
-	$(GOBUILD) -o bin/$(BINARY_NAME) -v .
+	@if [ -z "$(GITHUB_TOKEN)" ]; then \
+		echo "❌  GITHUB_TOKEN is not set"; exit 1; \
+	fi
+	@echo "machine github.com login ${GITHUB_TOKEN} password x-oauth-basic" > ~/.netrc && chmod 600 ~/.netrc
+	GOPRIVATE=$(GOPRIVATE) $(GOBUILD) -o bin/$(BINARY_NAME) -v .
+	rm -f ~/.netrc
 
 clean:
 	$(GOCLEAN)
@@ -29,12 +44,21 @@ run:
 	$(GOBUILD) -o bin/$(BINARY_NAME) -v . && ./bin/$(BINARY_NAME) -config ./data/config.yaml
 
 docker-build-all:
-	docker buildx build --platform linux/amd64,linux/arm64 -t goat-network/dogecoin-relayer:latest --push .
+	@if [ -z "$(GITHUB_TOKEN)" ]; then \
+		echo "❌  GITHUB_TOKEN is not set"; exit 1; \
+	fi
+	docker buildx build --platform linux/amd64,linux/arm64 --build-arg GITHUB_TOKEN=$(GITHUB_TOKEN) -t goat-network/dogecoin-relayer:latest --push .
 
 docker-build:
-	docker buildx build --platform linux/amd64 -t goat-network/dogecoin-relayer:latest --load .
+	@if [ -z "$(GITHUB_TOKEN)" ]; then \
+		echo "❌  GITHUB_TOKEN is not set"; exit 1; \
+	fi
+	docker buildx build --platform linux/amd64 --build-arg GITHUB_TOKEN=$(GITHUB_TOKEN) -t goat-network/dogecoin-relayer:latest --load .
 
 docker-build-x:
-	docker buildx build --platform linux/arm64 -t goat-network/dogecoin-relayer:latest --no-cache --load .
+	@if [ -z "$(GITHUB_TOKEN)" ]; then \
+		echo "❌  GITHUB_TOKEN is not set"; exit 1; \
+	fi
+	docker buildx build --platform linux/arm64 --build-arg GITHUB_TOKEN=$(GITHUB_TOKEN) -t goat-network/dogecoin-relayer:latest --load .
 
-.PHONY: all build clean test deps run docker-build docker-build-all docker-build-x
+.PHONY: all tidy build clean test deps run docker-build docker-build-all docker-build-x

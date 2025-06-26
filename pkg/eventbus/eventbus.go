@@ -15,6 +15,10 @@ const (
 	EventNetworkHeartbeat        EventType = "network:heartbeat"
 	EventNetworkPeerConnected    EventType = "network:peer:connected"
 	EventNetworkPeerDisconnected EventType = "network:peer:disconnected"
+
+	// Tss events
+	EventTssSigRequest  EventType = "tss:sig:request"
+	EventTssSigResponse EventType = "tss:sig:response"
 )
 
 // Event represents an event with a payload
