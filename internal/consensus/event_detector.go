@@ -1,0 +1,328 @@
+package consensus
+
+import (
+	"context"
+	"fmt"
+	"math/big"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethclient"
+	log "github.com/sirupsen/logrus"
+)
+
+// EventConfig defines which events to monitor
+type EventConfig struct {
+	ContractAddress common.Address `json:"contract_address"`
+	EventName       string         `json:"event_name"`      // e.g., "Transfer"
+	EventSignature  string         `json:"event_signature"` // e.g., "Transfer(address,address,uint256)"
+	ABI             string         `json:"abi"`             // Contract ABI JSON
+	IsActive        bool           `json:"is_active"`
+}
+
+// DetectedEvent represents a processed blockchain event
+type DetectedEvent struct {
+	BlockNumber     uint64                 `json:"block_number"`
+	TxHash          common.Hash            `json:"tx_hash"`
+	LogIndex        uint                   `json:"log_index"`
+	ContractAddress common.Address         `json:"contract_address"`
+	EventName       string                 `json:"event_name"`
+	EventData       map[string]interface{} `json:"event_data"`
+	Timestamp       time.Time              `json:"timestamp"`
+}
+
+// EventDetector monitors blockchain events
+type EventDetector struct {
+	ctx                context.Context
+	cancel             context.CancelFunc
+	configs            []EventConfig
+	lastScannedBlock   uint64
+	confirmationBlocks uint64
+	batchSize          uint64
+	scanInterval       time.Duration
+
+	eventChannel chan DetectedEvent
+	mu           sync.RWMutex
+	isRunning    bool
+
+	logger *log.Entry
+}
+
+// EventDetectorOption allows customization of EventDetector
+type EventDetectorOption func(*EventDetector)
+
+// NewEventDetector creates a new event detector
+func NewEventDetector(configs []EventConfig, options ...EventDetectorOption) *EventDetector {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	detector := &EventDetector{
+		ctx:                ctx,
+		cancel:             cancel,
+		configs:            configs,
+		lastScannedBlock:   10000,
+		confirmationBlocks: 6,               // Default 6 confirmations
+		batchSize:          1000,            // Default batch size
+		scanInterval:       5 * time.Second, // Default 5 seconds
+		eventChannel:       make(chan DetectedEvent, 1000),
+		logger:             log.WithField("component", "EventDetector"),
+	}
+
+	// Apply options
+	for _, option := range options {
+		option(detector)
+	}
+
+	return detector
+}
+
+func SetLastScannedBlock(block uint64) EventDetectorOption {
+	return func(d *EventDetector) {
+		d.lastScannedBlock = block
+	}
+}
+
+// SetConfirmationBlocks sets the number of confirmation blocks
+func SetConfirmationBlocks(blocks uint64) EventDetectorOption {
+	return func(d *EventDetector) {
+		d.confirmationBlocks = blocks
+	}
+}
+
+// SetBatchSize sets the batch size for scanning
+func SetBatchSize(size uint64) EventDetectorOption {
+	return func(d *EventDetector) {
+		d.batchSize = size
+	}
+}
+
+// SetScanInterval sets the scanning interval
+func SetScanInterval(interval time.Duration) EventDetectorOption {
+	return func(d *EventDetector) {
+		d.scanInterval = interval
+	}
+}
+
+// Start begins the event detection process
+func (ed *EventDetector) Start() error {
+	ed.mu.Lock()
+	if ed.isRunning {
+		ed.mu.Unlock()
+		return fmt.Errorf("event detector is already running")
+	}
+	ed.isRunning = true
+	ed.mu.Unlock()
+
+	ed.logger.Info("Starting event detector")
+
+	// TODO: read last scanned block from DB
+
+	// Start scanning in a goroutine
+	go ed.scanLoop()
+
+	return nil
+}
+
+// Stop stops the event detection process
+func (ed *EventDetector) Stop() {
+	ed.mu.Lock()
+	defer ed.mu.Unlock()
+
+	if !ed.isRunning {
+		return
+	}
+
+	ed.logger.Info("Stopping event detector")
+	ed.cancel()
+	ed.isRunning = false
+	close(ed.eventChannel)
+}
+
+// EventChannel returns the channel for receiving detected events
+func (ed *EventDetector) EventChannel() <-chan DetectedEvent {
+	return ed.eventChannel
+}
+
+// scanLoop is the main scanning loop
+func (ed *EventDetector) scanLoop() {
+	ticker := time.NewTicker(ed.scanInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ed.ctx.Done():
+			ed.logger.Info("Event detector scan loop stopped")
+			return
+		case <-ticker.C:
+			if err := ed.scanForEvents(); err != nil {
+				ed.logger.Errorf("Error scanning for events: %v", err)
+			}
+		}
+	}
+}
+
+// scanForEvents scans for new events
+func (ed *EventDetector) scanForEvents() error {
+	client := GetEthClient()
+	if client == nil {
+		return fmt.Errorf("ethereum client not initialized")
+	}
+
+	// Get latest block
+	latestBlock, err := client.BlockNumber(ed.ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get latest block: %w", err)
+	}
+
+	// Apply confirmation blocks
+	confirmedBlock := latestBlock - ed.confirmationBlocks
+	if confirmedBlock <= ed.lastScannedBlock {
+		return nil // No new blocks to scan
+	}
+
+	// Calculate scan range
+	fromBlock := ed.lastScannedBlock + 1
+	toBlock := fromBlock + ed.batchSize - 1
+	if toBlock > confirmedBlock {
+		toBlock = confirmedBlock
+	}
+
+	ed.logger.Debugf("Scanning blocks %d to %d", fromBlock, toBlock)
+
+	// Scan each contract separately for better error handling
+	for _, config := range ed.configs {
+		if !config.IsActive {
+			continue
+		}
+
+		if err := ed.scanContractEvents(client, config, fromBlock, toBlock); err != nil {
+			ed.logger.Errorf("Failed to scan events for contract %s: %v", config.ContractAddress.Hex(), err)
+			// Continue with other contracts even if one fails
+		}
+	}
+
+	// Update last scanned block
+	ed.lastScannedBlock = toBlock
+
+	return nil
+}
+
+// scanContractEvents scans events for a specific contract
+func (ed *EventDetector) scanContractEvents(client *ethclient.Client, config EventConfig, fromBlock, toBlock uint64) error {
+	// Parse contract ABI
+	contractABI, err := abi.JSON(strings.NewReader(config.ABI))
+	if err != nil {
+		return fmt.Errorf("failed to parse ABI: %w", err)
+	}
+
+	// Get event from ABI
+	event, exists := contractABI.Events[config.EventName]
+	if !exists {
+		return fmt.Errorf("event %s not found in ABI", config.EventName)
+	}
+
+	// Create filter query
+	query := ethereum.FilterQuery{
+		FromBlock: big.NewInt(int64(fromBlock)),
+		ToBlock:   big.NewInt(int64(toBlock)),
+		Addresses: []common.Address{config.ContractAddress},
+		Topics:    [][]common.Hash{{event.ID}}, // Filter by event signature
+	}
+
+	// Get logs
+	logs, err := client.FilterLogs(ed.ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to filter logs: %w", err)
+	}
+
+	// Process each log
+	for _, vlog := range logs {
+		detectedEvent, err := ed.parseEvent(vlog, config, contractABI, event)
+		if err != nil {
+			ed.logger.Errorf("Failed to parse event: %v", err)
+			continue
+		}
+
+		// Send to channel (non-blocking)
+		select {
+		case ed.eventChannel <- *detectedEvent:
+		default:
+			ed.logger.Warn("Event channel is full, dropping event")
+		}
+	}
+
+	if len(logs) > 0 {
+		ed.logger.Infof("Detected %d events for contract %s in blocks %d-%d",
+			len(logs), config.ContractAddress.Hex(), fromBlock, toBlock)
+	}
+
+	return nil
+}
+
+// parseEvent parses a raw log into a DetectedEvent
+func (ed *EventDetector) parseEvent(vlog types.Log, config EventConfig, contractABI abi.ABI, event abi.Event) (*DetectedEvent, error) {
+	// Unpack event data
+	eventData := make(map[string]interface{})
+	err := contractABI.UnpackIntoMap(eventData, config.EventName, vlog.Data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unpack event data: %w", err)
+	}
+
+	// Add indexed parameters
+	for i, arg := range event.Inputs {
+		if arg.Indexed && i+1 < len(vlog.Topics) {
+			value, err := ed.parseTopicValue(vlog.Topics[i+1], arg.Type.String())
+			if err != nil {
+				ed.logger.Warnf("Failed to parse indexed parameter %s: %v", arg.Name, err)
+				continue
+			}
+			eventData[arg.Name] = value
+		}
+	}
+
+	return &DetectedEvent{
+		BlockNumber:     vlog.BlockNumber,
+		TxHash:          vlog.TxHash,
+		LogIndex:        vlog.Index,
+		ContractAddress: vlog.Address,
+		EventName:       config.EventName,
+		EventData:       eventData,
+		Timestamp:       time.Now(),
+	}, nil
+}
+
+// parseTopicValue parses a topic value based on its type
+func (ed *EventDetector) parseTopicValue(topic common.Hash, typeStr string) (interface{}, error) {
+	switch typeStr {
+	case "address":
+		return common.HexToAddress(topic.Hex()), nil
+	case "uint256":
+		return new(big.Int).SetBytes(topic.Bytes()), nil
+	case "bytes32":
+		return topic, nil
+	case "bool":
+		return topic.Big().Cmp(big.NewInt(0)) != 0, nil
+	default:
+		// For other types, return the raw topic
+		return topic, nil
+	}
+}
+
+// GetLastScannedBlock returns the last scanned block number
+func (ed *EventDetector) GetLastScannedBlock() uint64 {
+	ed.mu.RLock()
+	defer ed.mu.RUnlock()
+	return ed.lastScannedBlock
+}
+
+// UpdateConfigs updates the event configurations
+func (ed *EventDetector) UpdateConfigs(configs []EventConfig) {
+	ed.mu.Lock()
+	defer ed.mu.Unlock()
+	ed.configs = configs
+	ed.logger.Info("Event detector configurations updated")
+}

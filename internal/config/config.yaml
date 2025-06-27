@@ -7,10 +7,10 @@ sqlite:
   folder: "/app/data"
 
 gorm:
-  log_level: "info"  # optional: silent, error, warn, info
+  log_level: "info" # optional: silent, error, warn, info
   max_idle_conns: 10
   max_open_conns: 100
-  conn_max_lifetime: 3600  # unit: second
+  conn_max_lifetime: 3600 # unit: second
 
 p2p:
   enabled: true
@@ -37,8 +37,8 @@ doge:
 
 scan:
   enabled: true
-  interval: 60  # unit: second
-  timeout: 30  # unit: second
+  interval: 60 # unit: second
+  timeout: 30 # unit: second
   range: 1000
   confirmations: 1
 
@@ -48,6 +48,12 @@ consensus:
   chain_id: 48816
   contract_bridge: "0x0000000000000000000000000000000000000000"
   contract_manager: "0x0000000000000000000000000000000000000000"
+  event_detection:
+    enabled: true
+    last_scanned_block: 10000
+    confirmation_blocks: 2
+    batch_size: 1000
+    scan_interval_sec: 5
 
 tss:
   enabled: true
