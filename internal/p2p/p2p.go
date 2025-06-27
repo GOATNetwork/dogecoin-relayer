@@ -15,7 +15,7 @@ type P2PModule struct {
 	conn   *models.DBConnection
 	logger *log.Entry
 
-	Network *Network
+	network *Network
 }
 
 var _ module.Module = (*P2PModule)(nil)
@@ -38,8 +38,8 @@ func (m *P2PModule) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	m.Network = network
-	go m.Network.Start()
+	m.network = network
+	go m.network.Start()
 
 	return nil
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
 	"github.com/goat-network/dogecoin-relayer/pkg/global"
+	"github.com/goat-network/dogecoin-relayer/pkg/types"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -35,22 +36,10 @@ const (
 	LibP2PTopic  = "goat-dogecoin-relayer-protocol"
 )
 
-// MessageType defines the type of messages
-type MessageType string
-
-const (
-	// MessageTypeHeartbeat is for heartbeat messages
-	MessageTypeHeartbeat MessageType = "heartbeat"
-	// MessageTypeBridgeIn is for bridge in contract call messages
-	MessageTypeBridgeIn MessageType = "bridge-in"
-	// MessageTypeBridgeOut is for bridge out contract call messages
-	MessageTypeBridgeOut MessageType = "bridge-out"
-)
-
 // Message represents a P2P message
 type Message struct {
 	// Type is the message type
-	Type MessageType
+	Type types.P2PMessageType
 	// ID is a unique message ID
 	ID string
 	// SessionID is the ID of the session this message belongs to
@@ -74,7 +63,7 @@ type Network struct {
 	config   config.P2PConfig
 	host     host.Host
 	eventBus *eventbus.Bus
-	handlers map[MessageType]func(*Message) error
+	handlers map[types.P2PMessageType]func(*types.P2PBroadcastMessage) error
 	ps       *pubsub.PubSub
 	topic    *pubsub.Topic
 	ctx      context.Context
@@ -218,7 +207,7 @@ func NewNetwork(ctx context.Context, config config.P2PConfig) (*Network, error) 
 		config:   config,
 		host:     host,
 		eventBus: global.GetEventBus(),
-		handlers: make(map[MessageType]func(*Message) error),
+		handlers: make(map[types.P2PMessageType]func(*types.P2PBroadcastMessage) error),
 		ps:       ps,
 		topic:    topic,
 		ctx:      ctx,
@@ -306,7 +295,11 @@ func (n *Network) handlePubSubMessages() {
 
 		handler, exists := n.handlers[libp2pMsg.Type]
 		if exists {
-			if err := handler(&libp2pMsg); err != nil {
+			if err := handler(&types.P2PBroadcastMessage{
+				Type:      libp2pMsg.Type,
+				SessionID: libp2pMsg.SessionID,
+				Payload:   libp2pMsg.Payload,
+			}); err != nil {
 				log.Errorf("Error handling pubsub message: %v", err)
 			}
 		} else {
@@ -373,15 +366,19 @@ func (n *Network) GetEventBus() *eventbus.Bus {
 }
 
 // RegisterHandler registers a handler for a specific message type
-func (n *Network) RegisterHandler(msgType MessageType, handler func(*Message) error) {
+func (n *Network) RegisterHandler(msgType types.P2PMessageType, handler func(*types.P2PBroadcastMessage) error) error {
+	if _, ok := n.handlers[msgType]; ok {
+		return fmt.Errorf("handler already registered for message type: %s", msgType)
+	}
 	n.handlers[msgType] = handler
+	return nil
 }
 
 // SendMessage sends a message to a specific peer
-func (n *Network) SendMessage(to *peer.ID, msgType MessageType, sessionID string, payload []byte) error {
+func (n *Network) SendMessage(to *peer.ID, msgType types.P2PMessageType, sessionID string, payload []byte) error {
 	msg := &Message{
 		Type:      msgType,
-		ID:        "msg-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+		ID:        fmt.Sprintf("msg-%s-%d", msgType, time.Now().UnixNano()),
 		SessionID: sessionID,
 		From:      n.host.ID(),
 		To:        to,
@@ -392,7 +389,11 @@ func (n *Network) SendMessage(to *peer.ID, msgType MessageType, sessionID string
 	if *to == n.host.ID() {
 		go func() {
 			if handler, ok := n.handlers[msgType]; ok {
-				if err := handler(msg); err != nil {
+				if err := handler(&types.P2PBroadcastMessage{
+					Type:      msg.Type,
+					SessionID: msg.SessionID,
+					Payload:   msg.Payload,
+				}); err != nil {
 					log.Errorf("Error handling local message: %v", err)
 				}
 			} else {
@@ -426,10 +427,10 @@ func (n *Network) SendMessageToTopic(msgBytes []byte) error {
 	return nil
 }
 
-func (n *Network) BroadcastMessage(to *peer.ID, msgType MessageType, sessionID string, payload []byte) error {
+func (n *Network) BroadcastMessage(to *peer.ID, msgType types.P2PMessageType, sessionID string, payload []byte) error {
 	msg := &Message{
 		Type:      msgType,
-		ID:        "msg-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+		ID:        fmt.Sprintf("msg-%s-%d", msgType, time.Now().UnixNano()),
 		SessionID: sessionID,
 		From:      n.host.ID(),
 		To:        to,
@@ -491,7 +492,11 @@ func (n *Network) handleStream(s network.Stream) {
 
 	handler, exists := n.handlers[msg.Type]
 	if exists {
-		if err := handler(&msg); err != nil {
+		if err := handler(&types.P2PBroadcastMessage{
+			Type:      msg.Type,
+			SessionID: msg.SessionID,
+			Payload:   msg.Payload,
+		}); err != nil {
 			log.Errorf("Error handling message: %s", err)
 		}
 	} else {
