@@ -74,8 +74,19 @@ type ConsensusConfig struct {
 	ContractBridge  string `yaml:"contract_bridge"`
 	ContractManager string `yaml:"contract_manager"`
 
+	// Event detection configuration
+	EventDetection EventDetectionConfig `yaml:"event_detection"`
+
 	// hex from environment variable: PROPOSER_PRIVATE_KEY
 	ProposerPrivateKey string
+}
+
+type EventDetectionConfig struct {
+	Enabled            bool `yaml:"enabled"`
+	LastScannedBlock   int  `yaml:"last_scanned_block"`
+	ConfirmationBlocks int  `yaml:"confirmation_blocks"`
+	BatchSize          int  `yaml:"batch_size"`
+	ScanIntervalSec    int  `yaml:"scan_interval_sec"`
 }
 
 type TssConfig struct {
