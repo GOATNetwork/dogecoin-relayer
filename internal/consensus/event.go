@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/goat-network/dogecoin-relayer/internal/config"
@@ -52,6 +51,11 @@ func (m *EventManager) Run(ctx context.Context) error {
 		"scan_interval_sec":   m.cfg.ScanIntervalSec,
 	}).Info("Event manager configuration loaded")
 
+	if err := m.StartMonitoring(); err != nil {
+		m.logger.Errorf("Failed to start event monitoring: %v", err)
+		return err
+	}
+
 	return nil
 }
 
@@ -64,15 +68,19 @@ func (m *EventManager) Shutdown(ctx context.Context) error {
 }
 
 // StartMonitoring starts monitoring consensus-related events
-func (m *EventManager) StartMonitoring(contractAddress common.Address) error {
+func (m *EventManager) StartMonitoring() error {
 	// Check if event detection is enabled
 	if !m.cfg.Enabled {
 		m.logger.Info("Event detection is disabled in configuration")
 		return nil
 	}
 
-	// Create event configurations for a hypothetical consensus contract
-	configs := m.createEventConfigs(contractAddress)
+	// Create event configurations using contract utilities
+	configs, err := CreateRequiredEventConfigs(m.cfg.AbiPath)
+	if err != nil {
+		m.logger.Errorf("Failed to create event config from ABI: %v", err)
+		return err
+	}
 
 	// Create event handler with configuration values
 	m.handler = NewEventHandler(configs,
@@ -91,7 +99,7 @@ func (m *EventManager) StartMonitoring(contractAddress common.Address) error {
 	}
 
 	m.logger.WithFields(log.Fields{
-		"contract":            contractAddress.Hex(),
+		"contract":            m.cfg.ContractAddress,
 		"confirmation_blocks": m.cfg.ConfirmationBlocks,
 		"batch_size":          m.cfg.BatchSize,
 		"scan_interval_sec":   m.cfg.ScanIntervalSec,
@@ -119,33 +127,6 @@ func (m *EventManager) GetMonitoringStatus() map[string]interface{} {
 	return map[string]interface{}{
 		"status":             "running",
 		"last_scanned_block": m.handler.GetLastScannedBlock(),
-	}
-}
-
-// createEventConfigs creates event configurations for consensus contract
-func (m *EventManager) createEventConfigs(contractAddress common.Address) []EventConfig {
-	// Example ABI for a hypothetical consensus contract
-	consensusABI := `[
-		{
-			"anonymous": false,
-			"inputs": [
-				{"indexed": false, "name": "epoch", "type": "uint256"},
-				{"indexed": false, "name": "blockHash", "type": "bytes32"},
-				{"indexed": false, "name": "timestamp", "type": "uint256"}
-			],
-			"name": "ConsensusUpdate",
-			"type": "event"
-		}
-	]`
-
-	return []EventConfig{
-		{
-			ContractAddress: contractAddress,
-			EventName:       "ConsensusUpdate",
-			EventSignature:  "ConsensusUpdate(uint256,bytes32,uint256)",
-			ABI:             consensusABI,
-			IsActive:        true,
-		},
 	}
 }
 

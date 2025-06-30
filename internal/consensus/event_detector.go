@@ -14,6 +14,8 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/goat-network/dogecoin-relayer/pkg/contract"
 )
 
 // EventConfig defines which events to monitor
@@ -105,6 +107,56 @@ func SetScanInterval(interval time.Duration) EventDetectorOption {
 	return func(d *EventDetector) {
 		d.scanInterval = interval
 	}
+}
+
+// CreateRequiredEventConfigs creates EventConfig using contract utilities for multiple addresses and events
+func CreateRequiredEventConfigs(abiFilePath string) ([]EventConfig, error) {
+	// TODO: add actual addresses and events here
+	return CreateEventConfig(abiFilePath, []common.Address{common.HexToAddress("0x0000000000000000000000000000000000000000")}, []string{"bridgeIn"})
+}
+
+// CreateEventConfig creates EventConfig using contract utilities for multiple addresses and events
+func CreateEventConfig(abiFilePath string, contractAddresses []common.Address, eventNames []string) ([]EventConfig, error) {
+	// Use the contract package to load ABI and raw data in one read
+	parsedABI, rawAbiData, err := contract.LoadABIAndRawDataFromFile(abiFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load ABI from %s: %w", abiFilePath, err)
+	}
+
+	// Validate all event names exist in ABI before creating configs
+	eventSignatures := make(map[string]string)
+	for _, eventName := range eventNames {
+		event, exists := parsedABI.Events[eventName]
+		if !exists {
+			return nil, fmt.Errorf("event %s not found in ABI", eventName)
+		}
+		eventSignatures[eventName] = generateEventSignature(event)
+	}
+
+	// Generate configs for all combinations of addresses and events
+	var configs []EventConfig
+	for _, contractAddress := range contractAddresses {
+		for _, eventName := range eventNames {
+			configs = append(configs, EventConfig{
+				ContractAddress: contractAddress,
+				EventName:       eventName,
+				EventSignature:  eventSignatures[eventName],
+				ABI:             rawAbiData,
+				IsActive:        true,
+			})
+		}
+	}
+
+	return configs, nil
+}
+
+// generateEventSignature generates event signature from ABI event
+func generateEventSignature(event abi.Event) string {
+	var inputs []string
+	for _, input := range event.Inputs {
+		inputs = append(inputs, input.Type.String())
+	}
+	return fmt.Sprintf("%s(%s)", event.Name, strings.Join(inputs, ","))
 }
 
 // Start begins the event detection process

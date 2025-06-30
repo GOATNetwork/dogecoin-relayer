@@ -1,7 +1,9 @@
 package contract
 
 import (
+	"fmt"
 	"math/big"
+	"os"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -10,11 +12,45 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
-// NewErc20 creates a new instance of an ERC20 token contract
-func NewEntryPoint(address common.Address, backend bind.ContractBackend) (*Contract, error) {
-	parsedABI, err := abi.JSON(strings.NewReader(entryPointABI))
+// LoadABIFromFile loads ABI from a JSON file
+func LoadABIFromFile(abiFilePath string) (abi.ABI, error) {
+	// Read the ABI file
+	abiData, err := os.ReadFile(abiFilePath)
 	if err != nil {
-		return nil, err
+		return abi.ABI{}, fmt.Errorf("failed to read ABI file %s: %w", abiFilePath, err)
+	}
+
+	// Parse the ABI
+	parsedABI, err := abi.JSON(strings.NewReader(string(abiData)))
+	if err != nil {
+		return abi.ABI{}, fmt.Errorf("failed to parse ABI from file %s: %w", abiFilePath, err)
+	}
+
+	return parsedABI, nil
+}
+
+// LoadABIAndRawDataFromFile loads ABI and returns both parsed ABI and raw JSON string
+func LoadABIAndRawDataFromFile(abiFilePath string) (abi.ABI, string, error) {
+	// Read the ABI file once
+	abiData, err := os.ReadFile(abiFilePath)
+	if err != nil {
+		return abi.ABI{}, "", fmt.Errorf("failed to read ABI file %s: %w", abiFilePath, err)
+	}
+
+	// Parse the ABI
+	parsedABI, err := abi.JSON(strings.NewReader(string(abiData)))
+	if err != nil {
+		return abi.ABI{}, "", fmt.Errorf("failed to parse ABI from file %s: %w", abiFilePath, err)
+	}
+
+	return parsedABI, string(abiData), nil
+}
+
+// NewEntryPoint creates a new instance of an EntryPoint contract
+func NewEntryPoint(address common.Address, backend bind.ContractBackend, abiFilePath string) (*Contract, error) {
+	parsedABI, err := LoadABIFromFile(abiFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load ABI for EntryPoint contract: %w", err)
 	}
 
 	contract := bind.NewBoundContract(address, parsedABI, backend, backend, backend)
@@ -22,6 +58,17 @@ func NewEntryPoint(address common.Address, backend bind.ContractBackend) (*Contr
 	return &Contract{
 		address:  address,
 		abi:      parsedABI,
+		contract: contract,
+	}, nil
+}
+
+// NewEntryPointWithABI creates a new instance of an EntryPoint contract with provided ABI
+func NewEntryPointWithABI(address common.Address, backend bind.ContractBackend, contractABI abi.ABI) (*Contract, error) {
+	contract := bind.NewBoundContract(address, contractABI, backend, backend, backend)
+
+	return &Contract{
+		address:  address,
+		abi:      contractABI,
 		contract: contract,
 	}, nil
 }
@@ -54,35 +101,3 @@ func CreateVerifyAndCallHash(targets []common.Address, calldata [][]byte, tssNon
 }
 
 // TODO: Implement the other functions
-
-const entryPointABI = `[
-    {
-      "type": "function",
-      "name": "verifyAndCall",
-      "inputs": [
-        {
-          "name": "_targets",
-          "type": "address[]",
-          "internalType": "address[]"
-        },
-        {
-          "name": "_calldata",
-          "type": "bytes[]",
-          "internalType": "bytes[]"
-        },
-        {
-          "name": "_signature",
-          "type": "bytes",
-          "internalType": "bytes"
-        }
-      ],
-      "outputs": [
-        {
-          "name": "res",
-          "type": "bool[]",
-          "internalType": "bool[]"
-        }
-      ],
-      "stateMutability": "nonpayable"
-    }
-  ]`
