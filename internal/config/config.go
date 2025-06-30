@@ -68,11 +68,9 @@ type DogeConfig struct {
 }
 
 type ConsensusConfig struct {
-	Enabled            bool   `yaml:"enabled"`
-	Rpc                string `yaml:"rpc"`
-	ChainId            uint64 `yaml:"chain_id"`
-	ContractBridge     string `yaml:"contract_bridge"`
-	ContractEntryPoint string `yaml:"contract_entry_point"`
+	Enabled bool   `yaml:"enabled"`
+	Rpc     string `yaml:"rpc"`
+	ChainId uint64 `yaml:"chain_id"`
 
 	// Event detection configuration
 	EventDetection EventDetectionConfig `yaml:"event_detection"`
@@ -83,6 +81,8 @@ type ConsensusConfig struct {
 
 type EventDetectionConfig struct {
 	Enabled            bool   `yaml:"enabled"`
+	ContractBridge     string `yaml:"contract_bridge"`
+	ContractEntryPoint string `yaml:"contract_entry_point"`
 	AbiPath            string `yaml:"abi_path"`
 	LastScannedBlock   int    `yaml:"last_scanned_block"`
 	ConfirmationBlocks int    `yaml:"confirmation_blocks"`

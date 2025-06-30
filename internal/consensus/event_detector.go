@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/pkg/contract"
 )
 
@@ -23,7 +24,6 @@ type EventConfig struct {
 	ContractAddress common.Address `json:"contract_address"`
 	EventName       string         `json:"event_name"`      // e.g., "Transfer"
 	EventSignature  string         `json:"event_signature"` // e.g., "Transfer(address,address,uint256)"
-	ABI             string         `json:"abi"`             // Contract ABI JSON
 	IsActive        bool           `json:"is_active"`
 }
 
@@ -43,6 +43,8 @@ type EventDetector struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	configs            []EventConfig
+	ABI                string // Contract ABI JSON
+	client             *ethclient.Client
 	lastScannedBlock   uint64
 	confirmationBlocks uint64
 	batchSize          uint64
@@ -59,13 +61,15 @@ type EventDetector struct {
 type EventDetectorOption func(*EventDetector)
 
 // NewEventDetector creates a new event detector
-func NewEventDetector(configs []EventConfig, options ...EventDetectorOption) *EventDetector {
+func NewEventDetector(rawAbiData string, configs []EventConfig, options ...EventDetectorOption) *EventDetector {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	detector := &EventDetector{
 		ctx:                ctx,
 		cancel:             cancel,
 		configs:            configs,
+		ABI:                rawAbiData,
+		client:             GetEthClient(),
 		lastScannedBlock:   10000,
 		confirmationBlocks: 6,               // Default 6 confirmations
 		batchSize:          1000,            // Default batch size
@@ -110,17 +114,30 @@ func SetScanInterval(interval time.Duration) EventDetectorOption {
 }
 
 // CreateRequiredEventConfigs creates EventConfig using contract utilities for multiple addresses and events
-func CreateRequiredEventConfigs(abiFilePath string) ([]EventConfig, error) {
-	// TODO: add actual addresses and events here
-	return CreateEventConfig(abiFilePath, []common.Address{common.HexToAddress("0x0000000000000000000000000000000000000000")}, []string{"bridgeIn"})
+func CreateRequiredEventConfigs(cfg config.EventDetectionConfig, abiFilePath string) (string, []EventConfig, error) {
+	var contractAddresses []common.Address
+	var eventNames []string
+	contractAddresses = append(contractAddresses, common.HexToAddress(cfg.ContractBridge))
+	eventNames = append(eventNames, "BridgeIn")
+	contractAddresses = append(contractAddresses, common.HexToAddress(cfg.ContractBridge))
+	eventNames = append(eventNames, "BridgeOutProposed")
+	contractAddresses = append(contractAddresses, common.HexToAddress(cfg.ContractBridge))
+	eventNames = append(eventNames, "BridgeOutFinished")
+	contractAddresses = append(contractAddresses, common.HexToAddress(cfg.ContractEntryPoint))
+	eventNames = append(eventNames, "SubmitterChosen")
+	rawAbiData, configs, err := CreateEventConfig(abiFilePath, contractAddresses, eventNames)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create event config: %w", err)
+	}
+	return rawAbiData, configs, nil
 }
 
 // CreateEventConfig creates EventConfig using contract utilities for multiple addresses and events
-func CreateEventConfig(abiFilePath string, contractAddresses []common.Address, eventNames []string) ([]EventConfig, error) {
+func CreateEventConfig(abiFilePath string, contractAddresses []common.Address, eventNames []string) (string, []EventConfig, error) {
 	// Use the contract package to load ABI and raw data in one read
 	parsedABI, rawAbiData, err := contract.LoadABIAndRawDataFromFile(abiFilePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load ABI from %s: %w", abiFilePath, err)
+		return "", nil, fmt.Errorf("failed to load ABI from %s: %w", abiFilePath, err)
 	}
 
 	// Validate all event names exist in ABI before creating configs
@@ -128,7 +145,7 @@ func CreateEventConfig(abiFilePath string, contractAddresses []common.Address, e
 	for _, eventName := range eventNames {
 		event, exists := parsedABI.Events[eventName]
 		if !exists {
-			return nil, fmt.Errorf("event %s not found in ABI", eventName)
+			return "", nil, fmt.Errorf("event %s not found in ABI", eventName)
 		}
 		eventSignatures[eventName] = generateEventSignature(event)
 	}
@@ -141,13 +158,12 @@ func CreateEventConfig(abiFilePath string, contractAddresses []common.Address, e
 				ContractAddress: contractAddress,
 				EventName:       eventName,
 				EventSignature:  eventSignatures[eventName],
-				ABI:             rawAbiData,
 				IsActive:        true,
 			})
 		}
 	}
 
-	return configs, nil
+	return rawAbiData, configs, nil
 }
 
 // generateEventSignature generates event signature from ABI event
@@ -219,13 +235,8 @@ func (ed *EventDetector) scanLoop() {
 
 // scanForEvents scans for new events
 func (ed *EventDetector) scanForEvents() error {
-	client := GetEthClient()
-	if client == nil {
-		return fmt.Errorf("ethereum client not initialized")
-	}
-
 	// Get latest block
-	latestBlock, err := client.BlockNumber(ed.ctx)
+	latestBlock, err := ed.client.BlockNumber(ed.ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get latest block: %w", err)
 	}
@@ -251,7 +262,7 @@ func (ed *EventDetector) scanForEvents() error {
 			continue
 		}
 
-		if err := ed.scanContractEvents(client, config, fromBlock, toBlock); err != nil {
+		if err := ed.scanContractEvents(config, fromBlock, toBlock); err != nil {
 			ed.logger.Errorf("Failed to scan events for contract %s: %v", config.ContractAddress.Hex(), err)
 			// Continue with other contracts even if one fails
 		}
@@ -264,7 +275,7 @@ func (ed *EventDetector) scanForEvents() error {
 }
 
 // scanContractEvents scans events for a specific contract
-func (ed *EventDetector) scanContractEvents(client *ethclient.Client, config EventConfig, fromBlock, toBlock uint64) error {
+func (ed *EventDetector) scanContractEvents(config EventConfig, fromBlock, toBlock uint64) error {
 	// Parse contract ABI
 	contractABI, err := abi.JSON(strings.NewReader(config.ABI))
 	if err != nil {
@@ -286,7 +297,7 @@ func (ed *EventDetector) scanContractEvents(client *ethclient.Client, config Eve
 	}
 
 	// Get logs
-	logs, err := client.FilterLogs(ed.ctx, query)
+	logs, err := ed.client.FilterLogs(ed.ctx, query)
 	if err != nil {
 		return fmt.Errorf("failed to filter logs: %w", err)
 	}

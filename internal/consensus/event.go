@@ -15,10 +15,12 @@ import (
 
 // EventManager manages consensus-related events
 type EventManager struct {
-	cfg     config.EventDetectionConfig
-	conn    *models.DBConnection
-	logger  *log.Entry
-	handler *EventHandler
+	cfg    config.EventDetectionConfig
+	conn   *models.DBConnection
+	logger *log.Entry
+
+	detector *EventDetector
+	handler  *EventHandler
 }
 
 var _ module.Module = (*EventManager)(nil)
@@ -61,8 +63,8 @@ func (m *EventManager) Run(ctx context.Context) error {
 
 func (m *EventManager) Shutdown(ctx context.Context) error {
 	m.logger.Info("Event manager module shutting down")
-	if m.handler != nil {
-		m.handler.Stop()
+	if m.detector != nil {
+		m.detector.Stop()
 	}
 	return nil
 }
@@ -76,33 +78,40 @@ func (m *EventManager) StartMonitoring() error {
 	}
 
 	// Create event configurations using contract utilities
-	configs, err := CreateRequiredEventConfigs(m.cfg.AbiPath)
+	rawAbiData, configs, err := CreateRequiredEventConfigs(m.cfg, m.cfg.AbiPath)
 	if err != nil {
 		m.logger.Errorf("Failed to create event config from ABI: %v", err)
 		return err
 	}
 
-	// Create event handler with configuration values
-	m.handler = NewEventHandler(configs,
-		SetLastScannedBlock(uint64(m.cfg.LastScannedBlock)),
+	// Create event detector with configuration values
+	m.detector = NewEventDetector(rawAbiData, configs, SetLastScannedBlock(uint64(m.cfg.LastScannedBlock)),
 		SetConfirmationBlocks(uint64(m.cfg.ConfirmationBlocks)),
 		SetBatchSize(uint64(m.cfg.BatchSize)),
-		SetScanInterval(time.Duration(m.cfg.ScanIntervalSec)*time.Second),
-	)
+		SetScanInterval(time.Duration(m.cfg.ScanIntervalSec)*time.Second))
+
+	// Create event handler
+	m.handler = NewEventHandler()
 
 	// Register processors
 	m.handler.RegisterProcessor(NewGenericEventProcessor("ConsensusUpdate"))
 
-	// Start the handler
-	if err := m.handler.Start(); err != nil {
-		return fmt.Errorf("failed to start consensus event handler: %w", err)
+	// Start the detector first
+	if err := m.detector.Start(); err != nil {
+		return fmt.Errorf("failed to start event detector: %w", err)
+	}
+
+	// Start the handler with the detector's event channel
+	if err := m.handler.Start(m.detector.EventChannel()); err != nil {
+		return fmt.Errorf("failed to start event handler: %w", err)
 	}
 
 	m.logger.WithFields(log.Fields{
-		"contract":            m.cfg.ContractAddress,
-		"confirmation_blocks": m.cfg.ConfirmationBlocks,
-		"batch_size":          m.cfg.BatchSize,
-		"scan_interval_sec":   m.cfg.ScanIntervalSec,
+		"contract_bridge":      m.cfg.ContractBridge,
+		"contract_entry_point": m.cfg.ContractEntryPoint,
+		"confirmation_blocks":  m.cfg.ConfirmationBlocks,
+		"batch_size":           m.cfg.BatchSize,
+		"scan_interval_sec":    m.cfg.ScanIntervalSec,
 	}).Info("Started monitoring consensus events")
 
 	return nil
@@ -110,15 +119,15 @@ func (m *EventManager) StartMonitoring() error {
 
 // StopMonitoring stops event monitoring
 func (m *EventManager) StopMonitoring() {
-	if m.handler != nil {
-		m.handler.Stop()
+	if m.detector != nil {
+		m.detector.Stop()
 	}
 	m.logger.Info("Stopped monitoring consensus events")
 }
 
 // GetMonitoringStatus returns the current monitoring status
 func (m *EventManager) GetMonitoringStatus() map[string]interface{} {
-	if m.handler == nil {
+	if m.detector == nil {
 		return map[string]interface{}{
 			"status": "stopped",
 		}
@@ -126,7 +135,7 @@ func (m *EventManager) GetMonitoringStatus() map[string]interface{} {
 
 	return map[string]interface{}{
 		"status":             "running",
-		"last_scanned_block": m.handler.GetLastScannedBlock(),
+		"last_scanned_block": m.detector.GetLastScannedBlock(),
 	}
 }
 

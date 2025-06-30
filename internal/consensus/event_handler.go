@@ -4,13 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/ethereum/go-ethereum/common"
 	log "github.com/sirupsen/logrus"
 )
 
 // EventHandler manages event detection and processing
 type EventHandler struct {
-	detector   *EventDetector
 	processors map[string]EventProcessor
 	logger     *log.Entry
 }
@@ -22,43 +20,25 @@ type EventProcessor interface {
 }
 
 // NewEventHandler creates a new event handler
-func NewEventHandler(configs []EventConfig, options ...EventDetectorOption) *EventHandler {
+func NewEventHandler() *EventHandler {
 	return &EventHandler{
-		detector:   NewEventDetector(configs, options...),
 		processors: make(map[string]EventProcessor),
 		logger:     log.WithField("component", "EventHandler"),
 	}
 }
 
-// RegisterProcessor registers an event processor for a specific event type
-func (eh *EventHandler) RegisterProcessor(processor EventProcessor) {
-	eh.processors[processor.GetEventName()] = processor
-	eh.logger.Infof("Registered processor for event: %s", processor.GetEventName())
-}
-
-// Start begins event detection and processing
-func (eh *EventHandler) Start() error {
-	// Start the detector
-	if err := eh.detector.Start(); err != nil {
-		return fmt.Errorf("failed to start event detector: %w", err)
-	}
-
+// Start begins event processing with the provided event channel
+func (eh *EventHandler) Start(eventChannel <-chan DetectedEvent) error {
 	// Start processing events
-	go eh.processEvents()
+	go eh.processEvents(eventChannel)
 
 	eh.logger.Info("Event handler started")
 	return nil
 }
 
-// Stop stops event detection and processing
-func (eh *EventHandler) Stop() {
-	eh.detector.Stop()
-	eh.logger.Info("Event handler stopped")
-}
-
-// processEvents processes detected events
-func (eh *EventHandler) processEvents() {
-	for event := range eh.detector.EventChannel() {
+// processEvents processes detected events from the provided channel
+func (eh *EventHandler) processEvents(eventChannel <-chan DetectedEvent) {
+	for event := range eventChannel {
 		if processor, exists := eh.processors[event.EventName]; exists {
 			if err := processor.ProcessEvent(event); err != nil {
 				eh.logger.Errorf("Failed to process event %s: %v", event.EventName, err)
@@ -69,14 +49,10 @@ func (eh *EventHandler) processEvents() {
 	}
 }
 
-// GetLastScannedBlock returns the last scanned block
-func (eh *EventHandler) GetLastScannedBlock() uint64 {
-	return eh.detector.GetLastScannedBlock()
-}
-
-// UpdateConfigs updates the event configurations
-func (eh *EventHandler) UpdateConfigs(configs []EventConfig) {
-	eh.detector.UpdateConfigs(configs)
+// RegisterProcessor registers an event processor for a specific event type
+func (eh *EventHandler) RegisterProcessor(processor EventProcessor) {
+	eh.processors[processor.GetEventName()] = processor
+	eh.logger.Infof("Registered processor for event: %s", processor.GetEventName())
 }
 
 // GenericEventProcessor processes any event and logs the data
@@ -113,17 +89,4 @@ func (p *GenericEventProcessor) ProcessEvent(event DetectedEvent) error {
 	// TODO: save event to DB
 
 	return nil
-}
-
-// Helper functions for creating common event configurations
-
-// CreateCustomEventConfig creates a configuration for monitoring custom events
-func CreateCustomEventConfig(contractAddress common.Address, eventName, eventSignature, abi string) EventConfig {
-	return EventConfig{
-		ContractAddress: contractAddress,
-		EventName:       eventName,
-		EventSignature:  eventSignature,
-		ABI:             abi,
-		IsActive:        true,
-	}
 }
