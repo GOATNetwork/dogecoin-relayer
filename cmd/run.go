@@ -15,6 +15,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	// import modules
+	_ "github.com/goat-network/dogecoin-relayer/internal/consensus"
 	_ "github.com/goat-network/dogecoin-relayer/internal/http"
 	_ "github.com/goat-network/dogecoin-relayer/internal/p2p"
 	_ "github.com/goat-network/dogecoin-relayer/internal/scan"
