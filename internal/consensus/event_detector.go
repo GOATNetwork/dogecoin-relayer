@@ -277,7 +277,7 @@ func (ed *EventDetector) scanForEvents() error {
 // scanContractEvents scans events for a specific contract
 func (ed *EventDetector) scanContractEvents(config EventConfig, fromBlock, toBlock uint64) error {
 	// Parse contract ABI
-	contractABI, err := abi.JSON(strings.NewReader(config.ABI))
+	contractABI, err := abi.JSON(strings.NewReader(ed.ABI))
 	if err != nil {
 		return fmt.Errorf("failed to parse ABI: %w", err)
 	}
