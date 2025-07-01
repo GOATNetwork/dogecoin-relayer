@@ -4,26 +4,23 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
+	"github.com/goat-network/dogecoin-relayer/pkg/global"
+	"github.com/goat-network/dogecoin-relayer/pkg/types"
 	log "github.com/sirupsen/logrus"
 )
 
 // EventHandler manages event detection and processing
 type EventHandler struct {
-	processors map[string]EventProcessor
-	logger     *log.Entry
-}
-
-// EventProcessor defines how to process different types of events
-type EventProcessor interface {
-	ProcessEvent(event DetectedEvent) error
-	GetEventName() string
+	eventBus *eventbus.Bus
+	logger   *log.Entry
 }
 
 // NewEventHandler creates a new event handler
 func NewEventHandler() *EventHandler {
 	return &EventHandler{
-		processors: make(map[string]EventProcessor),
-		logger:     log.WithField("component", "EventHandler"),
+		eventBus: global.GetEventBus(),
+		logger:   log.WithField("component", "EventHandler"),
 	}
 }
 
@@ -39,54 +36,105 @@ func (eh *EventHandler) Start(eventChannel <-chan DetectedEvent) error {
 // processEvents processes detected events from the provided channel
 func (eh *EventHandler) processEvents(eventChannel <-chan DetectedEvent) {
 	for event := range eventChannel {
-		if processor, exists := eh.processors[event.EventName]; exists {
-			if err := processor.ProcessEvent(event); err != nil {
-				eh.logger.Errorf("Failed to process event %s: %v", event.EventName, err)
-			}
-		} else {
-			eh.logger.Warnf("No processor registered for event: %s", event.EventName)
+		if err := eh.ProcessEvent(event); err != nil {
+			eh.logger.Errorf("Failed to process event %s: %v", event.EventName, err)
 		}
 	}
 }
 
-// RegisterProcessor registers an event processor for a specific event type
-func (eh *EventHandler) RegisterProcessor(processor EventProcessor) {
-	eh.processors[processor.GetEventName()] = processor
-	eh.logger.Infof("Registered processor for event: %s", processor.GetEventName())
-}
+// ProcessEvent processes a detected event based on its type
+func (eh *EventHandler) ProcessEvent(event DetectedEvent) error {
+	eh.logger.Debugf("Processing event: %s", event.EventName)
 
-// GenericEventProcessor processes any event and logs the data
-type GenericEventProcessor struct {
-	eventName string
-	logger    *log.Entry
-}
-
-func NewGenericEventProcessor(eventName string) *GenericEventProcessor {
-	return &GenericEventProcessor{
-		eventName: eventName,
-		logger:    log.WithField("processor", eventName),
+	switch event.EventName {
+	case types.EventNameBridgeIn:
+		return eh.processBridgeIn(event)
+	case types.EventNameBridgeOutProposed:
+		return eh.processBridgeOutProposed(event)
+	case types.EventNameBridgeOutFinished:
+		return eh.processBridgeOutFinished(event)
+	case types.EventNameSubmitterChosen:
+		return eh.processSubmitterChosen(event)
+	default:
+		eh.logger.Warnf("Unknown event type: %s", event.EventName)
+		return fmt.Errorf("unknown event type: %s", event.EventName)
 	}
 }
 
-func (p *GenericEventProcessor) GetEventName() string {
-	return p.eventName
-}
+// processBridgeIn handles BridgeIn events
+func (eh *EventHandler) processBridgeIn(event DetectedEvent) error {
+	logger := eh.logger.WithField("event", "BridgeIn")
 
-func (p *GenericEventProcessor) ProcessEvent(event DetectedEvent) error {
 	// Convert event data to JSON for logging
 	eventDataJSON, err := json.MarshalIndent(event.EventData, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal event data: %w", err)
 	}
 
-	p.logger.Infof("Event detected: %s\nContract: %s\nTx: %s\nBlock: %d\nData:\n%s",
-		event.EventName,
+	logger.Infof("BridgeIn event detected:\nContract: %s\nTx: %s\nBlock: %d\nData:\n%s",
 		event.ContractAddress.Hex(),
 		event.TxHash.Hex(),
 		event.BlockNumber,
 		string(eventDataJSON))
 
 	// TODO: save event to DB
+
+	// Publish to event bus for other modules
+	eh.eventBus.Publish(eventbus.EventBridgeInDetected, event)
+
+	return nil
+}
+
+// processBridgeOutProposed handles BridgeOutProposed events
+func (eh *EventHandler) processBridgeOutProposed(event DetectedEvent) error {
+	logger := eh.logger.WithField("event", "BridgeOutProposed")
+
+	logger.Infof("BridgeOutProposed event detected: Tx %s at block %d",
+		event.TxHash.Hex(), event.BlockNumber)
+
+	// TODO: implement BridgeOutProposed logic
+	// - Validate proposal
+	// - Coordinate with TSS for signing
+	// - Update proposal status in DB
+
+	// Publish to event bus
+	eh.eventBus.Publish(eventbus.EventBridgeOutProposed, event)
+
+	return nil
+}
+
+// processBridgeOutFinished handles BridgeOutFinished events
+func (eh *EventHandler) processBridgeOutFinished(event DetectedEvent) error {
+	logger := eh.logger.WithField("event", "BridgeOutFinished")
+
+	logger.Infof("BridgeOutFinished event detected: Tx %s at block %d",
+		event.TxHash.Hex(), event.BlockNumber)
+
+	// TODO: implement BridgeOutFinished logic
+	// - Mark transaction as completed
+	// - Update database status
+	// - Cleanup any pending states
+
+	// Publish to event bus
+	eh.eventBus.Publish(eventbus.EventBridgeOutFinished, event)
+
+	return nil
+}
+
+// processSubmitterChosen handles SubmitterChosen events
+func (eh *EventHandler) processSubmitterChosen(event DetectedEvent) error {
+	logger := eh.logger.WithField("event", "SubmitterChosen")
+
+	logger.Infof("SubmitterChosen event detected: Tx %s at block %d",
+		event.TxHash.Hex(), event.BlockNumber)
+
+	// TODO: implement SubmitterChosen logic
+	// - Check if this node is the chosen submitter
+	// - Prepare submission if selected
+	// - Coordinate with other modules
+
+	// Publish to event bus
+	eh.eventBus.Publish(eventbus.EventSubmitterChosen, event)
 
 	return nil
 }

@@ -19,6 +19,12 @@ const (
 	// Tss events
 	EventTssSigRequest  EventType = "tss:sig:request"
 	EventTssSigResponse EventType = "tss:sig:response"
+
+	// Consensus events
+	EventBridgeInDetected  EventType = "consensus:bridge:in:detected"
+	EventBridgeOutProposed EventType = "consensus:bridge:out:proposed"
+	EventBridgeOutFinished EventType = "consensus:bridge:out:finished"
+	EventSubmitterChosen   EventType = "consensus:submitter:chosen"
 )
 
 // Event represents an event with a payload

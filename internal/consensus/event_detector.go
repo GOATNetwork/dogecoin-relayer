@@ -17,6 +17,7 @@ import (
 
 	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/pkg/contract"
+	eventTypes "github.com/goat-network/dogecoin-relayer/pkg/types"
 )
 
 // EventConfig defines which events to monitor
@@ -118,13 +119,13 @@ func CreateRequiredEventConfigs(cfg config.EventDetectionConfig, abiFilePath str
 	var contractAddresses []common.Address
 	var eventNames []string
 	contractAddresses = append(contractAddresses, common.HexToAddress(cfg.ContractBridge))
-	eventNames = append(eventNames, "BridgeIn")
+	eventNames = append(eventNames, eventTypes.EventNameBridgeIn)
 	contractAddresses = append(contractAddresses, common.HexToAddress(cfg.ContractBridge))
-	eventNames = append(eventNames, "BridgeOutProposed")
+	eventNames = append(eventNames, eventTypes.EventNameBridgeOutProposed)
 	contractAddresses = append(contractAddresses, common.HexToAddress(cfg.ContractBridge))
-	eventNames = append(eventNames, "BridgeOutFinished")
+	eventNames = append(eventNames, eventTypes.EventNameBridgeOutFinished)
 	contractAddresses = append(contractAddresses, common.HexToAddress(cfg.ContractEntryPoint))
-	eventNames = append(eventNames, "SubmitterChosen")
+	eventNames = append(eventNames, eventTypes.EventNameSubmitterChosen)
 	rawAbiData, configs, err := CreateEventConfig(abiFilePath, contractAddresses, eventNames)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create event config: %w", err)
