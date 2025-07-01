@@ -1,7 +1,10 @@
 package contract
 
 import (
+	"fmt"
 	"math/big"
+	"os"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -89,4 +92,38 @@ func EncodeAddress(addr common.Address) ([]byte, error) {
 func EncodeBytes(data []byte) ([]byte, error) {
 	arguments := abi.Arguments{{Type: BytesType}}
 	return arguments.Pack(data)
+}
+
+// LoadABIFromFile loads ABI from a JSON file
+func LoadABIFromFile(abiFilePath string) (abi.ABI, error) {
+	// Read the ABI file
+	abiData, err := os.ReadFile(abiFilePath)
+	if err != nil {
+		return abi.ABI{}, fmt.Errorf("failed to read ABI file %s: %w", abiFilePath, err)
+	}
+
+	// Parse the ABI
+	parsedABI, err := abi.JSON(strings.NewReader(string(abiData)))
+	if err != nil {
+		return abi.ABI{}, fmt.Errorf("failed to parse ABI from file %s: %w", abiFilePath, err)
+	}
+
+	return parsedABI, nil
+}
+
+// LoadABIAndRawDataFromFile loads ABI and returns both parsed ABI and raw JSON string
+func LoadABIAndRawDataFromFile(abiFilePath string) (abi.ABI, string, error) {
+	// Read the ABI file once
+	abiData, err := os.ReadFile(abiFilePath)
+	if err != nil {
+		return abi.ABI{}, "", fmt.Errorf("failed to read ABI file %s: %w", abiFilePath, err)
+	}
+
+	// Parse the ABI
+	parsedABI, err := abi.JSON(strings.NewReader(string(abiData)))
+	if err != nil {
+		return abi.ABI{}, "", fmt.Errorf("failed to parse ABI from file %s: %w", abiFilePath, err)
+	}
+
+	return parsedABI, string(abiData), nil
 }

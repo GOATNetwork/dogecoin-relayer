@@ -3,48 +3,12 @@ package contract
 import (
 	"fmt"
 	"math/big"
-	"os"
-	"strings"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 )
-
-// LoadABIFromFile loads ABI from a JSON file
-func LoadABIFromFile(abiFilePath string) (abi.ABI, error) {
-	// Read the ABI file
-	abiData, err := os.ReadFile(abiFilePath)
-	if err != nil {
-		return abi.ABI{}, fmt.Errorf("failed to read ABI file %s: %w", abiFilePath, err)
-	}
-
-	// Parse the ABI
-	parsedABI, err := abi.JSON(strings.NewReader(string(abiData)))
-	if err != nil {
-		return abi.ABI{}, fmt.Errorf("failed to parse ABI from file %s: %w", abiFilePath, err)
-	}
-
-	return parsedABI, nil
-}
-
-// LoadABIAndRawDataFromFile loads ABI and returns both parsed ABI and raw JSON string
-func LoadABIAndRawDataFromFile(abiFilePath string) (abi.ABI, string, error) {
-	// Read the ABI file once
-	abiData, err := os.ReadFile(abiFilePath)
-	if err != nil {
-		return abi.ABI{}, "", fmt.Errorf("failed to read ABI file %s: %w", abiFilePath, err)
-	}
-
-	// Parse the ABI
-	parsedABI, err := abi.JSON(strings.NewReader(string(abiData)))
-	if err != nil {
-		return abi.ABI{}, "", fmt.Errorf("failed to parse ABI from file %s: %w", abiFilePath, err)
-	}
-
-	return parsedABI, string(abiData), nil
-}
 
 // NewEntryPoint creates a new instance of an EntryPoint contract
 func NewEntryPoint(address common.Address, backend bind.ContractBackend, abiFilePath string) (*Contract, error) {
