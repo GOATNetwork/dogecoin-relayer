@@ -15,6 +15,7 @@ gorm:
 p2p:
   enabled: true
   listen_addr: /ip4/0.0.0.0/tcp/4001
+  external_addr: # broadcast factory address, such as "/ip4/52.88.11.99/tcp/4001,/ip4/54.91.64.7/tcp/4001"
   bootstrap_peers:
     - /ip4/127.0.0.1/tcp/4001/p2p/QmS4ghgMgfFvqPjB4WKXHaN15ZyT4K4JY8Y8Y8Y8Y8
     - /ip4/127.0.0.1/tcp/4001/p2p/QmS4ghgMgfFvqPjB4WKXHaN15ZyT4K4JY8Y8Y8Y8Y8

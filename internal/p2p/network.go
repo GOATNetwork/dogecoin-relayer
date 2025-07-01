@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -20,6 +21,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 
 	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
@@ -61,6 +63,7 @@ type Message struct {
 
 type Network struct {
 	config   config.P2PConfig
+	logger   *log.Entry
 	host     host.Host
 	eventBus *eventbus.Bus
 	handlers map[types.P2PMessageType]func(*types.P2PBroadcastMessage) error
@@ -153,6 +156,7 @@ func convertLibP2pPubKeyToEthereumAddress(pub crypto.PubKey) (common.Address, er
 
 // NewNetwork creates and initializes a new P2P network
 func NewNetwork(ctx context.Context, config config.P2PConfig) (*Network, error) {
+	logger := types.InitLogEntry("p2p-network")
 	priv, err := loadEthKey(config.ProposerPrivateKey)
 	if err != nil {
 		return nil, err
@@ -167,6 +171,26 @@ func NewNetwork(ctx context.Context, config config.P2PConfig) (*Network, error) 
 		}
 		options = append(options, libp2p.ListenAddrs(addr))
 	}
+
+	addrsOpt := libp2p.AddrsFactory(func(in []multiaddr.Multiaddr) (out []multiaddr.Multiaddr) {
+		for _, a := range in {
+			if manet.IsPublicAddr(a) || manet.IsPrivateAddr(a) {
+				// exclude 0.0.0.0 / 127.0.0.1 / link-local
+				if !manet.IsIPLoopback(a) && !manet.IsIP6LinkLocal(a) && !manet.IsIPUnspecified(a) {
+					out = append(out, a)
+				}
+			}
+		}
+		for _, s := range strings.FieldsFunc(config.ExternalAddr, func(r rune) bool { return r == ',' || r == ' ' }) {
+			if m, err := multiaddr.NewMultiaddr(strings.TrimSpace(s)); err == nil {
+				out = append(out, m)
+			} else {
+				logger.Warnf("bad multiaddr %q: %v", s, err)
+			}
+		}
+		return
+	})
+	options = append(options, addrsOpt)
 
 	host, err := libp2p.New(options...)
 	if err != nil {
@@ -189,7 +213,6 @@ func NewNetwork(ctx context.Context, config config.P2PConfig) (*Network, error) 
 	ps, err := pubsub.NewGossipSub(ctx, host,
 		pubsub.WithMessageSignaturePolicy(pubsub.StrictSign),
 		pubsub.WithPeerOutboundQueueSize(1000),
-		pubsub.WithFloodPublish(true),
 		pubsub.WithPeerExchange(true),
 	)
 	if err != nil {
@@ -205,6 +228,7 @@ func NewNetwork(ctx context.Context, config config.P2PConfig) (*Network, error) 
 
 	n := &Network{
 		config:   config,
+		logger:   logger,
 		host:     host,
 		eventBus: global.GetEventBus(),
 		handlers: make(map[types.P2PMessageType]func(*types.P2PBroadcastMessage) error),
@@ -220,9 +244,9 @@ func NewNetwork(ctx context.Context, config config.P2PConfig) (*Network, error) 
 	go n.startHeartbeat()
 
 	n.eventBus.Publish(eventbus.EventNetworkInitialized, n.host.ID())
-	log.Infof("P2P network initialized with PubSub. Node ID: %s", n.host.ID())
+	logger.Infof("P2P network initialized with PubSub. Node ID: %s", n.host.ID())
 	for _, addr := range n.host.Addrs() {
-		log.Infof("Listening on: %s/p2p/%s", addr, n.host.ID())
+		logger.Infof("Listening on: %s/p2p/%s", addr, n.host.ID())
 	}
 
 	return n, nil
@@ -239,7 +263,7 @@ func (n *Network) checkWhitelisted(peerID peer.ID) error {
 	if err != nil {
 		return fmt.Errorf("convert pubkey to ethereum address: %w", err)
 	}
-	log.Debugf("Peer %s public key converted to Ethereum address: %s", peerID, ethAddr.Hex())
+	n.logger.Debugf("Peer %s public key converted to Ethereum address: %s", peerID, ethAddr.Hex())
 
 	// TODO: check if the peerID is in the whitelist
 
@@ -249,7 +273,7 @@ func (n *Network) checkWhitelisted(peerID peer.ID) error {
 func (n *Network) handlePubSubMessages() {
 	sub, err := n.topic.Subscribe()
 	if err != nil {
-		log.Errorf("Failed to subscribe to topic %s: %v", LibP2PTopic, err)
+		n.logger.Errorf("Failed to subscribe to topic %s: %v", LibP2PTopic, err)
 		return
 	}
 	defer sub.Cancel()
@@ -279,18 +303,29 @@ func (n *Network) handlePubSubMessages() {
 
 		var libp2pMsg Message
 		if err := json.Unmarshal(msg.Data, &libp2pMsg); err != nil {
-			log.Errorf("Error unmarshaling pubsub message: %v", err)
+			n.logger.Errorf("Error unmarshaling pubsub message: %v", err)
+			continue
+		}
+
+		if msg.GetFrom() != libp2pMsg.From {
+			n.logger.Warnf("Message sender mismatch: expected %s, got %s", libp2pMsg.From, msg.GetFrom())
 			continue
 		}
 
 		// Verify signature
 		if err := n.checkWhitelisted(libp2pMsg.From); err != nil {
-			log.Errorf("Whitelisted check failed: %v", err)
+			n.logger.Errorf("Whitelisted check failed: %v", err)
 			continue
 		}
 
 		if libp2pMsg.To != nil && *libp2pMsg.To != n.host.ID() {
 			continue
+		}
+
+		n.logger.Debugf("Received pubsub message: Type=%s, ID=%s, From=%s, To=%s, SessionID=%s",
+			libp2pMsg.Type, libp2pMsg.ID, libp2pMsg.From, libp2pMsg.To, libp2pMsg.SessionID)
+		if libp2pMsg.Type == types.P2PMessageTypeHeartbeat {
+			n.logger.Infof("💓 Received heartbeat from %s: %s", libp2pMsg.From, string(libp2pMsg.Payload))
 		}
 
 		handler, exists := n.handlers[libp2pMsg.Type]
@@ -394,10 +429,10 @@ func (n *Network) SendMessage(to *peer.ID, msgType types.P2PMessageType, session
 					SessionID: msg.SessionID,
 					Payload:   msg.Payload,
 				}); err != nil {
-					log.Errorf("Error handling local message: %v", err)
+					n.logger.Errorf("Error handling local message: %v", err)
 				}
 			} else {
-				log.Warnf("No handler for local message type: %v", msgType)
+				n.logger.Warnf("No handler for local message type: %v", msgType)
 			}
 		}()
 		return nil
@@ -423,7 +458,7 @@ func (n *Network) SendMessageToTopic(msgBytes []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to send message to topic %s: %w", LibP2PTopic, err)
 	}
-	log.Infof("✅ %s sent message to topic %s", n.host.ID().String(), LibP2PTopic)
+	n.logger.Infof("✅ %s sent message to topic %s", n.host.ID().String(), LibP2PTopic)
 	return nil
 }
 
@@ -447,7 +482,7 @@ func (n *Network) BroadcastMessage(to *peer.ID, msgType types.P2PMessageType, se
 	if err != nil {
 		return fmt.Errorf("failed to publish to topic %s: %w", LibP2PTopic, err)
 	}
-	log.Infof("✅ %s published message to topic %s", n.host.ID().String(), LibP2PTopic)
+	n.logger.Infof("✅ %s published message to topic %s", n.host.ID().String(), LibP2PTopic)
 	return nil
 }
 
@@ -481,12 +516,12 @@ func (n *Network) handleStream(s network.Stream) {
 	var msg Message
 	decoder := json.NewDecoder(s)
 	if err := decoder.Decode(&msg); err != nil {
-		log.Errorf("Error decoding message: %s", err)
+		n.logger.Errorf("Error decoding message: %s", err)
 		return
 	}
 
 	if err := n.checkWhitelisted(msg.From); err != nil {
-		log.Errorf("Whitelisted check failed: %v", err)
+		n.logger.Errorf("Whitelisted check failed: %v", err)
 		return
 	}
 
@@ -497,10 +532,10 @@ func (n *Network) handleStream(s network.Stream) {
 			SessionID: msg.SessionID,
 			Payload:   msg.Payload,
 		}); err != nil {
-			log.Errorf("Error handling message: %s", err)
+			n.logger.Errorf("Error handling message: %s", err)
 		}
 	} else {
-		log.Warnf("No handler registered for message type: %s", msg.Type)
+		n.logger.Warnf("No handler registered for message type: %s", msg.Type)
 	}
 }
 
@@ -508,7 +543,7 @@ func (n *Network) handleStream(s network.Stream) {
 func (n *Network) verifyPeerProtocol(ctx context.Context, peerID peer.ID) bool {
 	protocols, err := n.host.Peerstore().GetProtocols(peerID)
 	if err != nil {
-		log.Errorf("Failed to get protocols for peer %s: %v", peerID, err)
+		n.logger.Errorf("Failed to get protocols for peer %s: %v", peerID, err)
 		return false
 	}
 
@@ -521,7 +556,7 @@ func (n *Network) verifyPeerProtocol(ctx context.Context, peerID peer.ID) bool {
 	// Try to connect and see if the peer supports our protocol
 	stream, err := n.host.NewStream(ctx, peerID, protocol.ID(ProtocolID))
 	if err != nil {
-		log.Errorf("Peer %s does not support protocol %s: %v", peerID, ProtocolID, err)
+		n.logger.Errorf("Peer %s does not support protocol %s: %v", peerID, ProtocolID, err)
 		return false
 	}
 	stream.Close()
@@ -531,7 +566,7 @@ func (n *Network) verifyPeerProtocol(ctx context.Context, peerID peer.ID) bool {
 
 // startHeartbeat starts the heartbeat mechanism to maintain connections
 func (n *Network) startHeartbeat() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -540,16 +575,18 @@ func (n *Network) startHeartbeat() {
 			return
 		case <-ticker.C:
 			peers := n.GetPeers()
-			log.Infof("Heartbeat: Currently connected to %d peers", len(peers))
+			n.logger.Infof("Heartbeat: Currently connected to %d peers", len(peers))
 
 			// If no peers connected, try to reconnect to bootstrap peers
 			if len(peers) == 0 {
-				log.Warnf("No peers connected, attempting to reconnect to bootstrap peers...")
+				n.logger.Warnf("No peers connected, attempting to reconnect to bootstrap peers...")
 				if len(n.config.BootstrapPeers) > 0 {
 					if err := n.connectToBootstrapPeers(n.ctx); err != nil {
-						log.Errorf("Failed to reconnect to bootstrap peers: %v", err)
+						n.logger.Errorf("Failed to reconnect to bootstrap peers: %v", err)
 					}
 				}
+			} else {
+				n.BroadcastMessage(nil, types.P2PMessageTypeHeartbeat, "", fmt.Appendf(nil, "Heartbeat from %s, my unixnano is %d", n.host.ID().String(), time.Now().UnixNano()))
 			}
 
 			// Publish heartbeat event
@@ -568,13 +605,13 @@ func (n *Network) connectToBootstrapPeers(ctx context.Context) error {
 	for _, peerAddr := range n.config.BootstrapPeers {
 		addr, err := multiaddr.NewMultiaddr(peerAddr)
 		if err != nil {
-			log.Errorf("Failed to parse bootstrap peer address %s: %v", peerAddr, err)
+			n.logger.Errorf("Failed to parse bootstrap peer address %s: %v", peerAddr, err)
 			continue
 		}
 
 		peerInfo, err := peer.AddrInfoFromP2pAddr(addr)
 		if err != nil {
-			log.Errorf("Failed to get peer info from address %s: %v", peerAddr, err)
+			n.logger.Errorf("Failed to get peer info from address %s: %v", peerAddr, err)
 			continue
 		}
 
@@ -587,21 +624,21 @@ func (n *Network) connectToBootstrapPeers(ctx context.Context) error {
 		n.host.Peerstore().Put(peerInfo.ID, "peer-type", "bootstrap")
 
 		if err := n.host.Connect(ctx, *peerInfo); err != nil {
-			log.Errorf("Failed to connect to bootstrap peer %s: %v", peerInfo.ID, err)
+			n.logger.Errorf("Failed to connect to bootstrap peer %s: %v", peerInfo.ID, err)
 			continue
 		}
 
 		// Verify the peer supports our protocol
 		verifyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		if !n.verifyPeerProtocol(verifyCtx, peerInfo.ID) {
-			log.Errorf("Bootstrap peer %s does not support our protocol %s, disconnecting", peerInfo.ID, ProtocolID)
+			n.logger.Errorf("Bootstrap peer %s does not support our protocol %s, disconnecting", peerInfo.ID, ProtocolID)
 			n.host.Network().ClosePeer(peerInfo.ID)
 			cancel()
 			continue
 		}
 		cancel()
 
-		log.Infof("Successfully connected to bootstrap peer: %s with protocol support", peerInfo.ID)
+		n.logger.Infof("Successfully connected to bootstrap peer: %s with protocol support", peerInfo.ID)
 		successfulConnections++
 	}
 
