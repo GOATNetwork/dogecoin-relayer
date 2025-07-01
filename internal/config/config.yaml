@@ -46,10 +46,11 @@ consensus:
   enabled: true
   rpc: "https://testnet3.rpc.goat.network"
   chain_id: 48816
-  contract_bridge: "0x0000000000000000000000000000000000000000"
-  contract_manager: "0x0000000000000000000000000000000000000000"
   event_detection:
     enabled: true
+    contract_bridge: "0x0000000000000000000000000000000000000000"
+    contract_entry_point: "0x0000000000000000000000000000000000000000"
+    abi_path: "/app/data/abi.json"
     last_scanned_block: 10000
     confirmation_blocks: 2
     batch_size: 1000

@@ -5,82 +5,129 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/goat-network/dogecoin-relayer/internal/config"
+	"github.com/goat-network/dogecoin-relayer/internal/models"
+	"github.com/goat-network/dogecoin-relayer/pkg/module"
+	"github.com/goat-network/dogecoin-relayer/pkg/types"
 )
 
 // EventManager manages consensus-related events
 type EventManager struct {
-	handler *EventHandler
-	ctx     context.Context
-	cancel  context.CancelFunc
-	logger  *log.Entry
-	config  *config.ConsensusConfig
+	cfg    config.EventDetectionConfig
+	conn   *models.DBConnection
+	logger *log.Entry
+
+	detector *EventDetector
+	handler  *EventHandler
 }
 
-// NewEventManager creates a new consensus event manager
-func NewEventManager(cfg *config.ConsensusConfig) *EventManager {
-	ctx, cancel := context.WithCancel(context.Background())
+var _ module.Module = (*EventManager)(nil)
 
-	return &EventManager{
-		ctx:    ctx,
-		cancel: cancel,
-		logger: log.WithField("component", "EventManager"),
-		config: cfg,
-	}
+func (m *EventManager) Name() string {
+	return "event_manager"
 }
 
-// StartMonitoring starts monitoring consensus-related events
-func (cem *EventManager) StartMonitoring(contractAddress common.Address) error {
+func (m *EventManager) Init(cfg any, conn *models.DBConnection) error {
+	m.cfg = cfg.(config.EventDetectionConfig)
+	m.conn = conn
+	m.logger = types.InitLogEntry(m.Name())
+	return nil
+}
+
+func (m *EventManager) Run(ctx context.Context) error {
+	m.logger.Info("Event manager module running")
+
 	// Check if event detection is enabled
-	if !cem.config.EventDetection.Enabled {
-		cem.logger.Info("Event detection is disabled in configuration")
+	if !m.cfg.Enabled {
+		m.logger.Info("Event detection is disabled in configuration")
 		return nil
 	}
 
-	// Create event configurations for a hypothetical consensus contract
-	configs := cem.createEventConfigs(contractAddress)
+	// TODO: Start event monitoring logic here
+	// For now, just log that the module is running
+	m.logger.WithFields(log.Fields{
+		"confirmation_blocks": m.cfg.ConfirmationBlocks,
+		"batch_size":          m.cfg.BatchSize,
+		"scan_interval_sec":   m.cfg.ScanIntervalSec,
+	}).Info("Event manager configuration loaded")
 
-	// Create event handler with configuration values
-	cem.handler = NewEventHandler(configs,
-		SetLastScannedBlock(uint64(cem.config.EventDetection.LastScannedBlock)),
-		SetConfirmationBlocks(uint64(cem.config.EventDetection.ConfirmationBlocks)),
-		SetBatchSize(uint64(cem.config.EventDetection.BatchSize)),
-		SetScanInterval(time.Duration(cem.config.EventDetection.ScanIntervalSec)*time.Second),
-	)
-
-	// Register processors
-	cem.handler.RegisterProcessor(NewGenericEventProcessor("ConsensusUpdate"))
-
-	// Start the handler
-	if err := cem.handler.Start(); err != nil {
-		return fmt.Errorf("failed to start consensus event handler: %w", err)
+	if err := m.StartMonitoring(); err != nil {
+		m.logger.Errorf("Failed to start event monitoring: %v", err)
+		return err
 	}
 
-	cem.logger.WithFields(log.Fields{
-		"contract":            contractAddress.Hex(),
-		"confirmation_blocks": cem.config.EventDetection.ConfirmationBlocks,
-		"batch_size":          cem.config.EventDetection.BatchSize,
-		"scan_interval_sec":   cem.config.EventDetection.ScanIntervalSec,
+	return nil
+}
+
+func (m *EventManager) Shutdown(ctx context.Context) error {
+	m.logger.Info("Event manager module shutting down")
+	if m.detector != nil {
+		m.detector.Stop()
+	}
+	return nil
+}
+
+// StartMonitoring starts monitoring consensus-related events
+func (m *EventManager) StartMonitoring() error {
+	// Check if event detection is enabled
+	if !m.cfg.Enabled {
+		m.logger.Info("Event detection is disabled in configuration")
+		return nil
+	}
+
+	// Create event configurations using contract utilities
+	rawAbiData, configs, err := CreateRequiredEventConfigs(m.cfg, m.cfg.AbiPath)
+	if err != nil {
+		m.logger.Errorf("Failed to create event config from ABI: %v", err)
+		return err
+	}
+
+	// Create event detector with configuration values
+	m.detector = NewEventDetector(rawAbiData, configs, SetLastScannedBlock(uint64(m.cfg.LastScannedBlock)),
+		SetConfirmationBlocks(uint64(m.cfg.ConfirmationBlocks)),
+		SetBatchSize(uint64(m.cfg.BatchSize)),
+		SetScanInterval(time.Duration(m.cfg.ScanIntervalSec)*time.Second))
+
+	// Create event handler
+	m.handler = NewEventHandler()
+
+	// Register processors
+	m.handler.RegisterProcessor(NewGenericEventProcessor("ConsensusUpdate"))
+
+	// Start the detector first
+	if err := m.detector.Start(); err != nil {
+		return fmt.Errorf("failed to start event detector: %w", err)
+	}
+
+	// Start the handler with the detector's event channel
+	if err := m.handler.Start(m.detector.EventChannel()); err != nil {
+		return fmt.Errorf("failed to start event handler: %w", err)
+	}
+
+	m.logger.WithFields(log.Fields{
+		"contract_bridge":      m.cfg.ContractBridge,
+		"contract_entry_point": m.cfg.ContractEntryPoint,
+		"confirmation_blocks":  m.cfg.ConfirmationBlocks,
+		"batch_size":           m.cfg.BatchSize,
+		"scan_interval_sec":    m.cfg.ScanIntervalSec,
 	}).Info("Started monitoring consensus events")
 
 	return nil
 }
 
 // StopMonitoring stops event monitoring
-func (cem *EventManager) StopMonitoring() {
-	if cem.handler != nil {
-		cem.handler.Stop()
+func (m *EventManager) StopMonitoring() {
+	if m.detector != nil {
+		m.detector.Stop()
 	}
-	cem.cancel()
-	cem.logger.Info("Stopped monitoring consensus events")
+	m.logger.Info("Stopped monitoring consensus events")
 }
 
 // GetMonitoringStatus returns the current monitoring status
-func (cem *EventManager) GetMonitoringStatus() map[string]interface{} {
-	if cem.handler == nil {
+func (m *EventManager) GetMonitoringStatus() map[string]interface{} {
+	if m.detector == nil {
 		return map[string]interface{}{
 			"status": "stopped",
 		}
@@ -88,33 +135,11 @@ func (cem *EventManager) GetMonitoringStatus() map[string]interface{} {
 
 	return map[string]interface{}{
 		"status":             "running",
-		"last_scanned_block": cem.handler.GetLastScannedBlock(),
+		"last_scanned_block": m.detector.GetLastScannedBlock(),
 	}
 }
 
-// createEventConfigs creates event configurations for consensus contract
-func (cem *EventManager) createEventConfigs(contractAddress common.Address) []EventConfig {
-	// Example ABI for a hypothetical consensus contract
-	consensusABI := `[
-		{
-			"anonymous": false,
-			"inputs": [
-				{"indexed": false, "name": "epoch", "type": "uint256"},
-				{"indexed": false, "name": "blockHash", "type": "bytes32"},
-				{"indexed": false, "name": "timestamp", "type": "uint256"}
-			],
-			"name": "ConsensusUpdate",
-			"type": "event"
-		}
-	]`
-
-	return []EventConfig{
-		{
-			ContractAddress: contractAddress,
-			EventName:       "ConsensusUpdate",
-			EventSignature:  "ConsensusUpdate(uint256,bytes32,uint256)",
-			ABI:             consensusABI,
-			IsActive:        true,
-		},
-	}
+func init() {
+	log.Info("Registering event manager module")
+	module.RegisterModule(&EventManager{})
 }
