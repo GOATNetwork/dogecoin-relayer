@@ -575,7 +575,11 @@ func (n *Network) startHeartbeat() {
 			return
 		case <-ticker.C:
 			peers := n.GetPeers()
-			n.logger.Infof("Heartbeat: Currently connected to %d peers", len(peers))
+			topicPeers := []peer.ID{}
+			if n.topic != nil {
+				topicPeers = n.topic.ListPeers()
+			}
+			n.logger.Infof("Heartbeat: Currently connected to %d peers, %d topic peers", len(peers), len(topicPeers))
 
 			// If no peers connected, try to reconnect to bootstrap peers
 			if len(peers) == 0 {
