@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
 	"github.com/goat-network/dogecoin-relayer/pkg/global"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
@@ -12,15 +13,17 @@ import (
 
 // EventHandler manages event detection and processing
 type EventHandler struct {
-	eventBus *eventbus.Bus
-	logger   *log.Entry
+	eventBus  *eventbus.Bus
+	eventRepo *models.EventRepository
+	logger    *log.Entry
 }
 
 // NewEventHandler creates a new event handler
-func NewEventHandler() *EventHandler {
+func NewEventHandler(eventRepo *models.EventRepository) *EventHandler {
 	return &EventHandler{
-		eventBus: global.GetEventBus(),
-		logger:   log.WithField("component", "EventHandler"),
+		eventBus:  global.GetEventBus(),
+		eventRepo: eventRepo,
+		logger:    log.WithField("component", "EventHandler"),
 	}
 }
 
@@ -44,30 +47,80 @@ func (eh *EventHandler) processEvents(eventChannel <-chan DetectedEvent) {
 
 // ProcessEvent processes a detected event based on its type
 func (eh *EventHandler) ProcessEvent(event DetectedEvent) error {
-	eh.logger.Debugf("Processing event: %s", event.EventName)
+	eh.logger.Debugf("Processing event: %s (ID: %d)", event.EventName, event.DatabaseID)
 
+	// Event should already be saved to database by EventDetector
+	if event.DatabaseID == 0 {
+		eh.logger.Errorf("Event has no database ID - this should not happen")
+		return fmt.Errorf("event has no database ID")
+	}
+
+	// Log the processing step start
+	processingLog := &models.EventProcessingLog{
+		DetectedEventID: event.DatabaseID,
+		ProcessingStep:  "event_received",
+		Status:          "success",
+	}
+	if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
+		eh.logger.Warnf("Failed to log processing step: %v", err)
+	}
+
+	var processingErr error
 	switch event.EventName {
 	case types.EventNameBridgeIn:
-		return eh.processBridgeIn(event)
+		processingErr = eh.processBridgeIn(event, event.DatabaseID)
 	case types.EventNameBridgeOutProposed:
-		return eh.processBridgeOutProposed(event)
+		processingErr = eh.processBridgeOutProposed(event, event.DatabaseID)
 	case types.EventNameBridgeOutFinished:
-		return eh.processBridgeOutFinished(event)
+		processingErr = eh.processBridgeOutFinished(event, event.DatabaseID)
 	case types.EventNameSubmitterChosen:
-		return eh.processSubmitterChosen(event)
+		processingErr = eh.processSubmitterChosen(event, event.DatabaseID)
 	default:
 		eh.logger.Warnf("Unknown event type: %s", event.EventName)
-		return fmt.Errorf("unknown event type: %s", event.EventName)
+		processingErr = fmt.Errorf("unknown event type: %s", event.EventName)
 	}
+
+	// Update event status based on processing result
+	finalStatus := "processed"
+	if processingErr != nil {
+		finalStatus = "failed"
+		// Log the processing failure
+		failureLog := &models.EventProcessingLog{
+			DetectedEventID: event.DatabaseID,
+			ProcessingStep:  "event_processing",
+			Status:          "failed",
+			ErrorMessage:    processingErr.Error(),
+		}
+		if err := eh.eventRepo.CreateProcessingLog(failureLog); err != nil {
+			eh.logger.Warnf("Failed to log processing failure: %v", err)
+		}
+	}
+
+	// Update the event status in database
+	if err := eh.eventRepo.UpdateDetectedEventStatus(event.DatabaseID, finalStatus); err != nil {
+		eh.logger.Errorf("Failed to update event status: %v", err)
+	}
+
+	return processingErr
 }
 
 // processBridgeIn handles BridgeIn events
-func (eh *EventHandler) processBridgeIn(event DetectedEvent) error {
-	logger := eh.logger.WithField("event", "BridgeIn")
+func (eh *EventHandler) processBridgeIn(event DetectedEvent, eventID uint) error {
+	logger := eh.logger.WithField("event", "BridgeIn").WithField("event_id", eventID)
+
+	// Log processing step start
+	processingLog := &models.EventProcessingLog{
+		DetectedEventID: eventID,
+		ProcessingStep:  "bridge_in_processing",
+		Status:          "success",
+	}
 
 	// Convert event data to JSON for logging
 	eventDataJSON, err := json.MarshalIndent(event.EventData, "", "  ")
 	if err != nil {
+		processingLog.Status = "failed"
+		processingLog.ErrorMessage = fmt.Sprintf("failed to marshal event data: %v", err)
+		eh.eventRepo.CreateProcessingLog(processingLog)
 		return fmt.Errorf("failed to marshal event data: %w", err)
 	}
 
@@ -77,7 +130,15 @@ func (eh *EventHandler) processBridgeIn(event DetectedEvent) error {
 		event.BlockNumber,
 		string(eventDataJSON))
 
-	// TODO: save event to DB
+	// TODO: Implement specific BridgeIn business logic here
+	// - Validate bridge request
+	// - Check token balances
+	// - Initiate cross-chain transfer process
+
+	// Log successful processing
+	if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
+		eh.logger.Warnf("Failed to log processing step: %v", err)
+	}
 
 	// Publish to event bus for other modules
 	eh.eventBus.Publish(eventbus.EventBridgeInDetected, event)
@@ -86,8 +147,15 @@ func (eh *EventHandler) processBridgeIn(event DetectedEvent) error {
 }
 
 // processBridgeOutProposed handles BridgeOutProposed events
-func (eh *EventHandler) processBridgeOutProposed(event DetectedEvent) error {
-	logger := eh.logger.WithField("event", "BridgeOutProposed")
+func (eh *EventHandler) processBridgeOutProposed(event DetectedEvent, eventID uint) error {
+	logger := eh.logger.WithField("event", "BridgeOutProposed").WithField("event_id", eventID)
+
+	// Log processing step start
+	processingLog := &models.EventProcessingLog{
+		DetectedEventID: eventID,
+		ProcessingStep:  "bridge_out_proposed_processing",
+		Status:          "success",
+	}
 
 	logger.Infof("BridgeOutProposed event detected: Tx %s at block %d",
 		event.TxHash.Hex(), event.BlockNumber)
@@ -97,6 +165,11 @@ func (eh *EventHandler) processBridgeOutProposed(event DetectedEvent) error {
 	// - Coordinate with TSS for signing
 	// - Update proposal status in DB
 
+	// Log successful processing
+	if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
+		eh.logger.Warnf("Failed to log processing step: %v", err)
+	}
+
 	// Publish to event bus
 	eh.eventBus.Publish(eventbus.EventBridgeOutProposed, event)
 
@@ -104,8 +177,15 @@ func (eh *EventHandler) processBridgeOutProposed(event DetectedEvent) error {
 }
 
 // processBridgeOutFinished handles BridgeOutFinished events
-func (eh *EventHandler) processBridgeOutFinished(event DetectedEvent) error {
-	logger := eh.logger.WithField("event", "BridgeOutFinished")
+func (eh *EventHandler) processBridgeOutFinished(event DetectedEvent, eventID uint) error {
+	logger := eh.logger.WithField("event", "BridgeOutFinished").WithField("event_id", eventID)
+
+	// Log processing step start
+	processingLog := &models.EventProcessingLog{
+		DetectedEventID: eventID,
+		ProcessingStep:  "bridge_out_finished_processing",
+		Status:          "success",
+	}
 
 	logger.Infof("BridgeOutFinished event detected: Tx %s at block %d",
 		event.TxHash.Hex(), event.BlockNumber)
@@ -115,6 +195,11 @@ func (eh *EventHandler) processBridgeOutFinished(event DetectedEvent) error {
 	// - Update database status
 	// - Cleanup any pending states
 
+	// Log successful processing
+	if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
+		eh.logger.Warnf("Failed to log processing step: %v", err)
+	}
+
 	// Publish to event bus
 	eh.eventBus.Publish(eventbus.EventBridgeOutFinished, event)
 
@@ -122,8 +207,15 @@ func (eh *EventHandler) processBridgeOutFinished(event DetectedEvent) error {
 }
 
 // processSubmitterChosen handles SubmitterChosen events
-func (eh *EventHandler) processSubmitterChosen(event DetectedEvent) error {
-	logger := eh.logger.WithField("event", "SubmitterChosen")
+func (eh *EventHandler) processSubmitterChosen(event DetectedEvent, eventID uint) error {
+	logger := eh.logger.WithField("event", "SubmitterChosen").WithField("event_id", eventID)
+
+	// Log processing step start
+	processingLog := &models.EventProcessingLog{
+		DetectedEventID: eventID,
+		ProcessingStep:  "submitter_chosen_processing",
+		Status:          "success",
+	}
 
 	logger.Infof("SubmitterChosen event detected: Tx %s at block %d",
 		event.TxHash.Hex(), event.BlockNumber)
@@ -132,6 +224,11 @@ func (eh *EventHandler) processSubmitterChosen(event DetectedEvent) error {
 	// - Check if this node is the chosen submitter
 	// - Prepare submission if selected
 	// - Coordinate with other modules
+
+	// Log successful processing
+	if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
+		eh.logger.Warnf("Failed to log processing step: %v", err)
+	}
 
 	// Publish to event bus
 	eh.eventBus.Publish(eventbus.EventSubmitterChosen, event)

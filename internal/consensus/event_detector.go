@@ -16,6 +16,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/goat-network/dogecoin-relayer/internal/config"
+	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/pkg/contract"
 	eventTypes "github.com/goat-network/dogecoin-relayer/pkg/types"
 )
@@ -37,6 +38,7 @@ type DetectedEvent struct {
 	EventName       string                 `json:"event_name"`
 	EventData       map[string]interface{} `json:"event_data"`
 	Timestamp       time.Time              `json:"timestamp"`
+	DatabaseID      uint                   `json:"database_id"`
 }
 
 // EventDetector monitors blockchain events
@@ -46,6 +48,7 @@ type EventDetector struct {
 	configs            []EventConfig
 	ABI                string // Contract ABI JSON
 	client             *ethclient.Client
+	eventRepo          *models.EventRepository
 	lastScannedBlock   uint64
 	confirmationBlocks uint64
 	batchSize          uint64
@@ -62,7 +65,7 @@ type EventDetector struct {
 type EventDetectorOption func(*EventDetector)
 
 // NewEventDetector creates a new event detector
-func NewEventDetector(rawAbiData string, configs []EventConfig, options ...EventDetectorOption) *EventDetector {
+func NewEventDetector(rawAbiData string, configs []EventConfig, eventRepo *models.EventRepository, options ...EventDetectorOption) *EventDetector {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	detector := &EventDetector{
@@ -71,6 +74,7 @@ func NewEventDetector(rawAbiData string, configs []EventConfig, options ...Event
 		configs:            configs,
 		ABI:                rawAbiData,
 		client:             GetEthClient(),
+		eventRepo:          eventRepo,
 		lastScannedBlock:   10000,
 		confirmationBlocks: 6,               // Default 6 confirmations
 		batchSize:          1000,            // Default batch size
@@ -188,10 +192,54 @@ func (ed *EventDetector) Start() error {
 
 	ed.logger.Info("Starting event detector")
 
-	// TODO: read last scanned block from DB
+	// Initialize scan states for each contract from DB
+	if err := ed.initializeScanStates(); err != nil {
+		ed.logger.Errorf("Failed to initialize scan states: %v", err)
+		return fmt.Errorf("failed to initialize scan states: %w", err)
+	}
 
 	// Start scanning in a goroutine
 	go ed.scanLoop()
+
+	return nil
+}
+
+// initializeScanStates initializes scan states for all configured contracts
+func (ed *EventDetector) initializeScanStates() error {
+	contractAddressesMap := make(map[string]bool)
+
+	// Get unique contract addresses from configs
+	for _, config := range ed.configs {
+		if config.IsActive {
+			contractAddressesMap[config.ContractAddress.Hex()] = true
+		}
+	}
+
+	// Initialize scan state for each unique contract address
+	for contractAddress := range contractAddressesMap {
+		state, err := ed.eventRepo.GetScanState(contractAddress)
+		if err != nil {
+			// If scan state doesn't exist, create it with current last scanned block
+			newState := &models.EventScanState{
+				ContractAddress:    contractAddress,
+				LastScannedBlock:   ed.lastScannedBlock,
+				ConfirmationBlocks: ed.confirmationBlocks,
+				IsActive:           true,
+			}
+
+			if err := ed.eventRepo.CreateOrUpdateScanState(newState); err != nil {
+				return fmt.Errorf("failed to create scan state for contract %s: %w", contractAddress, err)
+			}
+
+			ed.logger.Infof("Created initial scan state for contract %s at block %d", contractAddress, ed.lastScannedBlock)
+		} else {
+			// Use the minimum last scanned block from all contracts
+			if state.LastScannedBlock < ed.lastScannedBlock {
+				ed.lastScannedBlock = state.LastScannedBlock
+			}
+			ed.logger.Infof("Loaded scan state for contract %s, last scanned block: %d", contractAddress, state.LastScannedBlock)
+		}
+	}
 
 	return nil
 }
@@ -258,14 +306,31 @@ func (ed *EventDetector) scanForEvents() error {
 	ed.logger.Debugf("Scanning blocks %d to %d", fromBlock, toBlock)
 
 	// Scan each contract separately for better error handling
+	contractsScanned := make(map[string]bool)
 	for _, config := range ed.configs {
 		if !config.IsActive {
 			continue
 		}
 
+		contractAddr := config.ContractAddress.Hex()
+		if contractsScanned[contractAddr] {
+			continue // Skip if already scanned this contract
+		}
+
 		if err := ed.scanContractEvents(config, fromBlock, toBlock); err != nil {
-			ed.logger.Errorf("Failed to scan events for contract %s: %v", config.ContractAddress.Hex(), err)
+			ed.logger.Errorf("Failed to scan events for contract %s: %v", contractAddr, err)
 			// Continue with other contracts even if one fails
+		} else {
+			contractsScanned[contractAddr] = true
+		}
+	}
+
+	// Update scan states for all successfully scanned contracts
+	for contractAddr := range contractsScanned {
+		if err := ed.eventRepo.UpdateScanState(contractAddr, toBlock); err != nil {
+			ed.logger.Errorf("Failed to update scan state for contract %s: %v", contractAddr, err)
+		} else {
+			ed.logger.Debugf("Updated scan state for contract %s to block %d", contractAddr, toBlock)
 		}
 	}
 
@@ -311,16 +376,35 @@ func (ed *EventDetector) scanContractEvents(config EventConfig, fromBlock, toBlo
 			continue
 		}
 
+		// Save event to database immediately upon detection
+		dbEvent := &models.DetectedEvent{
+			BlockNumber:     detectedEvent.BlockNumber,
+			TxHash:          detectedEvent.TxHash.Hex(),
+			LogIndex:        detectedEvent.LogIndex,
+			ContractAddress: detectedEvent.ContractAddress.Hex(),
+			EventName:       detectedEvent.EventName,
+			Status:          "pending",
+		}
+
+		if err := ed.eventRepo.CreateDetectedEvent(dbEvent, detectedEvent.EventData); err != nil {
+			ed.logger.Errorf("Failed to save detected event to database: %v", err)
+			// Continue processing other events even if one fails to save
+			continue
+		}
+
+		// Attach database ID to the detected event for processing
+		detectedEvent.DatabaseID = dbEvent.ID
+
 		// Send to channel (non-blocking)
 		select {
 		case ed.eventChannel <- *detectedEvent:
 		default:
-			ed.logger.Warn("Event channel is full, dropping event")
+			ed.logger.Warn("Event channel is full, dropping event (but already saved to DB)")
 		}
 	}
 
 	if len(logs) > 0 {
-		ed.logger.Infof("Detected %d events for contract %s in blocks %d-%d",
+		ed.logger.Infof("Detected and saved %d events for contract %s in blocks %d-%d",
 			len(logs), config.ContractAddress.Hex(), fromBlock, toBlock)
 	}
 
