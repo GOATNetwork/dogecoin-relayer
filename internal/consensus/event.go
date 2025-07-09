@@ -93,9 +93,6 @@ func (m *EventManager) StartMonitoring() error {
 	// Create event handler
 	m.handler = NewEventHandler()
 
-	// Register processors
-	m.handler.RegisterProcessor(NewGenericEventProcessor("ConsensusUpdate"))
-
 	// Start the detector first
 	if err := m.detector.Start(); err != nil {
 		return fmt.Errorf("failed to start event detector: %w", err)
