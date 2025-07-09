@@ -38,6 +38,7 @@ type ScanConfig struct {
 	Enabled  bool `yaml:"enabled"`
 	Interval int  `yaml:"interval"` // in seconds
 	Timeout  int  `yaml:"timeout"`  // in seconds
+	Range    int  `yaml:"range"`    // number of blocks to scan at once
 }
 
 type P2PConfig struct {
