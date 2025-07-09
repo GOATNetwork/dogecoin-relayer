@@ -38,11 +38,13 @@ type ScanConfig struct {
 	Enabled  bool `yaml:"enabled"`
 	Interval int  `yaml:"interval"` // in seconds
 	Timeout  int  `yaml:"timeout"`  // in seconds
+	Range    int  `yaml:"range"`    // number of blocks to scan at once
 }
 
 type P2PConfig struct {
 	Enabled               bool     `yaml:"enabled"`
 	ListenAddr            string   `yaml:"listen_addr"`
+	ExternalAddr          string   `yaml:"external_addr"` // broadcast factory address, such as "/ip4/52.88.11.99/tcp/4001,/ip4/54.91.64.7/tcp/4001"
 	BootstrapPeers        []string `yaml:"bootstrap_peers"`
 	EnableMDNS            bool     `yaml:"enable_mdns"`
 	ListenWaitSeconds     int      `yaml:"listen_wait_seconds"`

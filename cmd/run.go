@@ -16,9 +16,9 @@ import (
 
 	// import modules
 	_ "github.com/goat-network/dogecoin-relayer/internal/consensus"
+	_ "github.com/goat-network/dogecoin-relayer/internal/doge"
 	_ "github.com/goat-network/dogecoin-relayer/internal/http"
 	_ "github.com/goat-network/dogecoin-relayer/internal/p2p"
-	_ "github.com/goat-network/dogecoin-relayer/internal/scan"
 	_ "github.com/goat-network/dogecoin-relayer/internal/tss"
 )
 
@@ -56,7 +56,7 @@ func Run() {
 		enabledModules = append(enabledModules, "http")
 	}
 	if cfg.Scan.Enabled {
-		enabledModules = append(enabledModules, "scan")
+		enabledModules = append(enabledModules, "doge")
 	}
 	if cfg.Tss.Enabled {
 		enabledModules = append(enabledModules, "tss")
@@ -81,8 +81,8 @@ func Run() {
 
 		var moduleConfig any
 		switch moduleName {
-		case "scan":
-			moduleConfig = cfg.Scan
+		case "doge":
+			moduleConfig = cfg.Doge
 		case "p2p":
 			moduleConfig = cfg.P2P
 		case "http":
