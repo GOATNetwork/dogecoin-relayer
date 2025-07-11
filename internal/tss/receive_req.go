@@ -2,6 +2,7 @@ package tss
 
 import (
 	"context"
+	"time"
 
 	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
@@ -21,16 +22,28 @@ func (m *TssModule) handleSignStart(data any) {
 		m.logger.Errorf("invalid data type: %T", data)
 		return
 	}
-
-	_, err := m.signClient.StartSign(context.Background(), req.SessionID, req.UnsignHash)
+	ssResp, err := m.signClient.StartSign(context.Background(), req.SessionID, req.UnsignHash)
 	if err != nil {
 		m.logger.Errorf("failed to sign start: %v", err)
+		m.eventBus.Publish(eventbus.EventTssSigResponse, types.TssSigResponse{
+			SessionID: req.SessionID,
+			Success:   false,
+			Message:   ssResp.Message,
+			RawSig:    nil,
+		})
+		return
+	}
+	if !ssResp.Success {
+		m.logger.Errorf("sign start response failed: %s, session id: %s", ssResp.Message, req.SessionID)
+		m.eventBus.Publish(eventbus.EventTssSigResponse, types.TssSigResponse{
+			SessionID: req.SessionID,
+			Success:   false,
+			Message:   ssResp.Message,
+			RawSig:    nil,
+		})
 		return
 	}
 
-	// TODO: manange self module sessions state, publish event to other modules
-	m.eventBus.Publish(eventbus.EventTssSigResponse, types.TssSigResponse{
-		SessionID: req.SessionID,
-		RawSig:    nil,
-	})
+	m.activeSessions.Store(req.SessionID, time.Now())
+	m.logger.Infof("Added session %s to active sessions", req.SessionID)
 }
