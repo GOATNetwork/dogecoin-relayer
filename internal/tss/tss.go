@@ -2,6 +2,7 @@ package tss
 
 import (
 	"context"
+	"sync"
 
 	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
@@ -19,6 +20,8 @@ type TssModule struct {
 
 	signClient *SignClient
 	eventBus   *eventbus.Bus
+
+	activeSessions sync.Map // key: sessionID (string), value: timestamp (time.Time)
 }
 
 var _ module.Module = (*TssModule)(nil)
@@ -43,7 +46,8 @@ func (m *TssModule) Run(ctx context.Context) error {
 
 	// register event bus
 	m.subscribeEvent()
-	// TODO: start tss handler event by event bus
+	// start tss handler event by event bus
+	go m.checkSignHandler(ctx)
 
 	return nil
 }

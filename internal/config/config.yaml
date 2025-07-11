@@ -61,3 +61,4 @@ tss:
   enabled: true
   url: "http://localhost:8080"
   kdd: 10
+  timeout: 300 # unit: second
