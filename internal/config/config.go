@@ -96,6 +96,7 @@ type TssConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Url     string `yaml:"url"`
 	Kdd     uint32 `yaml:"kdd"`
+	Timeout int    `yaml:"timeout"` // unit: second
 }
 
 func LoadConfig(filePath string) (*Config, error) {
