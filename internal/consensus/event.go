@@ -5,21 +5,23 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
+	"github.com/goat-network/dogecoin-relayer/pkg/contract"
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
 )
 
 // EventManager manages consensus-related events
 type EventManager struct {
-	cfg       config.EventDetectionConfig
-	conn      *models.DBConnection
-	eventRepo *models.EventRepository
-	logger    *log.Entry
+	cfg           config.EventDetectionConfig
+	conn          *models.DBConnection
+	eventRepo     *models.EventRepository
+	logger        *log.Entry
+	utxoProcessor *UtxoProcessor
 
 	detector *EventDetector
 	handler  *EventHandler
@@ -34,13 +36,23 @@ func (m *EventManager) Name() string {
 func (m *EventManager) Init(cfg any, conn *models.DBConnection) error {
 	m.cfg = cfg.(config.EventDetectionConfig)
 	m.conn = conn
-	m.eventRepo = models.NewEventRepository(conn.DB)
+	m.eventRepo = models.NewEventRepository(conn.GetDB())
 	m.logger = types.InitLogEntry(m.Name())
+
+	// Initialize UTXO manager
+	m.utxoProcessor = NewUtxoManager(conn, m.cfg.ContractBridge)
+
 	return nil
 }
 
 func (m *EventManager) Run(ctx context.Context) error {
 	m.logger.Info("Event manager module running")
+
+	// Start UTXO manager for bridge operations
+	if err := m.startUtxoManager(); err != nil {
+		m.logger.Errorf("Failed to start UTXO manager: %v", err)
+		return err
+	}
 
 	// Check if event detection is enabled
 	if !m.cfg.Enabled {
@@ -69,6 +81,37 @@ func (m *EventManager) Shutdown(ctx context.Context) error {
 	if m.detector != nil {
 		m.detector.Stop()
 	}
+	if m.utxoProcessor != nil {
+		m.utxoProcessor.Stop()
+	}
+	return nil
+}
+
+// startUtxoManager starts the UTXO manager for bridge operations
+func (m *EventManager) startUtxoManager() error {
+	if m.utxoProcessor == nil {
+		return fmt.Errorf("UTXO manager not initialized")
+	}
+
+	// Create contract builder for generating bridge calldata
+	contractBuilder, err := contract.NewEntryPoint(
+		common.HexToAddress(m.cfg.ContractBridge),
+		GetEthClient(),
+		m.cfg.AbiPath,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create contract builder: %w", err)
+	}
+
+	// Set the contract builder in the UTXO manager
+	m.utxoProcessor.SetContractBuilder(contractBuilder)
+
+	// Start the UTXO manager
+	if err := m.utxoProcessor.Start(); err != nil {
+		return fmt.Errorf("failed to start UTXO manager: %w", err)
+	}
+
+	m.logger.Info("UTXO manager started successfully")
 	return nil
 }
 
@@ -157,6 +200,16 @@ func (m *EventManager) GetRecentEvents(status string, limit int) ([]models.Detec
 		return nil, fmt.Errorf("event repository not initialized")
 	}
 	return m.eventRepo.GetDetectedEventsByStatus(status, limit)
+}
+
+// GetUtxoManagerStats returns UTXO manager statistics
+func (m *EventManager) GetUtxoManagerStats() map[string]interface{} {
+	if m.utxoProcessor == nil {
+		return map[string]interface{}{
+			"status": "not_initialized",
+		}
+	}
+	return m.utxoProcessor.GetStats()
 }
 
 // RecoverFailedEvents reprocesses failed events from database
