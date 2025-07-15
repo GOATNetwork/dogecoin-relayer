@@ -9,6 +9,7 @@ import (
 	"github.com/dogecoinw/doged/chaincfg/chainhash"
 	"github.com/dogecoinw/doged/wire"
 	"github.com/goat-network/dogecoin-relayer/internal/config"
+	"github.com/goat-network/dogecoin-relayer/internal/metrics"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/pkg/global"
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
@@ -42,6 +43,7 @@ func (m *DogeModule) Init(cfg any, conn *models.DBConnection) error {
 	// Initialize Dogecoin client
 	client, err := NewDogeClient(m.cfg)
 	if err != nil {
+		metrics.RecordError("doge", "init_failed")
 		return fmt.Errorf("failed to create Dogecoin client: %w", err)
 	}
 	m.client = client
@@ -66,6 +68,7 @@ func (m *DogeModule) Init(cfg any, conn *models.DBConnection) error {
 
 func (m *DogeModule) Run(ctx context.Context) error {
 	m.logger.Info("Doge module running")
+	metrics.RecordModuleStart("doge")
 
 	// Start block scanning loop
 	go m.blockScanLoop(ctx)
@@ -82,6 +85,7 @@ func (m *DogeModule) Shutdown(ctx context.Context) error {
 	if m.client != nil {
 		m.client.Close()
 	}
+	metrics.RecordModuleStop("doge")
 	return nil
 }
 

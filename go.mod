@@ -5,10 +5,11 @@ go 1.24.4
 require (
 	github.com/dogecoinw/doged v1.0.6
 	github.com/ethereum/go-ethereum v1.15.11
-	github.com/goatnetwork/tss v1.0.1
+	github.com/goatnetwork/tss v1.0.2
 	github.com/libp2p/go-libp2p v0.42.0
 	github.com/libp2p/go-libp2p-pubsub v0.14.0
 	github.com/multiformats/go-multiaddr v0.16.0
+	github.com/prometheus/client_golang v1.22.0
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.10.0
 	gopkg.in/yaml.v2 v2.4.0
@@ -144,7 +145,6 @@ require (
 	github.com/pion/webrtc/v4 v4.1.2 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/prometheus/client_golang v1.22.0 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.64.0 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect

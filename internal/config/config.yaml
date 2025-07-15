@@ -62,3 +62,9 @@ tss:
   url: "http://localhost:8080"
   kdd: 10
   timeout: 300 # unit: second
+
+metrics:
+  enabled: true
+  collect_system_metrics: true
+  system_collect_interval: 10
+  enable_detailed_metrics: true
