@@ -17,6 +17,7 @@ type Config struct {
 	Scan      ScanConfig      `yaml:"scan"`
 	Consensus ConsensusConfig `yaml:"consensus"`
 	Tss       TssConfig       `yaml:"tss"`
+	Metrics   MetricsConfig   `yaml:"metrics"`
 }
 
 type LogConfig struct {
@@ -97,6 +98,13 @@ type TssConfig struct {
 	Url     string `yaml:"url"`
 	Kdd     uint32 `yaml:"kdd"`
 	Timeout int    `yaml:"timeout"` // unit: second
+}
+
+type MetricsConfig struct {
+	Enabled               bool `yaml:"enabled"`
+	CollectSystemMetrics  bool `yaml:"collect_system_metrics"`
+	SystemCollectInterval int  `yaml:"system_collect_interval"` // in seconds
+	EnableDetailedMetrics bool `yaml:"enable_detailed_metrics"`
 }
 
 func LoadConfig(filePath string) (*Config, error) {
