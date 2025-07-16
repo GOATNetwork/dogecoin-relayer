@@ -35,6 +35,7 @@ doge:
   start_height: 0
   confirmations: 1
   network_type: "regtest"
+  l2_chain_id: "2345"
 
 scan:
   enabled: true

@@ -275,7 +275,7 @@ func (m *DogeModule) processTransaction(tx *wire.MsgTx, dogeBlock types.DogeBloc
 			}
 			vins = append(vins, &models.VIN{
 				OrderId:   "",
-				BtcHeight: dogeBlock.BlockNumber,
+				L1Height:  dogeBlock.BlockNumber,
 				Txid:      vin.PreviousOutPoint.Hash.String(),
 				OutIndex:  int(vin.PreviousOutPoint.Index),
 				SigScript: vin.SignatureScript,
@@ -334,7 +334,7 @@ func (m *DogeModule) processTransaction(tx *wire.MsgTx, dogeBlock types.DogeBloc
 		}
 		vouts = append(vouts, &models.VOUT{
 			OrderId:    "",
-			BtcHeight:  dogeBlock.BlockNumber,
+			L1Height:   dogeBlock.BlockNumber,
 			Txid:       txid,
 			OutIndex:   idx,
 			WithdrawId: "",

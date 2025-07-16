@@ -68,6 +68,7 @@ type DogeConfig struct {
 	StartHeight   int    `yaml:"start_height"`
 	Confirmations int    `yaml:"confirmations"`
 	NetworkType   string `yaml:"network_type"`
+	L2ChainId     string `yaml:"l2_chain_id"`
 }
 
 type ConsensusConfig struct {
@@ -128,6 +129,14 @@ func LoadConfig(filePath string) (*Config, error) {
 	// set private key from environment variable
 	config.P2P.ProposerPrivateKey = os.Getenv("PROPOSER_PRIVATE_KEY")
 	config.Consensus.ProposerPrivateKey = os.Getenv("PROPOSER_PRIVATE_KEY")
+
+	// set default DOGE/L1 config
+	if config.Doge.L2ChainId == "" {
+		config.Doge.L2ChainId = "2345"
+	}
+	if config.Doge.NetworkType == "" {
+		config.Doge.NetworkType = "mainnet"
+	}
 
 	// set log level
 	logLevel, err := log.ParseLevel(config.Log.Level)
