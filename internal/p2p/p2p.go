@@ -49,6 +49,11 @@ func (m *P2PModule) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+// GetNetwork returns the network instance for accessing host and public key information
+func (m *P2PModule) GetNetwork() *Network {
+	return m.network
+}
+
 func init() {
 	log.Info("Registering p2p module")
 	module.RegisterModule(&P2PModule{})

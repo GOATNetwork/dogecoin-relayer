@@ -3,16 +3,18 @@ package consensus
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	log "github.com/sirupsen/logrus"
-
 	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
+	"github.com/goat-network/dogecoin-relayer/internal/tss"
 	"github.com/goat-network/dogecoin-relayer/pkg/contract"
+	"github.com/goat-network/dogecoin-relayer/pkg/global"
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
+	log "github.com/sirupsen/logrus"
 )
 
 // EventManager manages consensus-related events
@@ -40,7 +42,7 @@ func (m *EventManager) Init(cfg any, conn *models.DBConnection) error {
 	m.logger = types.InitLogEntry(m.Name())
 
 	// Initialize UTXO manager
-	m.utxoProcessor = NewUtxoManager(conn, m.cfg.ContractBridge)
+	m.utxoProcessor = NewUtxoProcessor(conn, m.cfg.ContractBridge)
 
 	return nil
 }
@@ -105,6 +107,41 @@ func (m *EventManager) startUtxoManager() error {
 
 	// Set the contract builder in the UTXO manager
 	m.utxoProcessor.SetContractBuilder(contractBuilder)
+
+	// Get TSS client from the TSS module if TSS is enabled
+	globalCfg := global.GetConfig()
+	if globalCfg != nil && globalCfg.Tss.Enabled {
+		// Get the TSS module from the module registry
+		tssModule, exists := module.GetModule("tss")
+		if !exists {
+			return fmt.Errorf("TSS module not found in registry")
+		}
+
+		// Cast to TssModule and get the sign client
+		tssModuleInstance, ok := tssModule.(*tss.TssModule)
+		if !ok {
+			return fmt.Errorf("failed to cast TSS module to TssModule type")
+		}
+
+		tssClient := tssModuleInstance.GetSignClient()
+		if tssClient == nil {
+			return fmt.Errorf("TSS sign client not initialized")
+		}
+
+		m.utxoProcessor.SetTssClient(tssClient)
+
+		// Set chain ID from consensus configuration
+		if globalCfg.Consensus.ChainId > 0 {
+			chainID := big.NewInt(int64(globalCfg.Consensus.ChainId))
+			m.utxoProcessor.SetChainID(chainID)
+		} else {
+			m.logger.Warn("Chain ID not configured, TSS transaction signing may fail")
+		}
+
+		m.logger.Info("TSS client configured for UTXO processor from TSS module")
+	} else {
+		m.logger.Warn("TSS is not enabled, bridge transactions will not be signed")
+	}
 
 	// Start the UTXO manager
 	if err := m.utxoProcessor.Start(); err != nil {

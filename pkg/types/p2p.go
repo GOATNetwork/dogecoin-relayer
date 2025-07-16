@@ -10,6 +10,8 @@ const (
 	P2PMessageTypeBridgeIn P2PMessageType = "bridge-in"
 	// P2PMessageTypeBridgeOut is for bridge out contract call messages
 	P2PMessageTypeBridgeOut P2PMessageType = "bridge-out"
+	// P2PMessageTypeDepositProposal is for deposit proposal messages
+	P2PMessageTypeDepositProposal P2PMessageType = "deposit-proposal"
 )
 
 // P2PBroadcastMessage is the message for broadcast to all peers

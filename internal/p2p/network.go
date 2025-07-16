@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -507,6 +508,32 @@ func (n *Network) Connect(ctx context.Context, peerID peer.ID, addrs []string) e
 // GetPeers returns all connected peers
 func (n *Network) GetPeers() []peer.ID {
 	return n.host.Network().Peers()
+}
+
+// GetNodeEthereumAddress returns this node's Ethereum address derived from its libp2p public key
+func (n *Network) GetNodeEthereumAddress() (common.Address, error) {
+	pubKey := n.host.Peerstore().PubKey(n.host.ID())
+	if pubKey == nil {
+		return common.Address{}, fmt.Errorf("public key not found for this node")
+	}
+
+	return convertLibP2pPubKeyToEthereumAddress(pubKey)
+}
+
+// GetNodeECDSAPrivateKey returns this node's ECDSA private key for transaction signing
+func (n *Network) GetNodeECDSAPrivateKey() (*ecdsa.PrivateKey, error) {
+	// Use the same private key hex from config to create ECDSA private key
+	privKeyBytes, err := hex.DecodeString(n.config.ProposerPrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid private key hex: %w", err)
+	}
+
+	if len(privKeyBytes) != 32 {
+		return nil, fmt.Errorf("expected 32 bytes private key, got %d", len(privKeyBytes))
+	}
+
+	privKey := ethcrypto.ToECDSAUnsafe(privKeyBytes)
+	return privKey, nil
 }
 
 // handleStream handles an incoming stream
