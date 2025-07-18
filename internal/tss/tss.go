@@ -87,6 +87,11 @@ func (m *TssModule) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+// GetSignClient returns the sign client instance
+func (m *TssModule) GetSignClient() *SignClient {
+	return m.signClient
+}
+
 func init() {
 	log.Info("Registering tss module")
 	module.RegisterModule(&TssModule{})

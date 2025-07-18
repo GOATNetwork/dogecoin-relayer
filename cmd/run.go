@@ -70,6 +70,9 @@ func Run() {
 	if cfg.Tss.Enabled {
 		enabledModules = append(enabledModules, "tss")
 	}
+	if cfg.Consensus.Enabled {
+		enabledModules = append(enabledModules, "consensus")
+	}
 
 	log.Infof("Enabled modules: %v", enabledModules)
 
