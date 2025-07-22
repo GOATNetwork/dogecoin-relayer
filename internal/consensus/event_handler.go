@@ -230,11 +230,7 @@ func (eh *EventHandler) processSubmitterChosen(event DetectedEvent, eventID uint
 
 		// Try to extract submitter address from common field names
 		var submitterAddr string
-		if addr, ok := event.EventData["submitter"].(string); ok {
-			submitterAddr = addr
-		} else if addr, ok := event.EventData["chosen"].(string); ok {
-			submitterAddr = addr
-		} else if addr, ok := event.EventData["newSubmitter"].(string); ok {
+		if addr, ok := event.EventData["newSubmitter"].(string); ok {
 			submitterAddr = addr
 		} else {
 			// Log available fields for debugging

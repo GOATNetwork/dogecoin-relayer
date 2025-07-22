@@ -44,6 +44,25 @@ func NewEntryPointWithABI(address common.Address, backend bind.ContractBackend, 
 	}, nil
 }
 
+func (contract *Contract) GetCurrentProposer() (common.Address, error) {
+	var out []interface{}
+	err := contract.contract.Call(&bind.CallOpts{}, &out, "nextSubmitter")
+	if err != nil {
+		return common.Address{}, fmt.Errorf("failed to get current proposer: %w", err)
+	}
+
+	if len(out) == 0 {
+		return common.Address{}, fmt.Errorf("no result returned from nextSubmitter call")
+	}
+
+	proposer, ok := out[0].(common.Address)
+	if !ok {
+		return common.Address{}, fmt.Errorf("failed to convert result to address")
+	}
+
+	return proposer, nil
+}
+
 // GenerateBridgeInTxData generates the transaction data for the bridgeIn function call
 func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction, batchId *big.Int) ([]byte, error) {
 	// Convert the bridgeTxs to the format expected by the ABI

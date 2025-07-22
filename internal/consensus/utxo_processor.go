@@ -192,12 +192,11 @@ func (up *UtxoProcessor) updateCurrentProposer(newProposer common.Address) {
 func (up *UtxoProcessor) initializeCurrentProposer() error {
 	// TODO: Query the contract for the current proposer
 	// This is only called once on startup
-	// Example:
-	// currentProposer, err := up.contractBuilder.GetCurrentProposer()
-	// if err != nil {
-	//     return err
-	// }
-	// up.updateCurrentProposer(currentProposer)
+	currentProposer, err := up.contractBuilder.GetCurrentProposer()
+	if err != nil {
+		return err
+	}
+	up.updateCurrentProposer(currentProposer)
 
 	up.logger.Debug("Current proposer will be set from SubmitterChosen events")
 	return nil
