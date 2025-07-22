@@ -107,19 +107,46 @@ func (up *UtxoProcessor) processWithdrawalUTXOs() error {
 
 	up.logger.Infof("Found %d new withdrawal UTXOs to process", len(utxos))
 
-	// Group withdrawal UTXOs into batches
-	batches := up.groupWithdrawalUTXOsIntoBatches(utxos)
-
-	for _, batch := range batches {
-		if err := up.processWithdrawalBatch(batch); err != nil {
-			up.logger.Errorf("Failed to process withdrawal batch %s: %v", batch.ID.String(), err)
+	// For withdrawals, each UTXO is processed individually (not batched)
+	// because each UTXO contains multiple outputs aligned with task IDs
+	for _, utxo := range utxos {
+		if err := up.processWithdrawalUTXO(utxo); err != nil {
+			up.logger.Errorf("Failed to process withdrawal UTXO %s: %v", utxo.Uid, err)
 			continue
 		}
 
-		// Mark UTXOs as processed
-		if err := up.markUTXOsAsProcessed(batch.UTXOs); err != nil {
-			up.logger.Errorf("Failed to mark withdrawal UTXOs as processed: %v", err)
+		// Mark UTXO as processed
+		if err := up.markUTXOsAsProcessed([]*models.UTXO{utxo}); err != nil {
+			up.logger.Errorf("Failed to mark withdrawal UTXO as processed: %v", err)
 		}
+	}
+
+	return nil
+}
+
+// processWithdrawalUTXO processes a single withdrawal UTXO with its associated outputs
+func (up *UtxoProcessor) processWithdrawalUTXO(utxo *models.UTXO) error {
+	up.logger.Infof("Processing withdrawal UTXO %s (txid: %s, amount: %d DOGE)",
+		utxo.Uid, utxo.Txid, utxo.Amount)
+
+	// Get all VOUT records for this transaction
+	vouts, err := up.getVOUTsForTransaction(utxo.Txid)
+	if err != nil {
+		return fmt.Errorf("failed to get VOUTs for transaction %s: %w", utxo.Txid, err)
+	}
+
+	if len(vouts) == 0 {
+		return fmt.Errorf("no VOUTs found for withdrawal transaction %s", utxo.Txid)
+	}
+
+	up.logger.Infof("Found %d outputs for withdrawal transaction %s", len(vouts), utxo.Txid)
+
+	// Create withdrawal request with single UTXO and aligned task IDs
+	request := up.createWithdrawalRequestFromUTXO(utxo, vouts)
+
+	// Process the withdrawal request
+	if err := up.processWithdrawalRequest(request); err != nil {
+		return fmt.Errorf("failed to process withdrawal request: %w", err)
 	}
 
 	return nil
@@ -155,12 +182,12 @@ func (up *UtxoProcessor) getUnprocessedWithdrawalUTXOs() ([]*models.UTXO, error)
 	var utxos []*models.UTXO
 
 	// Query for withdrawal UTXOs that haven't been processed yet
+	// For withdrawals, we typically have one UTXO that contains multiple outputs
 	err := up.conn.GetDB().Where(
-		"source = ? AND status = ? AND id > ? AND evm_addr != ?",
+		"source = ? AND status = ? AND id > ?",
 		models.UTXO_SOURCE_WITHDRAWAL,
 		models.UTXO_STATUS_CONFIRMED,
 		up.lastProcessedId,
-		"", // Non-empty EVM address required for withdrawals
 	).Limit(up.batchSize).Find(&utxos).Error
 
 	if err != nil {
@@ -223,90 +250,6 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*bridgeIn
 	return batches
 }
 
-// groupWithdrawalUTXOsIntoBatches groups withdrawal UTXOs into batches for efficient processing
-func (up *UtxoProcessor) groupWithdrawalUTXOsIntoBatches(utxos []*models.UTXO) []*bridgeOutBatch {
-	var batches []*bridgeOutBatch
-	currentBatch := &bridgeOutBatch{
-		ID:          big.NewInt(time.Now().Unix()), // Simple batch ID based on timestamp
-		TotalAmount: big.NewInt(0),
-		UTXOs:       make([]*models.UTXO, 0),
-		TaskIds:     make([]*big.Int, 0),
-	}
-
-	for _, utxo := range utxos {
-		// Validate UTXO has required data
-		if utxo.EvmAddr == "" {
-			up.logger.Warnf("Skipping UTXO %s: missing EVM address", utxo.Uid)
-			continue
-		}
-
-		currentBatch.TotalAmount.Add(currentBatch.TotalAmount, big.NewInt(utxo.Amount))
-		currentBatch.UTXOs = append(currentBatch.UTXOs, utxo)
-		// For withdrawals, we can use the UTXO ID as task ID (or derive from UTXO data)
-		currentBatch.TaskIds = append(currentBatch.TaskIds, big.NewInt(int64(utxo.ID)))
-
-		// Check if batch is full (limit to prevent large transactions)
-		if len(currentBatch.UTXOs) >= 5 {
-			batches = append(batches, currentBatch)
-			currentBatch = &bridgeOutBatch{
-				ID:          big.NewInt(time.Now().Unix() + int64(len(batches))),
-				TotalAmount: big.NewInt(0),
-				UTXOs:       make([]*models.UTXO, 0),
-				TaskIds:     make([]*big.Int, 0),
-			}
-		}
-	}
-
-	// Add the last batch if it has transactions
-	if len(currentBatch.UTXOs) > 0 {
-		batches = append(batches, currentBatch)
-	}
-
-	return batches
-}
-
-// processBatch processes a batch of bridge transactions
-func (up *UtxoProcessor) processBatch(batch *bridgeInBatch) error {
-	up.logger.Infof("Processing bridge batch %s with %d transactions, total amount: %s DOGE",
-		batch.ID.String(), len(batch.TransactionParams), batch.TotalAmount.String())
-
-	// Generate bridge transaction calldata
-	calldata, err := up.generateBridgeInCalldata(batch)
-	if err != nil {
-		return fmt.Errorf("failed to generate bridge calldata: %w", err)
-	}
-
-	up.logger.Infof("Generated bridge calldata: %x", calldata)
-
-	// Create session ID for TSS signing
-	sessionID, err := up.generateSessionID(batch)
-	if err != nil {
-		return fmt.Errorf("failed to generate session ID: %w", err)
-	}
-
-	// Store the pending batch data
-	pending := &pendingBatch{
-		batchType:    "deposit",
-		depositBatch: batch,
-		calldata:     calldata,
-		utxos:        batch.UTXOs,
-	}
-	up.pendingBatches.Store(sessionID, pending)
-
-	// Request TSS signature asynchronously
-	err = up.requestTssSignature(calldata, sessionID)
-	if err != nil {
-		// Clean up the pending batch on error
-		up.pendingBatches.Delete(sessionID)
-		return fmt.Errorf("failed to request TSS signature: %w", err)
-	}
-
-	// The actual signing will be handled by the event bus
-	up.logger.Infof("TSS signature requested for batch %s", batch.ID.String())
-
-	return nil
-}
-
 // processDepositBatch processes a batch of deposit bridge transactions
 func (up *UtxoProcessor) processDepositBatch(batch *bridgeInBatch) error {
 	up.logger.Infof("Processing deposit bridge batch %s with %d transactions, total amount: %s DOGE",
@@ -350,12 +293,12 @@ func (up *UtxoProcessor) processDepositBatch(batch *bridgeInBatch) error {
 }
 
 // processWithdrawalBatch processes a batch of withdrawal bridge transactions
-func (up *UtxoProcessor) processWithdrawalBatch(batch *bridgeOutBatch) error {
-	up.logger.Infof("Processing withdrawal bridge batch %s with %d UTXOs, total amount: %s DOGE",
-		batch.ID.String(), len(batch.UTXOs), batch.TotalAmount.String())
+func (up *UtxoProcessor) processWithdrawalRequest(request *withdrawalRequest) error {
+	up.logger.Infof("Processing withdrawal request %s with single UTXO %s, total amount: %s DOGE",
+		request.ID.String(), request.UTXO.Uid, request.TotalAmount.String())
 
 	// Generate bridgeOutFinish calldata for withdrawal
-	calldata, err := up.generateBridgeOutFinishCalldata(batch)
+	calldata, err := up.generateBridgeOutFinishCalldata(request)
 	if err != nil {
 		return fmt.Errorf("failed to generate bridgeOutFinish calldata: %w", err)
 	}
@@ -363,30 +306,30 @@ func (up *UtxoProcessor) processWithdrawalBatch(batch *bridgeOutBatch) error {
 	up.logger.Infof("Generated bridgeOutFinish calldata: %x", calldata)
 
 	// Create session ID for TSS signing
-	sessionID, err := up.generateWithdrawalSessionID(batch)
+	sessionID, err := up.generateWithdrawalSessionID(request)
 	if err != nil {
 		return fmt.Errorf("failed to generate session ID: %w", err)
 	}
 
-	// Store the pending batch data
+	// Store the pending request data
 	pending := &pendingBatch{
-		batchType:     "withdrawal",
-		withdrawBatch: batch,
-		calldata:      calldata,
-		utxos:         batch.UTXOs,
+		batchType:         "withdrawal",
+		withdrawalRequest: request,
+		calldata:          calldata,
+		utxos:             []*models.UTXO{request.UTXO}, // Convert single UTXO to slice for compatibility
 	}
 	up.pendingBatches.Store(sessionID, pending)
 
 	// Request TSS signature asynchronously
-	err = up.requestWithdrawalTssSignature(calldata, sessionID, batch)
+	err = up.requestWithdrawalTssSignature(calldata, sessionID, request)
 	if err != nil {
-		// Clean up the pending batch on error
+		// Clean up the pending request on error
 		up.pendingBatches.Delete(sessionID)
 		return fmt.Errorf("failed to request TSS signature: %w", err)
 	}
 
 	// The actual signing will be handled by the event bus
-	up.logger.Infof("TSS signature requested for withdrawal batch %s", batch.ID.String())
+	up.logger.Infof("TSS signature requested for withdrawal request %s", request.ID.String())
 
 	return nil
 }
@@ -424,32 +367,30 @@ func (up *UtxoProcessor) generateSessionID(batch *bridgeInBatch) (string, error)
 	return fmt.Sprintf("session-%s", shortHash), nil
 }
 
-// generateWithdrawalSessionID generates a session ID for withdrawal batches
-func (up *UtxoProcessor) generateWithdrawalSessionID(batch *bridgeOutBatch) (string, error) {
-	// Create a deterministic session ID based on the UTXOs in the batch
-	// This ensures all nodes generate the same session ID for the same batch
+// generateWithdrawalSessionID generates a session ID for withdrawal requests
+func (up *UtxoProcessor) generateWithdrawalSessionID(request *withdrawalRequest) (string, error) {
+	// Create a deterministic session ID based on the single UTXO and its task IDs
+	// This ensures all nodes generate the same session ID for the same withdrawal
 
-	if len(batch.UTXOs) == 0 {
-		return "", fmt.Errorf("cannot generate session ID for empty batch")
+	if request.UTXO == nil {
+		return "", fmt.Errorf("cannot generate session ID for request with no UTXO")
 	}
 
-	// Create a list of UTXO txids and sort them for consistency
-	txids := make([]string, len(batch.UTXOs))
-	for i, utxo := range batch.UTXOs {
-		txids[i] = utxo.Txid
-	}
+	utxo := request.UTXO
 
-	// Sort to ensure consistent ordering across all nodes
-	sort.Strings(txids)
-
-	// Concatenate all txids with withdrawal prefix
+	// Create a deterministic string combining UTXO info and task IDs
 	var concatenated string
-	for _, txid := range txids {
-		concatenated += txid + "|"
-	}
-	concatenated = "withdrawal|" + concatenated
+	concatenated += "withdrawal|" + utxo.Txid + "|"
 
-	// Create SHA256 hash of the concatenated txids
+	// Add task IDs to ensure uniqueness
+	for _, taskId := range request.TaskIds {
+		concatenated += taskId.String() + "|"
+	}
+
+	// Add total amount for additional uniqueness
+	concatenated += request.TotalAmount.String()
+
+	// Create SHA256 hash of the concatenated data
 	hash := sha256.Sum256([]byte(concatenated))
 	hashHex := hex.EncodeToString(hash[:])
 
@@ -475,30 +416,40 @@ func (up *UtxoProcessor) generateBridgeInCalldata(batch *bridgeInBatch) ([]byte,
 }
 
 // generateBridgeOutFinishCalldata generates the calldata for bridgeOutFinish function
-func (up *UtxoProcessor) generateBridgeOutFinishCalldata(batch *bridgeOutBatch) ([]byte, error) {
+func (up *UtxoProcessor) generateBridgeOutFinishCalldata(request *withdrawalRequest) ([]byte, error) {
 	if up.contractBuilder == nil {
 		return nil, fmt.Errorf("contract builder not set")
 	}
 
-	// For bridgeOutFinish, we need to process each UTXO as a separate transaction
-	// Take the first UTXO for now (in practice, you might want to batch multiple)
-	if len(batch.UTXOs) == 0 {
-		return nil, fmt.Errorf("no UTXOs in withdrawal batch")
+	if request.UTXO == nil {
+		return nil, fmt.Errorf("no UTXO in withdrawal request")
 	}
 
-	// Use the first UTXO to create a bridge transaction
-	firstUTXO := batch.UTXOs[0]
+	// For bridge out, we process a single UTXO that contains multiple outputs
+	// Each output aligns with a task ID
+	utxo := request.UTXO
+
+	// Create bridge transaction using the UTXO transaction data
+	// The transaction contains multiple outputs, but we represent it as a single BridgeTransaction
+	// with the full transaction data and aligned task IDs
 	bridgeTx := contract.BridgeTransaction{
-		DestEvmAddress: common.HexToAddress(firstUTXO.EvmAddr),
-		Amount:         big.NewInt(firstUTXO.Amount),
-		TxBytes:        []byte(firstUTXO.Txid),
+		DestEvmAddress: common.HexToAddress(utxo.EvmAddr), // This might be the fee recipient or contract address
+		Amount:         request.TotalAmount,               // Total amount of all outputs
+		TxBytes:        []byte(utxo.Txid),                 // Transaction ID as bytes (could be full tx bytes if available)
 	}
+
+	up.logger.Infof("Generating bridgeOutFinish calldata: requestId=%s, totalAmount=%s, taskIds=%d",
+		request.ID.String(), request.TotalAmount.String(), len(request.TaskIds))
 
 	// Generate the bridgeOutFinish transaction calldata
-	calldata, err := up.contractBuilder.GenerateBridgeOutFinishTxData(batch.ID, bridgeTx, batch.TaskIds)
+	// This creates calldata for: bridgeOutFinish(uint256 requestId, BridgeTransaction bridgeTx, uint256[] taskIds)
+	calldata, err := up.contractBuilder.GenerateBridgeOutFinishTxData(request.ID, bridgeTx, request.TaskIds)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate bridgeOutFinish transaction data: %w", err)
 	}
+
+	up.logger.Debugf("Generated bridgeOutFinish calldata for UTXO %s with %d task IDs: [%v]",
+		utxo.Uid, len(request.TaskIds), request.TaskIds)
 
 	return calldata, nil
 }
@@ -598,7 +549,7 @@ func (up *UtxoProcessor) sendProposalToP2P(proposal *DepositProposal) error {
 }
 
 // requestWithdrawalTssSignature creates a withdrawal proposal and requests TSS signature
-func (up *UtxoProcessor) requestWithdrawalTssSignature(calldata []byte, sessionID string, batch *bridgeOutBatch) error {
+func (up *UtxoProcessor) requestWithdrawalTssSignature(calldata []byte, sessionID string, request *withdrawalRequest) error {
 	if up.chainID == nil {
 		return fmt.Errorf("chain ID not set")
 	}
@@ -609,16 +560,16 @@ func (up *UtxoProcessor) requestWithdrawalTssSignature(calldata []byte, sessionI
 		return fmt.Errorf("failed to get proposer address: %w", err)
 	}
 
-	// Create batch ID from session ID for consistency
-	batchID := fmt.Sprintf("withdrawal-batch-%s", sessionID)
+	// Create request ID from session ID for consistency
+	requestID := fmt.Sprintf("withdrawal-request-%s", sessionID)
 
-	// Create the withdrawal proposal for the batch
+	// Create the withdrawal proposal for the request
 	proposal := NewWithdrawalProposal(
-		batchID,
-		batch.UTXOs,
-		batch.TotalAmount,
+		requestID,
+		[]*models.UTXO{request.UTXO}, // Convert single UTXO to slice for proposal compatibility
+		request.TotalAmount,
 		calldata,
-		batch.TaskIds,
+		request.TaskIds,
 		proposerAddress.Hex(),
 		sessionID,
 	)
@@ -636,7 +587,7 @@ func (up *UtxoProcessor) requestWithdrawalTssSignature(calldata []byte, sessionI
 
 	// Request TSS signature using the callTssSign function
 	up.callTssSign(sessionID, hash)
-	up.logger.Infof("TSS signing requested for withdrawal batch %s with session ID: %s", batchID, sessionID)
+	up.logger.Infof("TSS signing requested for withdrawal request %s with session ID: %s", requestID, sessionID)
 
 	return nil
 }
@@ -670,6 +621,7 @@ func (up *UtxoProcessor) GetStats() map[string]interface{} {
 		"bridge_contract":   up.bridgeContract.Hex(),
 		"current_proposer":  up.currentProposer.Hex(),
 		"proposer_set":      up.proposerSet,
+		"processing_model":  "deposits_batched_withdrawals_individual",
 	}
 }
 
@@ -692,4 +644,54 @@ func (up *UtxoProcessor) getNodeEthereumAddress() (common.Address, error) {
 	}
 
 	return network.GetNodeEthereumAddress()
+}
+
+// getVOUTsForTransaction retrieves all VOUT records for a specific transaction
+func (up *UtxoProcessor) getVOUTsForTransaction(txid string) ([]*models.VOUT, error) {
+	var vouts []*models.VOUT
+
+	err := up.conn.GetDB().Where(
+		"txid = ? AND source = ?",
+		txid,
+		models.UTXO_SOURCE_WITHDRAWAL,
+	).Order("out_index ASC").Find(&vouts).Error
+
+	if err != nil {
+		return nil, err
+	}
+
+	return vouts, nil
+}
+
+// createWithdrawalRequestFromUTXO creates a withdrawal request from a single UTXO and its outputs
+func (up *UtxoProcessor) createWithdrawalRequestFromUTXO(utxo *models.UTXO, vouts []*models.VOUT) *withdrawalRequest {
+	// Create task IDs from VOUT WithdrawId or OutIndex
+	taskIds := make([]*big.Int, 0, len(vouts))
+	totalAmount := big.NewInt(0)
+
+	for _, vout := range vouts {
+		// Use WithdrawId as task ID if available, otherwise use a combination of txid and out_index
+		var taskId *big.Int
+		if vout.WithdrawId != "" {
+			// Parse WithdrawId as task ID (assuming it's numeric)
+			taskId = big.NewInt(0)
+			taskId.SetString(vout.WithdrawId, 10)
+		} else {
+			// Fallback: use VOUT ID or OutIndex as task ID
+			taskId = big.NewInt(int64(vout.ID))
+		}
+
+		taskIds = append(taskIds, taskId)
+		totalAmount.Add(totalAmount, big.NewInt(vout.Amount))
+
+		up.logger.Debugf("VOUT %d: amount=%d, receiver=%s, taskId=%s",
+			vout.OutIndex, vout.Amount, vout.Receiver, taskId.String())
+	}
+
+	return &withdrawalRequest{
+		ID:          big.NewInt(time.Now().Unix()),
+		UTXO:        utxo,
+		TotalAmount: totalAmount,
+		TaskIds:     taskIds,
+	}
 }

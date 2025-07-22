@@ -26,21 +26,21 @@ type bridgeInBatch struct {
 	UTXOs             []*models.UTXO
 }
 
-// bridgeOutBatch represents a batch of withdrawal transactions
-type bridgeOutBatch struct {
+// withdrawalRequest represents a single withdrawal request with multiple outputs aligned to task IDs
+type withdrawalRequest struct {
 	ID          *big.Int
-	UTXOs       []*models.UTXO
+	UTXO        *models.UTXO // Single UTXO with multiple outputs
 	TotalAmount *big.Int
-	TaskIds     []*big.Int
+	TaskIds     []*big.Int // Task IDs aligned with VOUT outputs
 }
 
 // pendingBatch stores batch data while waiting for TSS signature
 type pendingBatch struct {
-	batchType     string // "deposit" or "withdrawal"
-	depositBatch  *bridgeInBatch
-	withdrawBatch *bridgeOutBatch
-	calldata      []byte
-	utxos         []*models.UTXO
+	batchType         string // "deposit" or "withdrawal"
+	depositBatch      *bridgeInBatch
+	withdrawalRequest *withdrawalRequest
+	calldata          []byte
+	utxos             []*models.UTXO
 }
 
 // UtxoProcessor manages UTXO processing for bridge operations

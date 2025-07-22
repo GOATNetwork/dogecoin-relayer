@@ -133,19 +133,19 @@ func (up *UtxoProcessor) handleP2PWithdrawalProposal(msg *types.P2PBroadcastMess
 		return fmt.Errorf("invalid withdrawal proposal: %w", err)
 	}
 
-	// Create pending batch entry for tracking
-	batch := &bridgeOutBatch{
-		ID:          big.NewInt(0), // Will be set based on batch ID
-		UTXOs:       proposal.UTXOs,
+	// Create pending request entry for tracking
+	request := &withdrawalRequest{
+		ID:          big.NewInt(0),     // Will be set based on request ID
+		UTXO:        proposal.UTXOs[0], // Single UTXO from proposal
 		TotalAmount: proposal.TotalAmount,
 		TaskIds:     proposal.TaskIds,
 	}
 
 	pending := &pendingBatch{
-		batchType:     "withdrawal",
-		withdrawBatch: batch,
-		calldata:      proposal.Calldata,
-		utxos:         proposal.UTXOs,
+		batchType:         "withdrawal",
+		withdrawalRequest: request,
+		calldata:          proposal.Calldata,
+		utxos:             proposal.UTXOs,
 	}
 
 	// Store the pending batch for when signature comes back
@@ -270,10 +270,10 @@ func (up *UtxoProcessor) completeBatchWithSignature(pending *pendingBatch, signa
 			return fmt.Errorf("deposit batch is nil")
 		}
 	case "withdrawal":
-		if pending.withdrawBatch != nil {
-			batchID = pending.withdrawBatch.ID.String()
+		if pending.withdrawalRequest != nil {
+			batchID = pending.withdrawalRequest.ID.String()
 		} else {
-			return fmt.Errorf("withdrawal batch is nil")
+			return fmt.Errorf("withdrawal request is nil")
 		}
 	default:
 		return fmt.Errorf("unknown batch type: %s", pending.batchType)
@@ -353,10 +353,10 @@ func (up *UtxoProcessor) handleBatchSigningFailure(pending *pendingBatch, errorM
 			batchID = "unknown-deposit-batch"
 		}
 	case "withdrawal":
-		if pending.withdrawBatch != nil {
-			batchID = pending.withdrawBatch.ID.String()
+		if pending.withdrawalRequest != nil {
+			batchID = pending.withdrawalRequest.ID.String()
 		} else {
-			batchID = "unknown-withdrawal-batch"
+			batchID = "unknown-withdrawal-request"
 		}
 	default:
 		batchID = "unknown-batch-type"
