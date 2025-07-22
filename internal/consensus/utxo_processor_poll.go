@@ -48,6 +48,21 @@ func (up *UtxoProcessor) processNewUTXOs() error {
 		return nil
 	}
 
+	// Process deposit UTXOs
+	if err := up.processDepositUTXOs(); err != nil {
+		up.logger.Errorf("Failed to process deposit UTXOs: %v", err)
+	}
+
+	// Process withdrawal UTXOs
+	if err := up.processWithdrawalUTXOs(); err != nil {
+		up.logger.Errorf("Failed to process withdrawal UTXOs: %v", err)
+	}
+
+	return nil
+}
+
+// processDepositUTXOs handles deposit UTXO processing
+func (up *UtxoProcessor) processDepositUTXOs() error {
 	// Query for new unprocessed deposit UTXOs
 	utxos, err := up.getUnprocessedDepositUTXOs()
 	if err != nil {
@@ -64,14 +79,46 @@ func (up *UtxoProcessor) processNewUTXOs() error {
 	batches := up.groupUTXOsIntoBatches(utxos)
 
 	for _, batch := range batches {
-		if err := up.processBatch(batch); err != nil {
-			up.logger.Errorf("Failed to process batch %s: %v", batch.ID.String(), err)
+		if err := up.processDepositBatch(batch); err != nil {
+			up.logger.Errorf("Failed to process deposit batch %s: %v", batch.ID.String(), err)
 			continue
 		}
 
 		// Mark UTXOs as processed
 		if err := up.markUTXOsAsProcessed(batch.UTXOs); err != nil {
-			up.logger.Errorf("Failed to mark UTXOs as processed: %v", err)
+			up.logger.Errorf("Failed to mark deposit UTXOs as processed: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// processWithdrawalUTXOs handles withdrawal UTXO processing
+func (up *UtxoProcessor) processWithdrawalUTXOs() error {
+	// Query for new unprocessed withdrawal UTXOs
+	utxos, err := up.getUnprocessedWithdrawalUTXOs()
+	if err != nil {
+		return fmt.Errorf("failed to get unprocessed withdrawal UTXOs: %w", err)
+	}
+
+	if len(utxos) == 0 {
+		return nil // No new withdrawal UTXOs to process
+	}
+
+	up.logger.Infof("Found %d new withdrawal UTXOs to process", len(utxos))
+
+	// Group withdrawal UTXOs into batches
+	batches := up.groupWithdrawalUTXOsIntoBatches(utxos)
+
+	for _, batch := range batches {
+		if err := up.processWithdrawalBatch(batch); err != nil {
+			up.logger.Errorf("Failed to process withdrawal batch %s: %v", batch.ID.String(), err)
+			continue
+		}
+
+		// Mark UTXOs as processed
+		if err := up.markUTXOsAsProcessed(batch.UTXOs); err != nil {
+			up.logger.Errorf("Failed to mark withdrawal UTXOs as processed: %v", err)
 		}
 	}
 
@@ -103,14 +150,39 @@ func (up *UtxoProcessor) getUnprocessedDepositUTXOs() ([]*models.UTXO, error) {
 	return utxos, nil
 }
 
+// getUnprocessedWithdrawalUTXOs retrieves unprocessed withdrawal UTXOs from database
+func (up *UtxoProcessor) getUnprocessedWithdrawalUTXOs() ([]*models.UTXO, error) {
+	var utxos []*models.UTXO
+
+	// Query for withdrawal UTXOs that haven't been processed yet
+	err := up.conn.GetDB().Where(
+		"source = ? AND status = ? AND id > ? AND evm_addr != ?",
+		models.UTXO_SOURCE_WITHDRAWAL,
+		models.UTXO_STATUS_CONFIRMED,
+		up.lastProcessedId,
+		"", // Non-empty EVM address required for withdrawals
+	).Limit(up.batchSize).Find(&utxos).Error
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Update last processed ID
+	if len(utxos) > 0 {
+		up.lastProcessedId = utxos[len(utxos)-1].ID
+	}
+
+	return utxos, nil
+}
+
 // groupUTXOsIntoBatches groups UTXOs into batches for efficient processing
-func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*bridgeBatch {
-	var batches []*bridgeBatch
-	currentBatch := &bridgeBatch{
-		ID:           big.NewInt(time.Now().Unix()), // Simple batch ID based on timestamp
-		Transactions: make([]contract.BridgeTransaction, 0),
-		TotalAmount:  big.NewInt(0),
-		UTXOs:        make([]*models.UTXO, 0),
+func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*bridgeInBatch {
+	var batches []*bridgeInBatch
+	currentBatch := &bridgeInBatch{
+		ID:                big.NewInt(time.Now().Unix()), // Simple batch ID based on timestamp
+		TransactionParams: make([]contract.BridgeTransaction, 0),
+		TotalAmount:       big.NewInt(0),
+		UTXOs:             make([]*models.UTXO, 0),
 	}
 
 	for _, utxo := range utxos {
@@ -127,24 +199,66 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*bridgeBa
 			TxBytes:        []byte(utxo.Txid), // Store transaction ID as bytes
 		}
 
-		currentBatch.Transactions = append(currentBatch.Transactions, bridgeTx)
+		currentBatch.TransactionParams = append(currentBatch.TransactionParams, bridgeTx)
 		currentBatch.TotalAmount.Add(currentBatch.TotalAmount, big.NewInt(utxo.Amount))
 		currentBatch.UTXOs = append(currentBatch.UTXOs, utxo)
 
 		// Check if batch is full (limit to prevent large transactions)
-		if len(currentBatch.Transactions) >= 5 {
+		if len(currentBatch.TransactionParams) >= 5 {
 			batches = append(batches, currentBatch)
-			currentBatch = &bridgeBatch{
-				ID:           big.NewInt(time.Now().Unix() + int64(len(batches))),
-				Transactions: make([]contract.BridgeTransaction, 0),
-				TotalAmount:  big.NewInt(0),
-				UTXOs:        make([]*models.UTXO, 0),
+			currentBatch = &bridgeInBatch{
+				ID:                big.NewInt(time.Now().Unix() + int64(len(batches))),
+				TransactionParams: make([]contract.BridgeTransaction, 0),
+				TotalAmount:       big.NewInt(0),
+				UTXOs:             make([]*models.UTXO, 0),
 			}
 		}
 	}
 
 	// Add the last batch if it has transactions
-	if len(currentBatch.Transactions) > 0 {
+	if len(currentBatch.TransactionParams) > 0 {
+		batches = append(batches, currentBatch)
+	}
+
+	return batches
+}
+
+// groupWithdrawalUTXOsIntoBatches groups withdrawal UTXOs into batches for efficient processing
+func (up *UtxoProcessor) groupWithdrawalUTXOsIntoBatches(utxos []*models.UTXO) []*bridgeOutBatch {
+	var batches []*bridgeOutBatch
+	currentBatch := &bridgeOutBatch{
+		ID:          big.NewInt(time.Now().Unix()), // Simple batch ID based on timestamp
+		TotalAmount: big.NewInt(0),
+		UTXOs:       make([]*models.UTXO, 0),
+		TaskIds:     make([]*big.Int, 0),
+	}
+
+	for _, utxo := range utxos {
+		// Validate UTXO has required data
+		if utxo.EvmAddr == "" {
+			up.logger.Warnf("Skipping UTXO %s: missing EVM address", utxo.Uid)
+			continue
+		}
+
+		currentBatch.TotalAmount.Add(currentBatch.TotalAmount, big.NewInt(utxo.Amount))
+		currentBatch.UTXOs = append(currentBatch.UTXOs, utxo)
+		// For withdrawals, we can use the UTXO ID as task ID (or derive from UTXO data)
+		currentBatch.TaskIds = append(currentBatch.TaskIds, big.NewInt(int64(utxo.ID)))
+
+		// Check if batch is full (limit to prevent large transactions)
+		if len(currentBatch.UTXOs) >= 5 {
+			batches = append(batches, currentBatch)
+			currentBatch = &bridgeOutBatch{
+				ID:          big.NewInt(time.Now().Unix() + int64(len(batches))),
+				TotalAmount: big.NewInt(0),
+				UTXOs:       make([]*models.UTXO, 0),
+				TaskIds:     make([]*big.Int, 0),
+			}
+		}
+	}
+
+	// Add the last batch if it has transactions
+	if len(currentBatch.UTXOs) > 0 {
 		batches = append(batches, currentBatch)
 	}
 
@@ -152,9 +266,9 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*bridgeBa
 }
 
 // processBatch processes a batch of bridge transactions
-func (up *UtxoProcessor) processBatch(batch *bridgeBatch) error {
+func (up *UtxoProcessor) processBatch(batch *bridgeInBatch) error {
 	up.logger.Infof("Processing bridge batch %s with %d transactions, total amount: %s DOGE",
-		batch.ID.String(), len(batch.Transactions), batch.TotalAmount.String())
+		batch.ID.String(), len(batch.TransactionParams), batch.TotalAmount.String())
 
 	// Generate bridge transaction calldata
 	calldata, err := up.generateBridgeInCalldata(batch)
@@ -172,9 +286,10 @@ func (up *UtxoProcessor) processBatch(batch *bridgeBatch) error {
 
 	// Store the pending batch data
 	pending := &pendingBatch{
-		batch:    batch,
-		calldata: calldata,
-		utxos:    batch.UTXOs,
+		batchType:    "deposit",
+		depositBatch: batch,
+		calldata:     calldata,
+		utxos:        batch.UTXOs,
 	}
 	up.pendingBatches.Store(sessionID, pending)
 
@@ -192,7 +307,91 @@ func (up *UtxoProcessor) processBatch(batch *bridgeBatch) error {
 	return nil
 }
 
-func (up *UtxoProcessor) generateSessionID(batch *bridgeBatch) (string, error) {
+// processDepositBatch processes a batch of deposit bridge transactions
+func (up *UtxoProcessor) processDepositBatch(batch *bridgeInBatch) error {
+	up.logger.Infof("Processing deposit bridge batch %s with %d transactions, total amount: %s DOGE",
+		batch.ID.String(), len(batch.TransactionParams), batch.TotalAmount.String())
+
+	// Generate bridge transaction calldata
+	calldata, err := up.generateBridgeInCalldata(batch)
+	if err != nil {
+		return fmt.Errorf("failed to generate bridge calldata: %w", err)
+	}
+
+	up.logger.Infof("Generated bridge calldata: %x", calldata)
+
+	// Create session ID for TSS signing
+	sessionID, err := up.generateSessionID(batch)
+	if err != nil {
+		return fmt.Errorf("failed to generate session ID: %w", err)
+	}
+
+	// Store the pending batch data
+	pending := &pendingBatch{
+		batchType:    "deposit",
+		depositBatch: batch,
+		calldata:     calldata,
+		utxos:        batch.UTXOs,
+	}
+	up.pendingBatches.Store(sessionID, pending)
+
+	// Request TSS signature asynchronously
+	err = up.requestTssSignature(calldata, sessionID)
+	if err != nil {
+		// Clean up the pending batch on error
+		up.pendingBatches.Delete(sessionID)
+		return fmt.Errorf("failed to request TSS signature: %w", err)
+	}
+
+	// The actual signing will be handled by the event bus
+	up.logger.Infof("TSS signature requested for deposit batch %s", batch.ID.String())
+
+	return nil
+}
+
+// processWithdrawalBatch processes a batch of withdrawal bridge transactions
+func (up *UtxoProcessor) processWithdrawalBatch(batch *bridgeOutBatch) error {
+	up.logger.Infof("Processing withdrawal bridge batch %s with %d UTXOs, total amount: %s DOGE",
+		batch.ID.String(), len(batch.UTXOs), batch.TotalAmount.String())
+
+	// Generate bridgeOutFinish calldata for withdrawal
+	calldata, err := up.generateBridgeOutFinishCalldata(batch)
+	if err != nil {
+		return fmt.Errorf("failed to generate bridgeOutFinish calldata: %w", err)
+	}
+
+	up.logger.Infof("Generated bridgeOutFinish calldata: %x", calldata)
+
+	// Create session ID for TSS signing
+	sessionID, err := up.generateWithdrawalSessionID(batch)
+	if err != nil {
+		return fmt.Errorf("failed to generate session ID: %w", err)
+	}
+
+	// Store the pending batch data
+	pending := &pendingBatch{
+		batchType:     "withdrawal",
+		withdrawBatch: batch,
+		calldata:      calldata,
+		utxos:         batch.UTXOs,
+	}
+	up.pendingBatches.Store(sessionID, pending)
+
+	// Request TSS signature asynchronously
+	err = up.requestWithdrawalTssSignature(calldata, sessionID, batch)
+	if err != nil {
+		// Clean up the pending batch on error
+		up.pendingBatches.Delete(sessionID)
+		return fmt.Errorf("failed to request TSS signature: %w", err)
+	}
+
+	// The actual signing will be handled by the event bus
+	up.logger.Infof("TSS signature requested for withdrawal batch %s", batch.ID.String())
+
+	return nil
+}
+
+func (up *UtxoProcessor) generateSessionID(batch *bridgeInBatch) (string, error) {
 	// Create a deterministic session ID based on the UTXOs in the batch
 	// This ensures all nodes generate the same session ID for the same batch
 
@@ -225,16 +424,80 @@ func (up *UtxoProcessor) generateSessionID(batch *bridgeBatch) (string, error) {
 	return fmt.Sprintf("session-%s", shortHash), nil
 }
 
+// generateWithdrawalSessionID generates a session ID for withdrawal batches
+func (up *UtxoProcessor) generateWithdrawalSessionID(batch *bridgeOutBatch) (string, error) {
+	// Create a deterministic session ID based on the UTXOs in the batch
+	// This ensures all nodes generate the same session ID for the same batch
+
+	if len(batch.UTXOs) == 0 {
+		return "", fmt.Errorf("cannot generate session ID for empty batch")
+	}
+
+	// Create a list of UTXO txids and sort them for consistency
+	txids := make([]string, len(batch.UTXOs))
+	for i, utxo := range batch.UTXOs {
+		txids[i] = utxo.Txid
+	}
+
+	// Sort to ensure consistent ordering across all nodes
+	sort.Strings(txids)
+
+	// Concatenate all txids with withdrawal prefix
+	var concatenated string
+	for _, txid := range txids {
+		concatenated += txid + "|"
+	}
+	concatenated = "withdrawal|" + concatenated
+
+	// Create SHA256 hash of the concatenated txids
+	hash := sha256.Sum256([]byte(concatenated))
+	hashHex := hex.EncodeToString(hash[:])
+
+	// Take the first 16 characters of the hash for a reasonably short but unique session ID
+	shortHash := hashHex[:16]
+
+	return fmt.Sprintf("withdrawal-session-%s", shortHash), nil
+}
+
 // generateBridgeInCalldata generates the calldata for bridge transactions
-func (up *UtxoProcessor) generateBridgeInCalldata(batch *bridgeBatch) ([]byte, error) {
+func (up *UtxoProcessor) generateBridgeInCalldata(batch *bridgeInBatch) ([]byte, error) {
 	if up.contractBuilder == nil {
 		return nil, fmt.Errorf("contract builder not set")
 	}
 
 	// Generate the bridge transaction calldata
-	calldata, err := up.contractBuilder.GenerateBridgeInTxData(batch.Transactions, batch.ID)
+	calldata, err := up.contractBuilder.GenerateBridgeInTxData(batch.TransactionParams, batch.ID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate bridge transaction data: %w", err)
+	}
+
+	return calldata, nil
+}
+
+// generateBridgeOutFinishCalldata generates the calldata for bridgeOutFinish function
+func (up *UtxoProcessor) generateBridgeOutFinishCalldata(batch *bridgeOutBatch) ([]byte, error) {
+	if up.contractBuilder == nil {
+		return nil, fmt.Errorf("contract builder not set")
+	}
+
+	// For bridgeOutFinish, we need to process each UTXO as a separate transaction
+	// Take the first UTXO for now (in practice, you might want to batch multiple)
+	if len(batch.UTXOs) == 0 {
+		return nil, fmt.Errorf("no UTXOs in withdrawal batch")
+	}
+
+	// Use the first UTXO to create a bridge transaction
+	firstUTXO := batch.UTXOs[0]
+	bridgeTx := contract.BridgeTransaction{
+		DestEvmAddress: common.HexToAddress(firstUTXO.EvmAddr),
+		Amount:         big.NewInt(firstUTXO.Amount),
+		TxBytes:        []byte(firstUTXO.Txid),
+	}
+
+	// Generate the bridgeOutFinish transaction calldata
+	calldata, err := up.contractBuilder.GenerateBridgeOutFinishTxData(batch.ID, bridgeTx, batch.TaskIds)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate bridgeOutFinish transaction data: %w", err)
 	}
 
 	return calldata, nil
@@ -268,7 +531,29 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 	}
 
 	pending := pendingData.(*pendingBatch)
-	batch := pending.batch
+
+	var batchUTXOs []*models.UTXO
+	var totalAmount *big.Int
+
+	// Get batch details based on type
+	switch pending.batchType {
+	case "deposit":
+		if pending.depositBatch != nil {
+			batchUTXOs = pending.depositBatch.UTXOs
+			totalAmount = pending.depositBatch.TotalAmount
+		}
+	case "withdrawal":
+		if pending.withdrawBatch != nil {
+			batchUTXOs = pending.withdrawBatch.UTXOs
+			totalAmount = pending.withdrawBatch.TotalAmount
+		}
+	default:
+		return fmt.Errorf("unknown batch type: %s", pending.batchType)
+	}
+
+	if len(batchUTXOs) == 0 {
+		return fmt.Errorf("no UTXOs found in pending batch")
+	}
 
 	// Get this node's Ethereum address (proposer)
 	proposerAddress, err := up.getNodeEthereumAddress()
@@ -282,8 +567,8 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 	// Create the deposit proposal for the batch
 	proposal := NewDepositProposal(
 		batchID,
-		batch.UTXOs,
-		batch.TotalAmount,
+		batchUTXOs,
+		totalAmount,
 		calldata,
 		proposerAddress.Hex(),
 		sessionID,
@@ -328,6 +613,69 @@ func (up *UtxoProcessor) sendProposalToP2P(proposal *DepositProposal) error {
 	})
 }
 
+// requestWithdrawalTssSignature creates a withdrawal proposal and requests TSS signature
+func (up *UtxoProcessor) requestWithdrawalTssSignature(calldata []byte, sessionID string, batch *bridgeOutBatch) error {
+	if up.chainID == nil {
+		return fmt.Errorf("chain ID not set")
+	}
+
+	// Get this node's Ethereum address (proposer)
+	proposerAddress, err := up.getNodeEthereumAddress()
+	if err != nil {
+		return fmt.Errorf("failed to get proposer address: %w", err)
+	}
+
+	// Create batch ID from session ID for consistency
+	batchID := fmt.Sprintf("withdrawal-batch-%s", sessionID)
+
+	// Create the withdrawal proposal for the batch
+	proposal := NewWithdrawalProposal(
+		batchID,
+		batch.UTXOs,
+		batch.TotalAmount,
+		calldata,
+		batch.TaskIds,
+		proposerAddress.Hex(),
+		sessionID,
+	)
+
+	// Send proposal to other P2P nodes
+	if err := up.sendWithdrawalProposalToP2P(proposal); err != nil {
+		up.logger.Errorf("Failed to send withdrawal proposal to P2P network: %v", err)
+		// Continue with TSS signing even if P2P broadcast fails
+	} else {
+		up.logger.Infof("Withdrawal proposal sent to P2P network for session %s", sessionID)
+	}
+
+	// Create hash to sign for verifyAndCall function
+	hash := crypto.Keccak256(calldata)
+
+	// Request TSS signature using the callTssSign function
+	up.callTssSign(sessionID, hash)
+	up.logger.Infof("TSS signing requested for withdrawal batch %s with session ID: %s", batchID, sessionID)
+
+	return nil
+}
+
+// sendWithdrawalProposalToP2P sends the withdrawal proposal to other P2P nodes
+func (up *UtxoProcessor) sendWithdrawalProposalToP2P(proposal *WithdrawalProposal) error {
+	p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
+	if !ok {
+		return fmt.Errorf("p2p module not found")
+	}
+
+	payload, err := proposal.MarshalJSON()
+	if err != nil {
+		return fmt.Errorf("failed to marshal withdrawal proposal: %v", err)
+	}
+
+	return p2pModule.(p2p.P2PSender).BroadcastP2PMessage(types.P2PBroadcastMessage{
+		Type:      types.P2PMessageTypeBridgeOut,
+		SessionID: proposal.SessionID,
+		Payload:   payload,
+	})
+}
+
 // GetStats returns current UTXO manager statistics
 func (up *UtxoProcessor) GetStats() map[string]interface{} {
 	return map[string]interface{}{
@@ -362,6 +710,17 @@ func (up *UtxoProcessor) getNodeEthereumAddress() (common.Address, error) {
 
 // isCurrentProposer checks if this node is the current proposer by querying the contract
 func (up *UtxoProcessor) isCurrentProposer() (bool, error) {
+	// Use ProposerManager if available (hybrid approach)
+	if up.proposerManager != nil {
+		return up.proposerManager.IsCurrentProposer()
+	}
+
+	// Fallback to old method if ProposerManager not available
+	return up.isCurrentProposerLegacy()
+}
+
+// isCurrentProposerLegacy is the original implementation for backward compatibility
+func (up *UtxoProcessor) isCurrentProposerLegacy() (bool, error) {
 	// Get this node's Ethereum address
 	nodeAddress, err := up.getNodeEthereumAddress()
 	if err != nil {

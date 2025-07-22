@@ -18,19 +18,29 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// bridgeBatch represents a batch of bridge transactions
-type bridgeBatch struct {
-	ID           *big.Int
-	Transactions []contract.BridgeTransaction
-	TotalAmount  *big.Int
-	UTXOs        []*models.UTXO
+// bridgeInBatch represents a batch of bridge transactions
+type bridgeInBatch struct {
+	ID                *big.Int
+	TransactionParams []contract.BridgeTransaction
+	TotalAmount       *big.Int
+	UTXOs             []*models.UTXO
+}
+
+// bridgeOutBatch represents a batch of withdrawal transactions
+type bridgeOutBatch struct {
+	ID          *big.Int
+	UTXOs       []*models.UTXO
+	TotalAmount *big.Int
+	TaskIds     []*big.Int
 }
 
 // pendingBatch stores batch data while waiting for TSS signature
 type pendingBatch struct {
-	batch    *bridgeBatch
-	calldata []byte
-	utxos    []*models.UTXO
+	batchType     string // "deposit" or "withdrawal"
+	depositBatch  *bridgeInBatch
+	withdrawBatch *bridgeOutBatch
+	calldata      []byte
+	utxos         []*models.UTXO
 }
 
 // UtxoProcessor manages UTXO processing for bridge operations
@@ -45,6 +55,9 @@ type UtxoProcessor struct {
 	chainID         *big.Int
 	p2pModule       *p2p.P2PModule // Reference to P2P module for accessing public key
 
+	// Proposer management
+	proposerManager *ProposerManager
+
 	// Pending batches waiting for TSS signatures
 	pendingBatches sync.Map // sessionID -> *pendingBatch
 
@@ -52,7 +65,6 @@ type UtxoProcessor struct {
 	pollInterval    time.Duration
 	batchSize       int
 	lastProcessedId uint
-	// activeSessions sync.Map
 
 	// Control
 	ctx       context.Context
@@ -96,6 +108,11 @@ func (up *UtxoProcessor) SetChainID(chainID *big.Int) {
 	up.chainID = chainID
 }
 
+// SetProposerManager sets the proposer manager for this processor
+func (up *UtxoProcessor) SetProposerManager(pm *ProposerManager) {
+	up.proposerManager = pm
+}
+
 // Start begins the UTXO monitoring process
 func (up *UtxoProcessor) Start() error {
 	if up.isRunning {
@@ -108,6 +125,15 @@ func (up *UtxoProcessor) Start() error {
 	up.registerP2PHandler()
 	// Subscribe to TSS signature responses
 	up.eventBus.Subscribe(eventbus.EventTssSigResponse, up.handleTssSignature)
+
+	// Start proposer manager if available
+	if up.proposerManager != nil {
+		if err := up.proposerManager.Start(); err != nil {
+			up.logger.Errorf("Failed to start proposer manager: %v", err)
+		} else {
+			up.logger.Info("Proposer manager started")
+		}
+	}
 
 	// Start the polling loop
 	go up.pollLoop()
@@ -122,6 +148,12 @@ func (up *UtxoProcessor) Stop() {
 	}
 
 	up.logger.Info("Stopping UTXO manager")
+
+	// Stop proposer manager
+	if up.proposerManager != nil {
+		up.proposerManager.Stop()
+	}
+
 	// Unsubscribe from events
 	up.eventBus.Unsubscribe(eventbus.EventTssSigResponse, up.handleTssSignature)
 	up.cancel()

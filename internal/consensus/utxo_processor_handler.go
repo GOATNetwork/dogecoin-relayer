@@ -27,6 +27,10 @@ func (up *UtxoProcessor) registerP2PHandler() {
 		p2pModule.(p2p.P2PSender).RegisterP2PHandler(types.P2PMessageTypeBridgeIn, func(msg *types.P2PBroadcastMessage) error {
 			return up.handleP2PDepositProposal(msg)
 		})
+		// register a handler for bridge out (withdrawal) message
+		p2pModule.(p2p.P2PSender).RegisterP2PHandler(types.P2PMessageTypeBridgeOut, func(msg *types.P2PBroadcastMessage) error {
+			return up.handleP2PWithdrawalProposal(msg)
+		})
 	}()
 }
 
@@ -86,17 +90,18 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 	}
 
 	// Create pending batch entry for tracking
-	batch := &bridgeBatch{
-		ID:           big.NewInt(0), // Will be set based on batch ID
-		UTXOs:        proposal.UTXOs,
-		TotalAmount:  proposal.TotalAmount,
-		Transactions: nil, // Will be constructed from UTXOs if needed
+	batch := &bridgeInBatch{
+		ID:                big.NewInt(0), // Will be set based on batch ID
+		UTXOs:             proposal.UTXOs,
+		TotalAmount:       proposal.TotalAmount,
+		TransactionParams: nil, // Will be constructed from UTXOs if needed
 	}
 
 	pending := &pendingBatch{
-		batch:    batch,
-		calldata: proposal.Calldata,
-		utxos:    proposal.UTXOs,
+		batchType:    "deposit",
+		depositBatch: batch,
+		calldata:     proposal.Calldata,
+		utxos:        proposal.UTXOs,
 	}
 
 	// Store the pending batch for when signature comes back
@@ -109,6 +114,50 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 	up.callTssSign(proposal.SessionID, hash)
 
 	up.logger.Infof("TSS signature requested for received proposal batch %s with session ID: %s",
+		proposal.BatchID, proposal.SessionID)
+
+	return nil
+}
+
+func (up *UtxoProcessor) handleP2PWithdrawalProposal(msg *types.P2PBroadcastMessage) error {
+	proposal := &WithdrawalProposal{}
+	err := proposal.UnmarshalJSON(msg.Payload)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal withdrawal proposal: %v", err)
+	}
+	up.logger.Infof("Received withdrawal proposal for batch %s from proposer %s", proposal.BatchID, proposal.Proposer)
+
+	// Validate the withdrawal proposal
+	if err := up.validateWithdrawalProposal(proposal); err != nil {
+		up.logger.Errorf("Invalid withdrawal proposal: %v", err)
+		return fmt.Errorf("invalid withdrawal proposal: %w", err)
+	}
+
+	// Create pending batch entry for tracking
+	batch := &bridgeOutBatch{
+		ID:          big.NewInt(0), // Will be set based on batch ID
+		UTXOs:       proposal.UTXOs,
+		TotalAmount: proposal.TotalAmount,
+		TaskIds:     proposal.TaskIds,
+	}
+
+	pending := &pendingBatch{
+		batchType:     "withdrawal",
+		withdrawBatch: batch,
+		calldata:      proposal.Calldata,
+		utxos:         proposal.UTXOs,
+	}
+
+	// Store the pending batch for when signature comes back
+	up.pendingBatches.Store(proposal.SessionID, pending)
+
+	// Create hash to sign for verifyAndCall function
+	hash := crypto.Keccak256(proposal.Calldata)
+
+	// Request TSS signature for the proposal
+	up.callTssSign(proposal.SessionID, hash)
+
+	up.logger.Infof("TSS signature requested for received withdrawal proposal batch %s with session ID: %s",
 		proposal.BatchID, proposal.SessionID)
 
 	return nil
@@ -160,9 +209,77 @@ func (up *UtxoProcessor) validateDepositProposal(proposal *DepositProposal) erro
 	return nil
 }
 
+// validateWithdrawalProposal validates a received withdrawal proposal
+func (up *UtxoProcessor) validateWithdrawalProposal(proposal *WithdrawalProposal) error {
+	// Basic validation checks
+	if proposal.BatchID == "" {
+		return fmt.Errorf("batch ID is required")
+	}
+	if proposal.SessionID == "" {
+		return fmt.Errorf("session ID is required")
+	}
+	if len(proposal.UTXOs) == 0 {
+		return fmt.Errorf("UTXOs list cannot be empty")
+	}
+	if proposal.TotalAmount == nil || proposal.TotalAmount.Cmp(big.NewInt(0)) <= 0 {
+		return fmt.Errorf("total amount must be positive")
+	}
+	if len(proposal.Calldata) == 0 {
+		return fmt.Errorf("calldata cannot be empty")
+	}
+	if proposal.Proposer == "" {
+		return fmt.Errorf("proposer address is required")
+	}
+	if len(proposal.TaskIds) == 0 {
+		return fmt.Errorf("task IDs are required for withdrawals")
+	}
+
+	// Calculate total amount from UTXOs and verify it matches proposal
+	calculatedTotal := big.NewInt(0)
+	for _, utxo := range proposal.UTXOs {
+		if utxo.Amount <= 0 {
+			return fmt.Errorf("UTXO amount must be positive")
+		}
+		calculatedTotal.Add(calculatedTotal, big.NewInt(utxo.Amount))
+	}
+
+	if calculatedTotal.Cmp(proposal.TotalAmount) != 0 {
+		return fmt.Errorf("calculated total amount (%s) does not match proposal total amount (%s)",
+			calculatedTotal.String(), proposal.TotalAmount.String())
+	}
+
+	// TODO: Add more sophisticated validation:
+	// - Verify UTXOs exist and are unspent
+	// - Validate calldata structure matches bridgeOutFinish
+	// - Check proposer authorization
+	// - Verify session ID uniqueness
+	// - Validate task IDs correspond to withdrawal requests
+
+	up.logger.Debugf("Withdrawal proposal validation passed for batch %s", proposal.BatchID)
+	return nil
+}
+
 // completeBatchWithSignature completes batch processing after receiving TSS signature
 func (up *UtxoProcessor) completeBatchWithSignature(pending *pendingBatch, signature []byte) error {
-	up.logger.Infof("Completing batch %s with signature", pending.batch.ID.String())
+	var batchID string
+	switch pending.batchType {
+	case "deposit":
+		if pending.depositBatch != nil {
+			batchID = pending.depositBatch.ID.String()
+		} else {
+			return fmt.Errorf("deposit batch is nil")
+		}
+	case "withdrawal":
+		if pending.withdrawBatch != nil {
+			batchID = pending.withdrawBatch.ID.String()
+		} else {
+			return fmt.Errorf("withdrawal batch is nil")
+		}
+	default:
+		return fmt.Errorf("unknown batch type: %s", pending.batchType)
+	}
+
+	up.logger.Infof("Completing %s batch %s with signature", pending.batchType, batchID)
 
 	// Send the calldata to the bridge contract
 	txHash, err := up.sendCalldataToBridge(pending.calldata, signature)
@@ -177,6 +294,12 @@ func (up *UtxoProcessor) completeBatchWithSignature(pending *pendingBatch, signa
 	if err != nil {
 		up.logger.Errorf("Failed to mark UTXOs as processed: %v", err)
 		return err
+	}
+
+	// Notify proposer manager of successful transaction
+	if up.proposerManager != nil {
+		up.proposerManager.OnTransactionSuccess()
+		up.logger.Debugf("Notified proposer manager of successful %s transaction", pending.batchType)
 	}
 
 	return nil
@@ -227,7 +350,25 @@ func (up *UtxoProcessor) sendCalldataToBridge(calldata []byte, signature []byte)
 
 // handleBatchSigningFailure handles TSS signing failures
 func (up *UtxoProcessor) handleBatchSigningFailure(pending *pendingBatch, errorMessage string) {
-	up.logger.Errorf("Batch %s signing failed: %s", pending.batch.ID.String(), errorMessage)
+	var batchID string
+	switch pending.batchType {
+	case "deposit":
+		if pending.depositBatch != nil {
+			batchID = pending.depositBatch.ID.String()
+		} else {
+			batchID = "unknown-deposit-batch"
+		}
+	case "withdrawal":
+		if pending.withdrawBatch != nil {
+			batchID = pending.withdrawBatch.ID.String()
+		} else {
+			batchID = "unknown-withdrawal-batch"
+		}
+	default:
+		batchID = "unknown-batch-type"
+	}
+
+	up.logger.Errorf("Batch %s signing failed: %s", batchID, errorMessage)
 	// For now, just log the failure. In production, you might want to:
 	// - Retry the signing process
 	// - Alert operators

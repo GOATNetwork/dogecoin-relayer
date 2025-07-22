@@ -2,11 +2,13 @@ package consensus
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/internal/tss"
@@ -51,7 +53,7 @@ func (m *EventManager) Run(ctx context.Context) error {
 	m.logger.Info("Event manager module running")
 
 	// Start UTXO manager for bridge operations
-	if err := m.startUtxoManager(); err != nil {
+	if err := m.startUtxoProcessor(); err != nil {
 		m.logger.Errorf("Failed to start UTXO manager: %v", err)
 		return err
 	}
@@ -89,8 +91,8 @@ func (m *EventManager) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// startUtxoManager starts the UTXO manager for bridge operations
-func (m *EventManager) startUtxoManager() error {
+// startUtxoProcessor starts the UTXO manager for bridge operations
+func (m *EventManager) startUtxoProcessor() error {
 	if m.utxoProcessor == nil {
 		return fmt.Errorf("UTXO manager not initialized")
 	}
@@ -108,8 +110,45 @@ func (m *EventManager) startUtxoManager() error {
 	// Set the contract builder in the UTXO manager
 	m.utxoProcessor.SetContractBuilder(contractBuilder)
 
-	// Get TSS client from the TSS module if TSS is enabled
+	// Get node's Ethereum address for proposer management
 	globalCfg := global.GetConfig()
+
+	// Create ProposerManager
+	if globalCfg != nil && globalCfg.P2P.ProposerPrivateKey != "" {
+		// Get node address from P2P private key
+		privKeyBytes, err := hex.DecodeString(globalCfg.P2P.ProposerPrivateKey)
+		if err != nil {
+			return fmt.Errorf("invalid proposer private key: %w", err)
+		}
+
+		privKey := crypto.ToECDSAUnsafe(privKeyBytes)
+		nodeAddress := crypto.PubkeyToAddress(privKey.PublicKey)
+
+		// Create initial validator set (for now, just this node)
+		// TODO: Get actual validator set from configuration or contract
+		initialValidators := []common.Address{nodeAddress}
+
+		// Create contract querier
+		contractQuerier := NewDefaultContractQuerier(contractBuilder, common.HexToAddress(m.cfg.ContractEntryPoint))
+
+		// Create proposer manager configuration
+		pmConfig := ProposerManagerConfig{
+			NodeAddress:          nodeAddress,
+			VerificationInterval: 5 * time.Minute,  // Verify with contract every 5 minutes
+			ProposerTimeout:      15 * time.Minute, // Timeout inactive proposer after 15 minutes
+			InitialValidators:    initialValidators,
+		}
+
+		// Create and set proposer manager
+		proposerManager := NewProposerManager(pmConfig, contractQuerier, global.GetEventBus())
+		m.utxoProcessor.SetProposerManager(proposerManager)
+
+		m.logger.Info("ProposerManager created and configured")
+	} else {
+		m.logger.Warn("ProposerManager not created - P2P private key not configured")
+	}
+
+	// Get TSS client from the TSS module if TSS is enabled
 	if globalCfg != nil && globalCfg.Tss.Enabled {
 		// Get the TSS module from the module registry
 		tssModule, exists := module.GetModule("tss")
