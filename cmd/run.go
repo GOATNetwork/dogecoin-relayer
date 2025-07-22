@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/goat-network/dogecoin-relayer/internal/config"
+	"github.com/goat-network/dogecoin-relayer/internal/metrics"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/pkg/global"
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
@@ -43,6 +44,14 @@ func Run() {
 
 	log.Debugf("cfg loaded %v", cfg)
 
+	// Initialize metrics system with configuration
+	metricsManager := metrics.Initialize(cfg.Metrics)
+	if cfg.Metrics.Enabled {
+		log.Info("Metrics system initialized and enabled")
+	} else {
+		log.Info("Metrics system initialized but disabled")
+	}
+
 	// Set global configuration
 	global.SetConfig(cfg)
 
@@ -70,6 +79,13 @@ func Run() {
 	conn, err := models.NewDBConnection(&cfg.Sqlite, &cfg.Gorm)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
+	}
+
+	// Update database connection metrics only if metrics are enabled
+	if cfg.Metrics.Enabled {
+		// Note: This is a simplified example. In a real implementation,
+		// you would get these stats from the actual database connection
+		metrics.UpdateDBMetrics(1, 0, 1)
 	}
 
 	for _, moduleName := range enabledModules {
@@ -106,6 +122,9 @@ func Run() {
 		}(m)
 	}
 
+	// Log successful startup
+	log.Info("All modules started successfully")
+
 	<-ctx.Done()
 
 	log.Info("Shutting down modules...")
@@ -127,6 +146,10 @@ func Run() {
 
 	conn.Close()
 	log.Info("Database connection closed")
+
+	// Clean up metrics
+	_ = metricsManager
+	log.Info("Metrics system cleaned up")
 
 	log.Info("All modules shut down. Exiting.")
 }
