@@ -296,12 +296,6 @@ func (up *UtxoProcessor) completeBatchWithSignature(pending *pendingBatch, signa
 		return err
 	}
 
-	// Notify proposer manager of successful transaction
-	if up.proposerManager != nil {
-		up.proposerManager.OnTransactionSuccess()
-		up.logger.Debugf("Notified proposer manager of successful %s transaction", pending.batchType)
-	}
-
 	return nil
 }
 

@@ -220,17 +220,44 @@ func (eh *EventHandler) processSubmitterChosen(event DetectedEvent, eventID uint
 	logger.Infof("SubmitterChosen event detected: Tx %s at block %d",
 		event.TxHash.Hex(), event.BlockNumber)
 
-	// TODO: implement SubmitterChosen logic
-	// - Check if this node is the chosen submitter
-	// - Prepare submission if selected
-	// - Coordinate with other modules
+	// Extract the chosen submitter address from event data
+	if event.EventData != nil {
+		// Log the event data for debugging
+		eventDataJSON, err := json.MarshalIndent(event.EventData, "", "  ")
+		if err == nil {
+			logger.Debugf("SubmitterChosen event data:\n%s", string(eventDataJSON))
+		}
+
+		// Try to extract submitter address from common field names
+		var submitterAddr string
+		if addr, ok := event.EventData["submitter"].(string); ok {
+			submitterAddr = addr
+		} else if addr, ok := event.EventData["chosen"].(string); ok {
+			submitterAddr = addr
+		} else if addr, ok := event.EventData["newSubmitter"].(string); ok {
+			submitterAddr = addr
+		} else {
+			// Log available fields for debugging
+			var fields []string
+			for key := range event.EventData {
+				fields = append(fields, key)
+			}
+			logger.Warnf("Could not find submitter address in event data. Available fields: %v", fields)
+		}
+
+		if submitterAddr != "" {
+			logger.Infof("New submitter chosen: %s", submitterAddr)
+		}
+	} else {
+		logger.Warn("SubmitterChosen event has no data")
+	}
 
 	// Log successful processing
 	if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
 		eh.logger.Warnf("Failed to log processing step: %v", err)
 	}
 
-	// Publish to event bus
+	// Publish to event bus for UTXO processor to update current proposer
 	eh.eventBus.Publish(eventbus.EventSubmitterChosen, event)
 
 	return nil

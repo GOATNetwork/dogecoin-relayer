@@ -532,28 +532,12 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 
 	pending := pendingData.(*pendingBatch)
 
-	var batchUTXOs []*models.UTXO
-	var totalAmount *big.Int
-
-	// Get batch details based on type
-	switch pending.batchType {
-	case "deposit":
-		if pending.depositBatch != nil {
-			batchUTXOs = pending.depositBatch.UTXOs
-			totalAmount = pending.depositBatch.TotalAmount
-		}
-	case "withdrawal":
-		if pending.withdrawBatch != nil {
-			batchUTXOs = pending.withdrawBatch.UTXOs
-			totalAmount = pending.withdrawBatch.TotalAmount
-		}
-	default:
-		return fmt.Errorf("unknown batch type: %s", pending.batchType)
+	// This function should only be called for deposit batches
+	if pending.batchType != "deposit" || pending.depositBatch == nil {
+		return fmt.Errorf("requestTssSignature called for non-deposit batch or nil depositBatch")
 	}
 
-	if len(batchUTXOs) == 0 {
-		return fmt.Errorf("no UTXOs found in pending batch")
-	}
+	batch := pending.depositBatch
 
 	// Get this node's Ethereum address (proposer)
 	proposerAddress, err := up.getNodeEthereumAddress()
@@ -567,8 +551,8 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 	// Create the deposit proposal for the batch
 	proposal := NewDepositProposal(
 		batchID,
-		batchUTXOs,
-		totalAmount,
+		batch.UTXOs,
+		batch.TotalAmount,
 		calldata,
 		proposerAddress.Hex(),
 		sessionID,
@@ -684,6 +668,8 @@ func (up *UtxoProcessor) GetStats() map[string]interface{} {
 		"poll_interval":     up.pollInterval.String(),
 		"batch_size":        up.batchSize,
 		"bridge_contract":   up.bridgeContract.Hex(),
+		"current_proposer":  up.currentProposer.Hex(),
+		"proposer_set":      up.proposerSet,
 	}
 }
 
@@ -706,38 +692,4 @@ func (up *UtxoProcessor) getNodeEthereumAddress() (common.Address, error) {
 	}
 
 	return network.GetNodeEthereumAddress()
-}
-
-// isCurrentProposer checks if this node is the current proposer by querying the contract
-func (up *UtxoProcessor) isCurrentProposer() (bool, error) {
-	// Use ProposerManager if available (hybrid approach)
-	if up.proposerManager != nil {
-		return up.proposerManager.IsCurrentProposer()
-	}
-
-	// Fallback to old method if ProposerManager not available
-	return up.isCurrentProposerLegacy()
-}
-
-// isCurrentProposerLegacy is the original implementation for backward compatibility
-func (up *UtxoProcessor) isCurrentProposerLegacy() (bool, error) {
-	// Get this node's Ethereum address
-	nodeAddress, err := up.getNodeEthereumAddress()
-	if err != nil {
-		return false, fmt.Errorf("failed to get node address: %w", err)
-	}
-
-	// TODO: Query the contract for the current proposer
-	// This is where you would make a contract call to get the current proposer address
-	// Example:
-	// currentProposer, err := up.getCurrentProposerFromContract()
-	// if err != nil {
-	//     return false, err
-	// }
-	// return nodeAddress == currentProposer, nil
-
-	up.logger.Debugf("Node address: %s - ready for proposer checking", nodeAddress.Hex())
-
-	// For now, return true as placeholder
-	return true, nil
 }
