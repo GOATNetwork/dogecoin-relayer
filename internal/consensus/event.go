@@ -177,6 +177,12 @@ func (m *EventManager) StartMonitoring() error {
 	// Create event handler with event repository
 	m.handler = NewEventHandler(m.eventRepo)
 
+	// Process any pending events from previous runs before starting new monitoring
+	if err := m.ProcessPendingEvents(); err != nil {
+		m.logger.Errorf("Failed to process pending events on startup: %v", err)
+		// Don't return error - continue with monitoring even if pending event processing fails
+	}
+
 	// Start the detector first
 	if err := m.detector.Start(); err != nil {
 		return fmt.Errorf("failed to start event detector: %w", err)
@@ -342,6 +348,61 @@ func (m *EventManager) StartPeriodicRecovery(intervalMinutes int, maxRetries int
 	}()
 
 	m.logger.Infof("Started periodic recovery every %d minutes (max retries: %d)", intervalMinutes, maxRetries)
+}
+
+// ProcessPendingEvents processes any pending events from previous runs
+func (m *EventManager) ProcessPendingEvents() error {
+	if m.eventRepo == nil {
+		return fmt.Errorf("event repository not initialized")
+	}
+
+	pendingEvents, err := m.eventRepo.GetDetectedEventsByStatus("pending", 0) // 0 = no limit
+	if err != nil {
+		return fmt.Errorf("failed to get pending events: %w", err)
+	}
+
+	if len(pendingEvents) == 0 {
+		m.logger.Info("No pending events found from previous runs")
+		return nil
+	}
+
+	m.logger.Infof("Found %d pending events from previous runs, processing...", len(pendingEvents))
+
+	processedCount := 0
+	failedCount := 0
+
+	for _, dbEvent := range pendingEvents {
+		// Convert back to DetectedEvent for processing
+		eventData, err := m.eventRepo.GetDetectedEventData(&dbEvent)
+		if err != nil {
+			m.logger.Errorf("Failed to parse event data for pending event %d: %v", dbEvent.ID, err)
+			failedCount++
+			continue
+		}
+
+		detectedEvent := DetectedEvent{
+			BlockNumber:     dbEvent.BlockNumber,
+			TxHash:          common.HexToHash(dbEvent.TxHash),
+			LogIndex:        dbEvent.LogIndex,
+			ContractAddress: common.HexToAddress(dbEvent.ContractAddress),
+			EventName:       dbEvent.EventName,
+			EventData:       eventData,
+			Timestamp:       dbEvent.ProcessedAt,
+			DatabaseID:      dbEvent.ID,
+		}
+
+		// Process the pending event
+		if err := m.handler.ProcessEvent(detectedEvent); err != nil {
+			m.logger.Errorf("Failed to process pending event %d: %v", dbEvent.ID, err)
+			failedCount++
+		} else {
+			processedCount++
+			m.logger.Debugf("Successfully processed pending event %d", dbEvent.ID)
+		}
+	}
+
+	m.logger.Infof("Finished processing pending events: %d successful, %d failed", processedCount, failedCount)
+	return nil
 }
 
 func init() {
