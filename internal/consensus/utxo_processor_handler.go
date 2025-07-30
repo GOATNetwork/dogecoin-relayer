@@ -90,7 +90,7 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 	}
 
 	// Create pending batch entry for tracking
-	batch := &bridgeInBatch{
+	batch := &BridgeInBatch{
 		ID:                big.NewInt(0), // Will be set based on batch ID
 		UTXOs:             proposal.UTXOs,
 		TotalAmount:       proposal.TotalAmount,

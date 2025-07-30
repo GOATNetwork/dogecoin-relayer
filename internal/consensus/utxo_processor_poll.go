@@ -28,15 +28,15 @@ func (up *UtxoProcessor) pollLoop() {
 			up.logger.Info("UTXO manager poll loop stopping...")
 			return
 		case <-ticker.C:
-			if err := up.processNewUTXOs(); err != nil {
+			if err := up.scanNewUTXOs(); err != nil {
 				up.logger.Errorf("Failed to process new UTXOs: %v", err)
 			}
 		}
 	}
 }
 
-// processNewUTXOs checks for new deposit UTXOs and processes them
-func (up *UtxoProcessor) processNewUTXOs() error {
+// scanNewUTXOs checks for new deposit UTXOs and processes them
+func (up *UtxoProcessor) scanNewUTXOs() error {
 	// Check if this node should process UTXOs
 	isProposer, err := up.isCurrentProposer()
 	if err != nil {
@@ -48,21 +48,21 @@ func (up *UtxoProcessor) processNewUTXOs() error {
 		return nil
 	}
 
-	// Process deposit UTXOs
-	if err := up.processDepositUTXOs(); err != nil {
+	// Scan deposit UTXOs
+	if err := up.scanDepositUTXOs(); err != nil {
 		up.logger.Errorf("Failed to process deposit UTXOs: %v", err)
 	}
 
-	// Process withdrawal UTXOs
-	if err := up.processWithdrawalUTXOs(); err != nil {
+	// Scan withdrawal UTXOs
+	if err := up.scanWithdrawalUTXOs(); err != nil {
 		up.logger.Errorf("Failed to process withdrawal UTXOs: %v", err)
 	}
 
 	return nil
 }
 
-// processDepositUTXOs handles deposit UTXO processing
-func (up *UtxoProcessor) processDepositUTXOs() error {
+// scanDepositUTXOs handles deposit UTXO processing
+func (up *UtxoProcessor) scanDepositUTXOs() error {
 	// Query for new unprocessed deposit UTXOs
 	utxos, err := up.getUnprocessedDepositUTXOs()
 	if err != nil {
@@ -93,8 +93,8 @@ func (up *UtxoProcessor) processDepositUTXOs() error {
 	return nil
 }
 
-// processWithdrawalUTXOs handles withdrawal UTXO processing
-func (up *UtxoProcessor) processWithdrawalUTXOs() error {
+// scanWithdrawalUTXOs handles withdrawal UTXO processing
+func (up *UtxoProcessor) scanWithdrawalUTXOs() error {
 	// Query for new unprocessed withdrawal UTXOs
 	utxos, err := up.getUnprocessedWithdrawalUTXOs()
 	if err != nil {
@@ -203,9 +203,9 @@ func (up *UtxoProcessor) getUnprocessedWithdrawalUTXOs() ([]*models.UTXO, error)
 }
 
 // groupUTXOsIntoBatches groups UTXOs into batches for efficient processing
-func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*bridgeInBatch {
-	var batches []*bridgeInBatch
-	currentBatch := &bridgeInBatch{
+func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*BridgeInBatch {
+	var batches []*BridgeInBatch
+	currentBatch := &BridgeInBatch{
 		ID:                big.NewInt(time.Now().Unix()), // Simple batch ID based on timestamp
 		TransactionParams: make([]contract.BridgeTransaction, 0),
 		TotalAmount:       big.NewInt(0),
@@ -233,7 +233,7 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*bridgeIn
 		// Check if batch is full (limit to prevent large transactions)
 		if len(currentBatch.TransactionParams) >= 5 {
 			batches = append(batches, currentBatch)
-			currentBatch = &bridgeInBatch{
+			currentBatch = &BridgeInBatch{
 				ID:                big.NewInt(time.Now().Unix() + int64(len(batches))),
 				TransactionParams: make([]contract.BridgeTransaction, 0),
 				TotalAmount:       big.NewInt(0),
@@ -251,7 +251,7 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*bridgeIn
 }
 
 // processDepositBatch processes a batch of deposit bridge transactions
-func (up *UtxoProcessor) processDepositBatch(batch *bridgeInBatch) error {
+func (up *UtxoProcessor) processDepositBatch(batch *BridgeInBatch) error {
 	up.logger.Infof("Processing deposit bridge batch %s with %d transactions, total amount: %s DOGE",
 		batch.ID.String(), len(batch.TransactionParams), batch.TotalAmount.String())
 
@@ -334,7 +334,7 @@ func (up *UtxoProcessor) processWithdrawalRequest(request *withdrawalRequest) er
 	return nil
 }
 
-func (up *UtxoProcessor) generateSessionID(batch *bridgeInBatch) (string, error) {
+func (up *UtxoProcessor) generateSessionID(batch *BridgeInBatch) (string, error) {
 	// Create a deterministic session ID based on the UTXOs in the batch
 	// This ensures all nodes generate the same session ID for the same batch
 
@@ -401,7 +401,7 @@ func (up *UtxoProcessor) generateWithdrawalSessionID(request *withdrawalRequest)
 }
 
 // generateBridgeInCalldata generates the calldata for bridge transactions
-func (up *UtxoProcessor) generateBridgeInCalldata(batch *bridgeInBatch) ([]byte, error) {
+func (up *UtxoProcessor) generateBridgeInCalldata(batch *BridgeInBatch) ([]byte, error) {
 	if up.contractBuilder == nil {
 		return nil, fmt.Errorf("contract builder not set")
 	}

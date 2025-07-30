@@ -18,8 +18,8 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// bridgeInBatch represents a batch of bridge transactions
-type bridgeInBatch struct {
+// BridgeInBatch represents a batch of bridge transactions
+type BridgeInBatch struct {
 	ID                *big.Int
 	TransactionParams []contract.BridgeTransaction
 	TotalAmount       *big.Int
@@ -37,7 +37,7 @@ type withdrawalRequest struct {
 // pendingBatch stores batch data while waiting for TSS signature
 type pendingBatch struct {
 	batchType         string // "deposit" or "withdrawal"
-	depositBatch      *bridgeInBatch
+	depositBatch      *BridgeInBatch
 	withdrawalRequest *withdrawalRequest
 	calldata          []byte
 	utxos             []*models.UTXO
