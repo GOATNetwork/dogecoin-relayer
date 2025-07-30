@@ -61,8 +61,10 @@ func (eh *EventHandler) ProcessEvent(event DetectedEvent) error {
 		ProcessingStep:  "event_received",
 		Status:          "success",
 	}
-	if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
-		eh.logger.Warnf("Failed to log processing step: %v", err)
+	if eh.eventRepo != nil {
+		if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
+			eh.logger.Warnf("Failed to log processing step: %v", err)
+		}
 	}
 
 	var processingErr error
@@ -97,8 +99,10 @@ func (eh *EventHandler) ProcessEvent(event DetectedEvent) error {
 	}
 
 	// Update the event status in database
-	if err := eh.eventRepo.UpdateDetectedEventStatus(event.DatabaseID, finalStatus); err != nil {
-		eh.logger.Errorf("Failed to update event status: %v", err)
+	if eh.eventRepo != nil {
+		if err := eh.eventRepo.UpdateDetectedEventStatus(event.DatabaseID, finalStatus); err != nil {
+			eh.logger.Errorf("Failed to update event status: %v", err)
+		}
 	}
 
 	return processingErr
@@ -136,8 +140,10 @@ func (eh *EventHandler) processBridgeIn(event DetectedEvent, eventID uint) error
 	// - Initiate cross-chain transfer process
 
 	// Log successful processing
-	if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
-		eh.logger.Warnf("Failed to log processing step: %v", err)
+	if eh.eventRepo != nil {
+		if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
+			eh.logger.Warnf("Failed to log processing step: %v", err)
+		}
 	}
 
 	// Publish to event bus for other modules
@@ -166,8 +172,10 @@ func (eh *EventHandler) processBridgeOutProposed(event DetectedEvent, eventID ui
 	// - Update proposal status in DB
 
 	// Log successful processing
-	if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
-		eh.logger.Warnf("Failed to log processing step: %v", err)
+	if eh.eventRepo != nil {
+		if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
+			eh.logger.Warnf("Failed to log processing step: %v", err)
+		}
 	}
 
 	// Publish to event bus
@@ -196,8 +204,10 @@ func (eh *EventHandler) processBridgeOutFinished(event DetectedEvent, eventID ui
 	// - Cleanup any pending states
 
 	// Log successful processing
-	if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
-		eh.logger.Warnf("Failed to log processing step: %v", err)
+	if eh.eventRepo != nil {
+		if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
+			eh.logger.Warnf("Failed to log processing step: %v", err)
+		}
 	}
 
 	// Publish to event bus
@@ -249,8 +259,10 @@ func (eh *EventHandler) processSubmitterChosen(event DetectedEvent, eventID uint
 	}
 
 	// Log successful processing
-	if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
-		eh.logger.Warnf("Failed to log processing step: %v", err)
+	if eh.eventRepo != nil {
+		if err := eh.eventRepo.CreateProcessingLog(processingLog); err != nil {
+			eh.logger.Warnf("Failed to log processing step: %v", err)
+		}
 	}
 
 	// Publish to event bus for UTXO processor to update current proposer

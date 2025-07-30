@@ -13,6 +13,9 @@ type EventRepository struct {
 }
 
 func NewEventRepository(db *gorm.DB) *EventRepository {
+	if db == nil {
+		panic("database instance cannot be nil when creating EventRepository")
+	}
 	return &EventRepository{db: db}
 }
 

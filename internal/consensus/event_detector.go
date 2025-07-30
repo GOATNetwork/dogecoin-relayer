@@ -206,6 +206,12 @@ func (ed *EventDetector) Start() error {
 
 // initializeScanStates initializes scan states for all configured contracts
 func (ed *EventDetector) initializeScanStates() error {
+	// Skip initialization if repository is not available
+	if ed.eventRepo == nil {
+		ed.logger.Info("Event repository not available, using default scan states")
+		return nil
+	}
+
 	contractAddressesMap := make(map[string]bool)
 
 	// Get unique contract addresses from configs
@@ -227,8 +233,10 @@ func (ed *EventDetector) initializeScanStates() error {
 				IsActive:           true,
 			}
 
-			if err := ed.eventRepo.CreateOrUpdateScanState(newState); err != nil {
-				return fmt.Errorf("failed to create scan state for contract %s: %w", contractAddress, err)
+			if ed.eventRepo != nil {
+				if err := ed.eventRepo.CreateOrUpdateScanState(newState); err != nil {
+					return fmt.Errorf("failed to create scan state for contract %s: %w", contractAddress, err)
+				}
 			}
 
 			ed.logger.Infof("Created initial scan state for contract %s at block %d", contractAddress, ed.lastScannedBlock)
@@ -327,8 +335,10 @@ func (ed *EventDetector) scanForEvents() error {
 
 	// Update scan states for all successfully scanned contracts
 	for contractAddr := range contractsScanned {
-		if err := ed.eventRepo.UpdateScanState(contractAddr, toBlock); err != nil {
-			ed.logger.Errorf("Failed to update scan state for contract %s: %v", contractAddr, err)
+		if ed.eventRepo != nil {
+			if err := ed.eventRepo.UpdateScanState(contractAddr, toBlock); err != nil {
+				ed.logger.Errorf("Failed to update scan state for contract %s: %v", contractAddr, err)
+			}
 		} else {
 			ed.logger.Debugf("Updated scan state for contract %s to block %d", contractAddr, toBlock)
 		}
@@ -386,9 +396,14 @@ func (ed *EventDetector) scanContractEvents(config EventConfig, fromBlock, toBlo
 			Status:          "pending",
 		}
 
-		if err := ed.eventRepo.CreateDetectedEvent(dbEvent, detectedEvent.EventData); err != nil {
-			ed.logger.Errorf("Failed to save detected event to database: %v", err)
-			// Continue processing other events even if one fails to save
+		if ed.eventRepo != nil {
+			if err := ed.eventRepo.CreateDetectedEvent(dbEvent, detectedEvent.EventData); err != nil {
+				ed.logger.Errorf("Failed to save detected event to database: %v", err)
+				// Continue processing other events even if one fails to save
+			}
+		} else {
+			ed.logger.Debugf("Event detected but not persisted (database not available): %s", detectedEvent.EventName)
+			// Continue processing other events even if database is not available
 			continue
 		}
 
