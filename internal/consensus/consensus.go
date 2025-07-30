@@ -12,7 +12,11 @@ import (
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/internal/metrics"
+	"github.com/goat-network/dogecoin-relayer/internal/models"
+	"github.com/goat-network/dogecoin-relayer/pkg/module"
+	"github.com/goat-network/dogecoin-relayer/pkg/types"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -21,6 +25,75 @@ var (
 	clientMutex  sync.RWMutex
 	clientOnce   sync.Once
 )
+
+// ConsensusModule manages the overall consensus functionality
+type ConsensusModule struct {
+	cfg          config.ConsensusConfig
+	conn         *models.DBConnection
+	logger       *log.Entry
+	eventManager *EventManager
+}
+
+// Ensure ConsensusModule implements the Module interface
+var _ module.Module = (*ConsensusModule)(nil)
+
+func (c *ConsensusModule) Name() string {
+	return "consensus"
+}
+
+func (c *ConsensusModule) Init(cfg any, conn *models.DBConnection) error {
+	c.cfg = cfg.(config.ConsensusConfig)
+	c.conn = conn
+	c.logger = types.InitLogEntry(c.Name())
+
+	// Initialize the Ethereum client with the RPC URL from consensus config
+	if c.cfg.Rpc != "" {
+		if err := InitEthClient(c.cfg.Rpc); err != nil {
+			c.logger.Errorf("Failed to initialize Ethereum client: %v", err)
+			return fmt.Errorf("failed to initialize Ethereum client: %w", err)
+		}
+	}
+
+	// Initialize the EventManager with the EventDetectionConfig subset
+	c.eventManager = &EventManager{}
+	if err := c.eventManager.Init(c.cfg.EventDetection, conn); err != nil {
+		c.logger.Errorf("Failed to initialize event manager: %v", err)
+		return fmt.Errorf("failed to initialize event manager: %w", err)
+	}
+
+	c.logger.Info("Consensus module initialized successfully")
+	return nil
+}
+
+func (c *ConsensusModule) Run(ctx context.Context) error {
+	c.logger.Info("Consensus module running")
+
+	// Start the event manager
+	if err := c.eventManager.Run(ctx); err != nil {
+		c.logger.Errorf("Failed to run event manager: %v", err)
+		return fmt.Errorf("failed to run event manager: %w", err)
+	}
+
+	c.logger.Info("Consensus module started successfully")
+	return nil
+}
+
+func (c *ConsensusModule) Shutdown(ctx context.Context) error {
+	c.logger.Info("Consensus module shutting down")
+
+	// Shutdown the event manager
+	if c.eventManager != nil {
+		if err := c.eventManager.Shutdown(ctx); err != nil {
+			c.logger.Errorf("Failed to shutdown event manager: %v", err)
+		}
+	}
+
+	// Close the Ethereum client
+	CloseEthClient()
+
+	c.logger.Info("Consensus module shutdown complete")
+	return nil
+}
 
 // InitEthClient initializes the global Ethereum client
 func InitEthClient(rpcURL string) error {
@@ -209,4 +282,9 @@ func GetBlockNumber(ctx context.Context) (uint64, error) {
 
 	timer.RecordSuccess()
 	return blockNumber, nil
+}
+
+func init() {
+	log.Info("Registering consensus module")
+	module.RegisterModule(&ConsensusModule{})
 }
