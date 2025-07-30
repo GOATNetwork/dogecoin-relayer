@@ -12,6 +12,7 @@ services:
       - ./data/node-01/db:/app/data
       - ./data/node-01/p2p:/app/p2p
       - ./data/node-01/config.yaml:/app/config/config.yaml
+      - ./data/abi.json:/app/data/abi.json
     networks:
       goat-network:
         ipv4_address: 192.168.15.11
@@ -29,10 +30,11 @@ services:
       - ./data/node-02/db:/app/data
       - ./data/node-02/p2p:/app/p2p
       - ./data/node-02/config.yaml:/app/config/config.yaml
+      - ./data/abi.json:/app/data/abi.json
     networks:
       goat-network:
         ipv4_address: 192.168.15.12
-  
+
   dogecoin-relayer-03:
     build: .
     image: goat-network/dogecoin-relayer:latest
@@ -46,6 +48,7 @@ services:
       - ./data/node-03/db:/app/data
       - ./data/node-03/p2p:/app/p2p
       - ./data/node-03/config.yaml:/app/config/config.yaml
+      - ./data/abi.json:/app/data/abi.json
     networks:
       goat-network:
         ipv4_address: 192.168.15.13
