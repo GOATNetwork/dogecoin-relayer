@@ -25,10 +25,17 @@ func (m *TssModule) handleSignStart(data any) {
 	ssResp, err := m.signClient.StartSign(context.Background(), req.SessionID, req.UnsignHash)
 	if err != nil {
 		m.logger.Errorf("failed to sign start: %v", err)
+
+		// Handle nil response safely
+		errorMessage := err.Error()
+		if ssResp != nil && ssResp.Message != "" {
+			errorMessage = ssResp.Message
+		}
+
 		m.eventBus.Publish(eventbus.EventTssSigResponse, types.TssSigResponse{
 			SessionID: req.SessionID,
 			Success:   false,
-			Message:   ssResp.Message,
+			Message:   errorMessage,
 			RawSig:    nil,
 		})
 		return

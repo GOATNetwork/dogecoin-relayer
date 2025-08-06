@@ -3,6 +3,8 @@ services:
     build: .
     image: goat-network/dogecoin-relayer:latest
     container_name: dogecoin-relayer-01
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8181:8080"
       - "4011:4001"
@@ -21,6 +23,8 @@ services:
     build: .
     image: goat-network/dogecoin-relayer:latest
     container_name: dogecoin-relayer-02
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8182:8080"
       - "4012:4001"
@@ -39,6 +43,8 @@ services:
     build: .
     image: goat-network/dogecoin-relayer:latest
     container_name: dogecoin-relayer-03
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8183:8080"
       - "4013:4001"

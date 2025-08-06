@@ -5,7 +5,9 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -15,6 +17,8 @@ import (
 	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/internal/metrics"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
+	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
+	"github.com/goat-network/dogecoin-relayer/pkg/global"
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
 	log "github.com/sirupsen/logrus"
@@ -32,6 +36,7 @@ type ConsensusModule struct {
 	conn         *models.DBConnection
 	logger       *log.Entry
 	eventManager *EventManager
+	eventBus     *eventbus.Bus
 }
 
 // Ensure ConsensusModule implements the Module interface
@@ -45,6 +50,7 @@ func (c *ConsensusModule) Init(cfg any, conn *models.DBConnection) error {
 	c.cfg = cfg.(config.ConsensusConfig)
 	c.conn = conn
 	c.logger = types.InitLogEntry(c.Name())
+	c.eventBus = global.GetEventBus()
 
 	// Initialize the Ethereum client with the RPC URL from consensus config
 	if c.cfg.Rpc != "" {
@@ -52,6 +58,24 @@ func (c *ConsensusModule) Init(cfg any, conn *models.DBConnection) error {
 			c.logger.Errorf("Failed to initialize Ethereum client: %v", err)
 			return fmt.Errorf("failed to initialize Ethereum client: %w", err)
 		}
+
+		// Verify the Ethereum client is working by getting the latest block number
+		client := GetEthClient()
+		if client == nil {
+			c.logger.Error("Ethereum client is nil after initialization")
+			return fmt.Errorf("ethereum client is nil after initialization")
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		latestBlock, err := client.BlockNumber(ctx)
+		if err != nil {
+			c.logger.Errorf("Failed to get latest block number: %v", err)
+			return fmt.Errorf("failed to get latest block number: %w", err)
+		}
+
+		c.logger.Infof("Ethereum client verified - latest block number: %d", latestBlock)
 	}
 
 	// Initialize the EventManager with the EventDetectionConfig subset
@@ -68,6 +92,12 @@ func (c *ConsensusModule) Init(cfg any, conn *models.DBConnection) error {
 func (c *ConsensusModule) Run(ctx context.Context) error {
 	c.logger.Info("Consensus module running")
 
+	// Perform TSS consensus check before starting main operations
+	if err := c.performTSSConsensusCheck(ctx); err != nil {
+		c.logger.Errorf("TSS consensus check failed: %v", err)
+		return fmt.Errorf("TSS consensus check failed: %w", err)
+	}
+
 	// Start the event manager
 	if err := c.eventManager.Run(ctx); err != nil {
 		c.logger.Errorf("Failed to run event manager: %v", err)
@@ -76,6 +106,139 @@ func (c *ConsensusModule) Run(ctx context.Context) error {
 
 	c.logger.Info("Consensus module started successfully")
 	return nil
+}
+
+// performTSSConsensusCheck performs a TSS consensus check during startup
+func (c *ConsensusModule) performTSSConsensusCheck(ctx context.Context) error {
+	c.logger.Info("Starting TSS consensus check...")
+
+	// Create a channel to receive the TSS response
+	responseChan := make(chan types.TssSigResponse, 1)
+	timeoutChan := make(chan struct{}, 1)
+
+	// Generate a test session ID and hash to sign
+	testSessionID := "consensus-startup-check"
+
+	// Use a constant test hash for all nodes to ensure TSS consensus check works
+	// This is a deterministic hash that all nodes will sign the same way
+	testHash := []byte{
+		0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+		0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+		0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+		0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+	}
+
+	c.logger.WithFields(log.Fields{
+		"session_id": testSessionID,
+		"hash":       fmt.Sprintf("0x%x", testHash),
+	}).Info("Generated test TSS signature request")
+
+	// Subscribe to TSS signature response events for our session
+	tssResponseHandler := func(data any) {
+		if response, ok := data.(types.TssSigResponse); ok {
+			if response.SessionID == testSessionID {
+				c.logger.WithFields(log.Fields{
+					"session_id": response.SessionID,
+					"success":    response.Success,
+					"message":    response.Message,
+					"signature":  fmt.Sprintf("0x%x", response.RawSig),
+				}).Info("Received TSS signature response")
+
+				select {
+				case responseChan <- response:
+				default:
+					// Channel is full, ignore duplicate responses
+				}
+			}
+		}
+	}
+
+	c.eventBus.Subscribe(eventbus.EventTssSigResponse, tssResponseHandler)
+	defer c.eventBus.Unsubscribe(eventbus.EventTssSigResponse, tssResponseHandler)
+
+	// Set up timeout - use context deadline if shorter than default 30s
+	timeout := 30 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		if timeUntilDeadline := time.Until(deadline); timeUntilDeadline < timeout {
+			timeout = timeUntilDeadline
+		}
+	}
+	go func() {
+		time.Sleep(timeout)
+		select {
+		case timeoutChan <- struct{}{}:
+		default:
+		}
+	}()
+
+	// Publish the TSS signature request
+	tssRequest := types.TssSigRequest{
+		SessionID:  testSessionID,
+		UnsignHash: testHash,
+	}
+
+	c.logger.WithFields(log.Fields{
+		"session_id": tssRequest.SessionID,
+		"hash":       fmt.Sprintf("0x%x", tssRequest.UnsignHash),
+	}).Info("Publishing TSS signature request for consensus check")
+
+	c.eventBus.Publish(eventbus.EventTssSigRequest, tssRequest)
+
+	// Wait for response or timeout
+	select {
+	case response := <-responseChan:
+		if response.Success {
+			c.logger.WithFields(log.Fields{
+				"session_id":     response.SessionID,
+				"signature_size": len(response.RawSig),
+				"duration":       fmt.Sprintf("%.2fs", time.Since(time.Unix(0, 0)).Seconds()),
+			}).Info("✅ TSS consensus check PASSED - TSS system is operational")
+			return nil
+		} else {
+			// Check if this is a connection issue vs compatibility issue
+			isConnectionIssue := strings.Contains(response.Message, "connect: connection refused") ||
+				strings.Contains(response.Message, "no such host") ||
+				strings.Contains(response.Message, "network is unreachable")
+
+			isCompatibilityIssue := strings.Contains(response.Message, "failed to decode") ||
+				strings.Contains(response.Message, "json: cannot unmarshal") ||
+				strings.Contains(response.Message, "Unsupported curve")
+
+			if isConnectionIssue {
+				c.logger.WithFields(log.Fields{
+					"session_id": response.SessionID,
+					"message":    response.Message,
+				}).Error("❌ TSS consensus check FAILED - TSS service unreachable")
+				return fmt.Errorf("TSS service unreachable: %s", response.Message)
+			} else if isCompatibilityIssue {
+				// For compatibility/format issues, log warning but continue
+				c.logger.WithFields(log.Fields{
+					"session_id": response.SessionID,
+					"message":    response.Message,
+				}).Warn("⚠️ TSS consensus check - compatibility issue detected, but TSS service is reachable")
+				c.logger.Warn("TSS service responded but with format/compatibility issues - consensus will continue but TSS functionality may be limited")
+				return nil
+			} else {
+				// For other unknown errors, fail the check
+				c.logger.WithFields(log.Fields{
+					"session_id": response.SessionID,
+					"message":    response.Message,
+				}).Error("❌ TSS consensus check FAILED - unknown TSS error")
+				return fmt.Errorf("TSS signing failed: %s", response.Message)
+			}
+		}
+
+	case <-timeoutChan:
+		c.logger.WithFields(log.Fields{
+			"session_id": testSessionID,
+			"timeout":    timeout.String(),
+		}).Error("❌ TSS consensus check FAILED - timeout waiting for TSS response")
+		return fmt.Errorf("TSS consensus check timeout after %v", timeout)
+
+	case <-ctx.Done():
+		c.logger.Info("TSS consensus check cancelled due to context cancellation")
+		return ctx.Err()
+	}
 }
 
 func (c *ConsensusModule) Shutdown(ctx context.Context) error {
