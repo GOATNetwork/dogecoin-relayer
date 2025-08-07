@@ -18,19 +18,29 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// bridgeBatch represents a batch of bridge transactions
-type bridgeBatch struct {
-	ID           *big.Int
-	Transactions []contract.BridgeTransaction
-	TotalAmount  *big.Int
-	UTXOs        []*models.UTXO
+// BridgeInBatch represents a batch of bridge transactions
+type BridgeInBatch struct {
+	ID                *big.Int
+	TransactionParams []contract.BridgeTransaction
+	TotalAmount       *big.Int
+	UTXOs             []*models.UTXO
+}
+
+// withdrawalRequest represents a single withdrawal request with multiple outputs aligned to task IDs
+type withdrawalRequest struct {
+	ID          *big.Int
+	UTXO        *models.UTXO // Single UTXO with multiple outputs
+	TotalAmount *big.Int
+	TaskIds     []*big.Int // Task IDs aligned with VOUT outputs
 }
 
 // pendingBatch stores batch data while waiting for TSS signature
 type pendingBatch struct {
-	batch    *bridgeBatch
-	calldata []byte
-	utxos    []*models.UTXO
+	batchType         string // "deposit" or "withdrawal"
+	depositBatch      *BridgeInBatch
+	withdrawalRequest *withdrawalRequest
+	calldata          []byte
+	utxos             []*models.UTXO
 }
 
 // UtxoProcessor manages UTXO processing for bridge operations
@@ -45,6 +55,10 @@ type UtxoProcessor struct {
 	chainID         *big.Int
 	p2pModule       *p2p.P2PModule // Reference to P2P module for accessing public key
 
+	// Current proposer state
+	currentProposer common.Address // Cached from SubmitterChosen events
+	proposerSet     bool           // Whether we have received proposer info
+
 	// Pending batches waiting for TSS signatures
 	pendingBatches sync.Map // sessionID -> *pendingBatch
 
@@ -52,7 +66,6 @@ type UtxoProcessor struct {
 	pollInterval    time.Duration
 	batchSize       int
 	lastProcessedId uint
-	// activeSessions sync.Map
 
 	// Control
 	ctx       context.Context
@@ -108,6 +121,14 @@ func (up *UtxoProcessor) Start() error {
 	up.registerP2PHandler()
 	// Subscribe to TSS signature responses
 	up.eventBus.Subscribe(eventbus.EventTssSigResponse, up.handleTssSignature)
+	// Subscribe to SubmitterChosen events to track current proposer
+	up.eventBus.Subscribe(eventbus.EventSubmitterChosen, up.handleSubmitterChosen)
+
+	// Initialize current proposer from contract
+	if err := up.initializeCurrentProposer(); err != nil {
+		up.logger.Warnf("Failed to initialize current proposer: %v", err)
+		// Continue anyway - will be updated when events come in
+	}
 
 	// Start the polling loop
 	go up.pollLoop()
@@ -124,6 +145,82 @@ func (up *UtxoProcessor) Stop() {
 	up.logger.Info("Stopping UTXO manager")
 	// Unsubscribe from events
 	up.eventBus.Unsubscribe(eventbus.EventTssSigResponse, up.handleTssSignature)
+	up.eventBus.Unsubscribe(eventbus.EventSubmitterChosen, up.handleSubmitterChosen)
 	up.cancel()
 	up.isRunning = false
+}
+
+// handleSubmitterChosen handles SubmitterChosen events from the event bus
+func (up *UtxoProcessor) handleSubmitterChosen(data any) {
+	event, ok := data.(DetectedEvent)
+	if !ok {
+		up.logger.Errorf("Invalid SubmitterChosen event data type: %T", data)
+		return
+	}
+
+	// Extract proposer address from event data
+	if event.EventData == nil {
+		up.logger.Errorf("SubmitterChosen event has no data")
+		return
+	}
+
+	// Parse the submitter address from event data
+	// The event data should contain the chosen submitter address
+	if submitterAddr, ok := event.EventData["submitter"].(string); ok {
+		newProposer := common.HexToAddress(submitterAddr)
+		up.updateCurrentProposer(newProposer)
+	} else if submitterAddr, ok := event.EventData["chosen"].(string); ok {
+		newProposer := common.HexToAddress(submitterAddr)
+		up.updateCurrentProposer(newProposer)
+	} else {
+		up.logger.Errorf("Could not extract submitter address from SubmitterChosen event: %+v", event.EventData)
+	}
+}
+
+// updateCurrentProposer updates the current proposer and logs the change
+func (up *UtxoProcessor) updateCurrentProposer(newProposer common.Address) {
+	oldProposer := up.currentProposer
+	up.currentProposer = newProposer
+	up.proposerSet = true
+
+	if oldProposer != newProposer {
+		up.logger.Infof("Proposer updated: %s → %s", oldProposer.Hex(), newProposer.Hex())
+	}
+}
+
+// initializeCurrentProposer queries the contract for current proposer on startup
+func (up *UtxoProcessor) initializeCurrentProposer() error {
+	// TODO: Query the contract for the current proposer
+	// This is only called once on startup
+	currentProposer, err := up.contractBuilder.GetCurrentProposer()
+	if err != nil {
+		return err
+	}
+	up.updateCurrentProposer(currentProposer)
+
+	up.logger.Debug("Current proposer will be set from SubmitterChosen events")
+	return nil
+}
+
+// isCurrentProposer checks if this node is the current proposer using cached state
+func (up *UtxoProcessor) isCurrentProposer() (bool, error) {
+	// Get this node's Ethereum address
+	nodeAddress, err := up.getNodeEthereumAddress()
+	if err != nil {
+		return false, fmt.Errorf("failed to get node address: %w", err)
+	}
+
+	// If we haven't received proposer info yet, fall back to contract query
+	if !up.proposerSet {
+		up.logger.Debug("No proposer info from events yet, querying contract...")
+		// TODO: Query contract as fallback
+		// For now, return false to skip processing until we get events
+		return false, nil
+	}
+
+	isProposer := up.currentProposer == nodeAddress
+	up.logger.Debugf("Proposer check: current=%s, node=%s, isProposer=%v",
+		up.currentProposer.Hex(), nodeAddress.Hex(), isProposer)
+
+	return isProposer, nil
 }

@@ -20,7 +20,8 @@ import (
 
 const (
 	// Hardcoded RPC endpoint for integration tests
-	TestnetRPC = "https://testnet3.rpc.goat.network"
+	TestnetRPC = "https://rpc.testnet3.goat.network"
+	// TestnetRPC = "http://127.0.0.1:8545"
 
 	// User's deployed EventEmitter contract for real event detection
 	EventEmitterContract = "0x6440c1963e4629556cc32f233D6d458c35f8A7Ce"
@@ -653,9 +654,9 @@ func TestEventDetector_Integration_FullFlow(t *testing.T) {
 
 // Test network connectivity and basic RPC functionality
 func TestEventDetector_NetworkConnectivity(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping network connectivity test in short mode")
-	}
+	// if testing.Short() {
+	// 	t.Skip("Skipping network connectivity test in short mode")
+	// }
 
 	// Test RPC connectivity
 	err := InitEthClient(TestnetRPC)

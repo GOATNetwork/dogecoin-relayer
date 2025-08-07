@@ -29,21 +29,30 @@ type EventManager struct {
 	handler  *EventHandler
 }
 
-var _ module.Module = (*EventManager)(nil)
+// Remove the Module interface assertion since EventManager is no longer a Module
+// var _ module.Module = (*EventManager)(nil)
 
-func (m *EventManager) Name() string {
-	return "event_manager"
-}
-
-func (m *EventManager) Init(cfg any, conn *models.DBConnection) error {
-	m.cfg = cfg.(config.EventDetectionConfig)
+// EventManager initialization (not part of Module interface anymore)
+func (m *EventManager) Init(cfg config.EventDetectionConfig, conn *models.DBConnection) error {
+	// Store the EventDetectionConfig directly now
+	m.cfg = cfg
 	m.conn = conn
-	m.eventRepo = models.NewEventRepository(conn.GetDB())
-	m.logger = types.InitLogEntry(m.Name())
+	m.logger = types.InitLogEntry("event_manager")
 
-	// Initialize UTXO manager
+	// Check if database is available and ready
+	if conn != nil && conn.GetDB() != nil {
+		// Database is ready, create event repository
+		m.eventRepo = models.NewEventRepository(conn.GetDB())
+		m.logger.Info("EventManager initialized with database support")
+	} else {
+		// Database not ready, run in mock mode
+		m.logger.Warn("Database not ready, EventManager running in mock mode (events will not be persisted)")
+	}
+
+	// Initialize UTXO manager (this doesn't require database for basic functionality)
 	m.utxoProcessor = NewUtxoProcessor(conn, m.cfg.ContractBridge)
 
+	m.logger.Info("EventManager initialized successfully")
 	return nil
 }
 
@@ -51,7 +60,7 @@ func (m *EventManager) Run(ctx context.Context) error {
 	m.logger.Info("Event manager module running")
 
 	// Start UTXO manager for bridge operations
-	if err := m.startUtxoManager(); err != nil {
+	if err := m.startUtxoProcessor(); err != nil {
 		m.logger.Errorf("Failed to start UTXO manager: %v", err)
 		return err
 	}
@@ -89,11 +98,19 @@ func (m *EventManager) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// startUtxoManager starts the UTXO manager for bridge operations
-func (m *EventManager) startUtxoManager() error {
+// startUtxoProcessor starts the UTXO manager for bridge operations
+func (m *EventManager) startUtxoProcessor() error {
 	if m.utxoProcessor == nil {
 		return fmt.Errorf("UTXO manager not initialized")
 	}
+
+	// Skip contract builder setup if event detection is disabled
+	if !m.cfg.Enabled {
+		m.logger.Info("Event detection disabled, skipping contract builder setup")
+		return nil
+	}
+
+	m.logger.Info("Event detection enabled, initializing contract builder")
 
 	// Create contract builder for generating bridge calldata
 	contractBuilder, err := contract.NewEntryPoint(
@@ -107,6 +124,7 @@ func (m *EventManager) startUtxoManager() error {
 
 	// Set the contract builder in the UTXO manager
 	m.utxoProcessor.SetContractBuilder(contractBuilder)
+	m.logger.Info("Contract builder set successfully")
 
 	// Get TSS client from the TSS module if TSS is enabled
 	globalCfg := global.GetConfig()
@@ -134,11 +152,12 @@ func (m *EventManager) startUtxoManager() error {
 		if globalCfg.Consensus.ChainId > 0 {
 			chainID := big.NewInt(int64(globalCfg.Consensus.ChainId))
 			m.utxoProcessor.SetChainID(chainID)
+			m.logger.Infof("Chain ID set to %d", globalCfg.Consensus.ChainId)
 		} else {
-			m.logger.Warn("Chain ID not configured, TSS transaction signing may fail")
+			return fmt.Errorf("invalid chain ID in consensus configuration")
 		}
 
-		m.logger.Info("TSS client configured for UTXO processor from TSS module")
+		m.logger.Info("TSS client configured for UTXO processor")
 	} else {
 		m.logger.Warn("TSS is not enabled, bridge transactions will not be signed")
 	}
@@ -160,6 +179,11 @@ func (m *EventManager) StartMonitoring() error {
 		return nil
 	}
 
+	// Check if event repository is available (database ready)
+	if m.eventRepo == nil {
+		m.logger.Warn("Event repository not available, event detection will run without persistence")
+	}
+
 	// Create event configurations using contract utilities
 	rawAbiData, configs, err := CreateRequiredEventConfigs(m.cfg, m.cfg.AbiPath)
 	if err != nil {
@@ -176,6 +200,12 @@ func (m *EventManager) StartMonitoring() error {
 
 	// Create event handler with event repository
 	m.handler = NewEventHandler(m.eventRepo)
+
+	// Process any pending events from previous runs before starting new monitoring
+	if err := m.ProcessPendingEvents(); err != nil {
+		m.logger.Errorf("Failed to process pending events on startup: %v", err)
+		// Don't return error - continue with monitoring even if pending event processing fails
+	}
 
 	// Start the detector first
 	if err := m.detector.Start(); err != nil {
@@ -344,7 +374,64 @@ func (m *EventManager) StartPeriodicRecovery(intervalMinutes int, maxRetries int
 	m.logger.Infof("Started periodic recovery every %d minutes (max retries: %d)", intervalMinutes, maxRetries)
 }
 
-func init() {
-	log.Info("Registering event manager module")
-	module.RegisterModule(&EventManager{})
+// ProcessPendingEvents processes any pending events from previous runs
+func (m *EventManager) ProcessPendingEvents() error {
+	if m.eventRepo == nil {
+		m.logger.Info("Event repository not available, skipping pending events processing")
+		return nil
+	}
+
+	pendingEvents, err := m.eventRepo.GetDetectedEventsByStatus("pending", 0) // 0 = no limit
+	if err != nil {
+		return fmt.Errorf("failed to get pending events: %w", err)
+	}
+
+	if len(pendingEvents) == 0 {
+		m.logger.Info("No pending events found from previous runs")
+		return nil
+	}
+
+	m.logger.Infof("Found %d pending events from previous runs, processing...", len(pendingEvents))
+
+	processedCount := 0
+	failedCount := 0
+
+	for _, dbEvent := range pendingEvents {
+		// Convert back to DetectedEvent for processing
+		eventData, err := m.eventRepo.GetDetectedEventData(&dbEvent)
+		if err != nil {
+			m.logger.Errorf("Failed to parse event data for pending event %d: %v", dbEvent.ID, err)
+			failedCount++
+			continue
+		}
+
+		detectedEvent := DetectedEvent{
+			BlockNumber:     dbEvent.BlockNumber,
+			TxHash:          common.HexToHash(dbEvent.TxHash),
+			LogIndex:        dbEvent.LogIndex,
+			ContractAddress: common.HexToAddress(dbEvent.ContractAddress),
+			EventName:       dbEvent.EventName,
+			EventData:       eventData,
+			Timestamp:       dbEvent.ProcessedAt,
+			DatabaseID:      dbEvent.ID,
+		}
+
+		// Process the pending event
+		if err := m.handler.ProcessEvent(detectedEvent); err != nil {
+			m.logger.Errorf("Failed to process pending event %d: %v", dbEvent.ID, err)
+			failedCount++
+		} else {
+			processedCount++
+			m.logger.Debugf("Successfully processed pending event %d", dbEvent.ID)
+		}
+	}
+
+	m.logger.Infof("Finished processing pending events: %d successful, %d failed", processedCount, failedCount)
+	return nil
 }
+
+// Remove the module registration since EventManager is no longer a Module
+// func init() {
+// 	log.Info("Registering event manager module")
+// 	module.RegisterModule(&EventManager{})
+// }
