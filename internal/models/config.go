@@ -1,9 +1,16 @@
 package models
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
 	"github.com/goat-network/dogecoin-relayer/internal/config"
 	log "github.com/sirupsen/logrus"
+	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 type LogrusWriter struct {
@@ -21,21 +28,16 @@ type DBConnection struct {
 
 func NewDBConnection(sqliteCfg *config.SqliteConfig, gormCfg *config.GormConfig) (*DBConnection, error) {
 	conn := &DBConnection{}
-	// TODO: init db
-	// err := conn.initDB(sqliteCfg, gormCfg)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	log.Info("Start to migrate")
-	// do migrate
-	// migrateRepo := NewMigrateRepository(conn.DB)
-	// err = migrateRepo.DoMigrate()
-	// if err != nil {
-	// 	log.Fatalf("Migrate failed: %v", err)
-	// }
-	log.Info("Migrate done")
+	if err := conn.initDB(sqliteCfg, gormCfg); err != nil {
+		return nil, err
+	}
 
-	// TODO: init all repositories
+	log.Info("Start to migrate")
+	migrateRepo := NewMigrateRepository(conn.DB)
+	if err := migrateRepo.DoMigrate(); err != nil {
+		return nil, fmt.Errorf("migrate failed: %w", err)
+	}
+	log.Info("Migrate done")
 
 	return conn, nil
 }
@@ -45,59 +47,69 @@ func (conn *DBConnection) GetDB() *gorm.DB {
 }
 
 func (conn *DBConnection) initDB(sqliteCfg *config.SqliteConfig, gormCfg *config.GormConfig) error {
-	// logLevel, err := log.ParseLevel(gormCfg.LogLevel) // Convert string to logger.LogLevel
-	// if err != nil {
-	// 	return fmt.Errorf("invalid log level: %w", err)
-	// }
+	folder := sqliteCfg.Folder
+	if folder == "" {
+		folder = "/app/data"
+	}
+	if err := os.MkdirAll(folder, 0o755); err != nil {
+		return fmt.Errorf("failed to create sqlite folder %s: %w", folder, err)
+	}
 
-	// logrusLogger := log.New()
-	// logrusLogger.SetLevel(log.InfoLevel)
+	dbPath := filepath.Join(folder, "relayer.db")
 
-	// gormLogger := logger.New(
-	// 	&LogrusWriter{Logger: logrusLogger, Level: logLevel},
-	// 	logger.Config{
-	// 		SlowThreshold:             time.Second,
-	// 		LogLevel:                  logger.LogLevel(logLevel),
-	// 		IgnoreRecordNotFoundError: true,
-	// 	},
-	// )
-	// dsn := fmt.Sprintf(
-	// 	"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s TimeZone=%s client_encoding=UTF8",
-	// 	postgresCfg.Host,
-	// 	postgresCfg.Port,
-	// 	postgresCfg.User,
-	// 	postgresCfg.Password,
-	// 	postgresCfg.DBName,
-	// 	postgresCfg.SSLMode,
-	// 	postgresCfg.TimeZone,
-	// )
-	// db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
-	// 	Logger: gormLogger,
-	// 	NamingStrategy: schema.NamingStrategy{
-	// 		TablePrefix: "tb_", // Table prefix for all tables, e.g., "tb_migrate_logs"
-	// 	},
-	// })
+	// Configure GORM logger level from config
+	logMode := parseGormLogLevel(gormCfg.LogLevel)
+	gLogger := gormlogger.Default.LogMode(logMode)
 
-	// if err != nil {
-	// 	return fmt.Errorf("failed to connect to db: %w", err)
-	// }
-	// log.Debug("Db connected successfully")
+	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{Logger: gLogger})
+	if err != nil {
+		return fmt.Errorf("failed to open sqlite db: %w", err)
+	}
 
-	// // AutoMigrate types
-	// err = db.AutoMigrate(&MigrateLog{})
-	// if err != nil {
-	// 	return fmt.Errorf("failed to migrate db: %w", err)
-	// }
+	// Tune connection pool
+	sqlDB, err := db.DB()
+	if err != nil {
+		return fmt.Errorf("failed to get underlying sql DB: %w", err)
+	}
+	if gormCfg.MaxIdleConns > 0 {
+		sqlDB.SetMaxIdleConns(gormCfg.MaxIdleConns)
+	}
+	if gormCfg.MaxOpenConns > 0 {
+		sqlDB.SetMaxOpenConns(gormCfg.MaxOpenConns)
+	}
+	if gormCfg.ConnMaxLifetime > 0 {
+		sqlDB.SetConnMaxLifetime(time.Duration(gormCfg.ConnMaxLifetime) * time.Second)
+	}
 
-	// conn.DB = db
+	conn.DB = db
+	log.Infof("SQLite database initialized at %s", dbPath)
 	return nil
 }
 
 func (conn *DBConnection) Close() {
+	if conn == nil || conn.DB == nil {
+		return
+	}
 	sqlDB, err := conn.DB.DB()
 	if err != nil {
 		log.Errorf("Failed to get sql db for close: %v", err)
 		return
 	}
 	sqlDB.Close()
+}
+
+// parseGormLogLevel converts a string level into gorm logger level
+func parseGormLogLevel(level string) gormlogger.LogLevel {
+	switch level {
+	case "silent", "Silent", "SILENT":
+		return gormlogger.Silent
+	case "error", "Error", "ERROR":
+		return gormlogger.Error
+	case "warn", "Warn", "WARNING", "WARN":
+		return gormlogger.Warn
+	case "info", "Info", "INFO", "":
+		return gormlogger.Info
+	default:
+		return gormlogger.Info
+	}
 }
