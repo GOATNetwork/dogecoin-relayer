@@ -14,6 +14,7 @@ import (
 	"github.com/goat-network/dogecoin-relayer/pkg/contract"
 	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
 	"github.com/goat-network/dogecoin-relayer/pkg/global"
+	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
 	log "github.com/sirupsen/logrus"
 )
@@ -51,6 +52,7 @@ type UtxoProcessor struct {
 	eventBus        *eventbus.Bus
 	contractBuilder *contract.Contract
 	bridgeContract  common.Address
+	abiPath         string
 	tssClient       *tss.SignClient
 	chainID         *big.Int
 	p2pModule       *p2p.P2PModule // Reference to P2P module for accessing public key
@@ -74,7 +76,7 @@ type UtxoProcessor struct {
 }
 
 // NewUtxoProcessor creates a new UTXO processor
-func NewUtxoProcessor(conn *models.DBConnection, bridgeContractAddress string) *UtxoProcessor {
+func NewUtxoProcessor(conn *models.DBConnection, bridgeContractAddress, abiPath string) *UtxoProcessor {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	up := &UtxoProcessor{
@@ -83,6 +85,7 @@ func NewUtxoProcessor(conn *models.DBConnection, bridgeContractAddress string) *
 		logger:          types.InitLogEntry("utxo-processor"),
 		eventBus:        global.GetEventBus(),
 		bridgeContract:  common.HexToAddress(bridgeContractAddress),
+		abiPath:         abiPath,
 		pollInterval:    10 * time.Second, // Poll every 10 seconds
 		batchSize:       10,               // Process 10 UTXOs at a time
 		lastProcessedId: 0,
@@ -115,6 +118,55 @@ func (up *UtxoProcessor) Start() error {
 		return fmt.Errorf("UTXO manager is already running")
 	}
 
+	// Create contract builder for generating bridge calldata
+	contractBuilder, err := contract.NewEntryPoint(
+		up.bridgeContract,
+		GetEthClient(),
+		up.abiPath,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create contract builder: %w", err)
+	}
+
+	// Set the contract builder in the UTXO manager
+	up.SetContractBuilder(contractBuilder)
+	up.logger.Info("Contract builder set successfully")
+
+	// Get TSS client from the TSS module if TSS is enabled
+	globalCfg := global.GetConfig()
+	if globalCfg != nil && globalCfg.Tss.Enabled {
+		// Get the TSS module from the module registry
+		tssModule, exists := module.GetModule("tss")
+		if !exists {
+			return fmt.Errorf("TSS module not found in registry")
+		}
+
+		// Cast to TssModule and get the sign client
+		tssModuleInstance, ok := tssModule.(*tss.TssModule)
+		if !ok {
+			return fmt.Errorf("failed to cast TSS module to TssModule type")
+		}
+
+		tssClient := tssModuleInstance.GetSignClient()
+		if tssClient == nil {
+			return fmt.Errorf("TSS sign client not initialized")
+		}
+
+		up.SetTssClient(tssClient)
+
+		// Set chain ID from consensus configuration
+		if globalCfg.Consensus.ChainId == 0 {
+			return fmt.Errorf("invalid chain ID in consensus configuration")
+		}
+		chainID := big.NewInt(int64(globalCfg.Consensus.ChainId))
+		up.SetChainID(chainID)
+		up.logger.Infof("Chain ID set to %d", globalCfg.Consensus.ChainId)
+
+		up.logger.Info("TSS client configured for UTXO processor")
+	} else {
+		up.logger.Warn("TSS is not enabled, bridge transactions will not be signed")
+	}
+
 	up.isRunning = true
 	up.logger.Info("Starting UTXO manager")
 
@@ -123,12 +175,6 @@ func (up *UtxoProcessor) Start() error {
 	up.eventBus.Subscribe(eventbus.EventTssSigResponse, up.handleTssSignature)
 	// Subscribe to SubmitterChosen events to track current proposer
 	up.eventBus.Subscribe(eventbus.EventSubmitterChosen, up.handleSubmitterChosen)
-
-	// Initialize current proposer from contract
-	if err := up.initializeCurrentProposer(); err != nil {
-		up.logger.Warnf("Failed to initialize current proposer: %v", err)
-		// Continue anyway - will be updated when events come in
-	}
 
 	// Start the polling loop
 	go up.pollLoop()
@@ -186,20 +232,6 @@ func (up *UtxoProcessor) updateCurrentProposer(newProposer common.Address) {
 	if oldProposer != newProposer {
 		up.logger.Infof("Proposer updated: %s → %s", oldProposer.Hex(), newProposer.Hex())
 	}
-}
-
-// initializeCurrentProposer queries the contract for current proposer on startup
-func (up *UtxoProcessor) initializeCurrentProposer() error {
-	// TODO: Query the contract for the current proposer
-	// This is only called once on startup
-	currentProposer, err := up.contractBuilder.GetCurrentProposer()
-	if err != nil {
-		return err
-	}
-	up.updateCurrentProposer(currentProposer)
-
-	up.logger.Debug("Current proposer will be set from SubmitterChosen events")
-	return nil
 }
 
 // isCurrentProposer checks if this node is the current proposer using cached state

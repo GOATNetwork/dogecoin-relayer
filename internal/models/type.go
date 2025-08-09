@@ -36,7 +36,6 @@ type DetectedEvent struct {
 type EventScanState struct {
 	gorm.Model `swaggerignore:"true"`
 
-	ContractAddress    string    `gorm:"type:varchar(42);not null;uniqueIndex" json:"contract_address"`
 	LastScannedBlock   uint64    `gorm:"type:bigint;not null;default:0" json:"last_scanned_block"`
 	LastScannedAt      time.Time `gorm:"type:timestamp" json:"last_scanned_at,omitempty"`
 	ConfirmationBlocks uint64    `gorm:"type:bigint;default:6" json:"confirmation_blocks"`

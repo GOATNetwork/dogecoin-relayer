@@ -157,28 +157,6 @@ func createEventEmitterABI() string {
 	]`
 }
 
-func createTestLogs() []types.Log {
-	// Create Transfer event log
-	transferEventID := common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef") // Transfer event signature
-	fromAddr := common.HexToAddress("0x1111111111111111111111111111111111111111")
-	toAddr := common.HexToAddress("0x2222222222222222222222222222222222222222")
-
-	return []types.Log{
-		{
-			Address: common.HexToAddress(EventEmitterContract),
-			Topics: []common.Hash{
-				transferEventID,
-				common.BytesToHash(fromAddr.Bytes()),
-				common.BytesToHash(toAddr.Bytes()),
-			},
-			Data:        common.FromHex("0x00000000000000000000000000000000000000000000000000000000000003e8"), // 1000 in hex
-			BlockNumber: 12345,
-			TxHash:      common.HexToHash("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab"),
-			Index:       0,
-		},
-	}
-}
-
 // Note: For proper testing of the scanning functionality, we would need dependency injection
 // of the ethclient.Client. The current implementation uses a global client which makes
 // unit testing more difficult. This is a common issue that can be resolved by refactoring
@@ -788,16 +766,13 @@ func TestEventDetector_EventEmitterContract_Integration(t *testing.T) {
 	t.Logf("Latest block: %d, Target EventEmitter block: %d", latestBlock, EventEmitterBlock)
 
 	// Ensure the target block exists
-	if latestBlock < EventEmitterBlock {
+	if latestBlock < EventEmitterBlock || EventEmitterBlock < 5 {
 		t.Skipf("Target block %d not yet available (latest: %d)", EventEmitterBlock, latestBlock)
 	}
 
 	// Create detector to scan around the EventEmitter block
 	// Scan a small range around the target block to catch the events
 	startBlock := EventEmitterBlock - 5 // Start a few blocks before
-	if startBlock < 0 {
-		startBlock = 0
-	}
 
 	detector := NewEventDetector(eventEmitterABI, eventEmitterConfigs, testRepo,
 		SetLastScannedBlock(startBlock),

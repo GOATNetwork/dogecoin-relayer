@@ -75,9 +75,8 @@ func (r *EventRepository) GetScanState(contractAddress string) (*EventScanState,
 	return &state, nil
 }
 
-func (r *EventRepository) UpdateScanState(contractAddress string, lastScannedBlock uint64) error {
+func (r *EventRepository) UpdateScanState(lastScannedBlock uint64) error {
 	state := &EventScanState{
-		ContractAddress:  contractAddress,
 		LastScannedBlock: lastScannedBlock,
 		LastScannedAt:    time.Now(),
 		IsActive:         true,
