@@ -317,8 +317,15 @@ func (ed *EventDetector) scanForEvents() error {
 		return fmt.Errorf("failed to scan events: %w", err)
 	}
 
-	if err := ed.eventRepo.UpdateScanState(toBlock); err != nil {
+	tx := ed.eventRepo.BeginTransaction()
+
+	if err := ed.eventRepo.UpdateScanState(tx, toBlock); err != nil {
 		return fmt.Errorf("failed to update scan state: %w", err)
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	// Update last scanned block

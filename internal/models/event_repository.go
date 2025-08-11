@@ -19,8 +19,13 @@ func NewEventRepository(db *gorm.DB) *EventRepository {
 	return &EventRepository{db: db}
 }
 
+// Transaction operations
+func (r *EventRepository) BeginTransaction() *gorm.DB {
+	return r.db.Begin()
+}
+
 // DetectedEvent operations
-func (r *EventRepository) CreateDetectedEvent(event *DetectedEvent, eventData map[string]interface{}) error {
+func (r *EventRepository) CreateDetectedEvent(event *DetectedEvent, eventData map[string]any) error {
 	// Convert event data to JSON string
 	if eventData != nil {
 		jsonData, err := json.Marshal(eventData)
@@ -75,7 +80,10 @@ func (r *EventRepository) GetScanState(contractAddress string) (*EventScanState,
 	return &state, nil
 }
 
-func (r *EventRepository) UpdateScanState(lastScannedBlock uint64) error {
+func (r *EventRepository) UpdateScanState(transaction *gorm.DB, lastScannedBlock uint64) error {
+	if transaction == nil {
+		transaction = r.db
+	}
 	state := &EventScanState{
 		LastScannedBlock: lastScannedBlock,
 		LastScannedAt:    time.Now(),
@@ -83,7 +91,7 @@ func (r *EventRepository) UpdateScanState(lastScannedBlock uint64) error {
 	}
 
 	// Use Upsert (create or update)
-	return r.db.Save(state).Error
+	return transaction.Save(state).Error
 }
 
 func (r *EventRepository) CreateOrUpdateScanState(state *EventScanState) error {
