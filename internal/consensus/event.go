@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
@@ -39,7 +38,7 @@ func NewEventManager(cfg config.EventDetectionConfig, conn *models.DBConnection)
 	return m, nil
 }
 
-func (m *EventManager) Run(ctx context.Context) error {
+func (m *EventManager) Start(ctx context.Context) error {
 	m.logger.Info("Event manager module running")
 
 	// For now, just log that the module is running
@@ -99,12 +98,6 @@ func (m *EventManager) StartMonitoring() error {
 	// Create event handler with event repository
 	m.handler = NewEventHandler(m.eventRepo)
 
-	// Process any pending events from previous runs before starting new monitoring
-	if err := m.ProcessPendingEvents(); err != nil {
-		m.logger.Errorf("Failed to process pending events on startup: %v", err)
-		// Don't return error - continue with monitoring even if pending event processing fails
-	}
-
 	// Start the detector first
 	if err := m.detector.Start(); err != nil {
 		return fmt.Errorf("failed to start event detector: %w", err)
@@ -114,9 +107,6 @@ func (m *EventManager) StartMonitoring() error {
 	if err := m.handler.Start(m.detector.EventChannel()); err != nil {
 		return fmt.Errorf("failed to start event handler: %w", err)
 	}
-
-	// Start periodic recovery of failed events (every 30 minutes, max 3 retries)
-	m.StartPeriodicRecovery(30, 3)
 
 	m.logger.WithFields(log.Fields{
 		"contract_bridge":      m.cfg.ContractBridge,
@@ -151,20 +141,26 @@ func (m *EventManager) GetMonitoringStatus() map[string]interface{} {
 	}
 }
 
-// GetEventStatistics returns event processing statistics
+// GetEventStatistics returns event processing statistics (now simplified)
 func (m *EventManager) GetEventStatistics() (map[string]int64, error) {
 	if m.eventRepo == nil {
 		return nil, fmt.Errorf("event repository not initialized")
 	}
-	return m.eventRepo.GetEventProcessingStatistics()
-}
 
-// GetRecentEvents returns recent detected events
-func (m *EventManager) GetRecentEvents(status string, limit int) ([]models.DetectedEvent, error) {
-	if m.eventRepo == nil {
-		return nil, fmt.Errorf("event repository not initialized")
-	}
-	return m.eventRepo.GetDetectedEventsByStatus(status, limit)
+	// Return simple statistics for the new system
+	stats := make(map[string]int64)
+
+	// Count deposits by status
+	pendingDeposits, _ := m.eventRepo.ListDepositsByStatus(nil, "pending", 0)
+	confirmedDeposits, _ := m.eventRepo.ListDepositsByStatus(nil, "confirmed", 0)
+	stats["deposits_pending"] = int64(len(pendingDeposits))
+	stats["deposits_confirmed"] = int64(len(confirmedDeposits))
+
+	// Count proposers by status
+	activeProposers, _ := m.eventRepo.ListProposersByStatus(nil, "ok")
+	stats["proposers_active"] = int64(len(activeProposers))
+
+	return stats, nil
 }
 
 // GetUtxoManagerStats returns UTXO manager statistics
@@ -176,151 +172,3 @@ func (m *EventManager) GetRecentEvents(status string, limit int) ([]models.Detec
 // 	}
 // 	return m.utxoProcessor.GetStats()
 // }
-
-// RecoverFailedEvents reprocesses failed events from database
-func (m *EventManager) RecoverFailedEvents(maxRetries int) error {
-	if m.eventRepo == nil {
-		return fmt.Errorf("event repository not initialized")
-	}
-
-	failedEvents, err := m.eventRepo.GetDetectedEventsByStatus("failed", 100)
-	if err != nil {
-		return fmt.Errorf("failed to get failed events: %w", err)
-	}
-
-	if len(failedEvents) == 0 {
-		return nil
-	}
-
-	m.logger.Infof("Found %d failed events to retry", len(failedEvents))
-
-	for _, dbEvent := range failedEvents {
-		// Check retry count in processing logs
-		logs, err := m.eventRepo.GetProcessingLogs(dbEvent.ID)
-		if err != nil {
-			m.logger.Errorf("Failed to get processing logs for event %d: %v", dbEvent.ID, err)
-			continue
-		}
-
-		retryCount := 0
-		for _, log := range logs {
-			if log.Status == "failed" {
-				retryCount++
-			}
-		}
-
-		if retryCount >= maxRetries {
-			m.logger.Debugf("Skipping event %d - max retries exceeded (%d)", dbEvent.ID, retryCount)
-			continue
-		}
-
-		// Convert back to DetectedEvent for reprocessing
-		eventData, err := m.eventRepo.GetDetectedEventData(&dbEvent)
-		if err != nil {
-			m.logger.Errorf("Failed to parse event data for event %d: %v", dbEvent.ID, err)
-			continue
-		}
-
-		detectedEvent := DetectedEvent{
-			BlockNumber:     dbEvent.BlockNumber,
-			TxHash:          common.HexToHash(dbEvent.TxHash),
-			LogIndex:        dbEvent.LogIndex,
-			ContractAddress: common.HexToAddress(dbEvent.ContractAddress),
-			EventName:       dbEvent.EventName,
-			EventData:       eventData,
-			Timestamp:       dbEvent.ProcessedAt,
-			DatabaseID:      dbEvent.ID,
-		}
-
-		// Reset status to pending for retry
-		if err := m.eventRepo.UpdateDetectedEventStatus(dbEvent.ID, "pending"); err != nil {
-			m.logger.Errorf("Failed to reset event status for retry: %v", err)
-			continue
-		}
-
-		// Reprocess the event
-		if err := m.handler.ProcessEvent(detectedEvent); err != nil {
-			m.logger.Errorf("Failed to reprocess event %d: %v", dbEvent.ID, err)
-		} else {
-			m.logger.Infof("Successfully reprocessed event %d", dbEvent.ID)
-		}
-	}
-
-	return nil
-}
-
-// StartPeriodicRecovery starts a goroutine that periodically recovers failed events
-func (m *EventManager) StartPeriodicRecovery(intervalMinutes int, maxRetries int) {
-	if intervalMinutes <= 0 {
-		return
-	}
-
-	go func() {
-		ticker := time.NewTicker(time.Duration(intervalMinutes) * time.Minute)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			if err := m.RecoverFailedEvents(maxRetries); err != nil {
-				m.logger.Errorf("Failed to recover failed events: %v", err)
-			}
-		}
-	}()
-
-	m.logger.Infof("Started periodic recovery every %d minutes (max retries: %d)", intervalMinutes, maxRetries)
-}
-
-// ProcessPendingEvents processes any pending events from previous runs
-func (m *EventManager) ProcessPendingEvents() error {
-	if m.eventRepo == nil {
-		m.logger.Info("Event repository not available, skipping pending events processing")
-		return nil
-	}
-
-	pendingEvents, err := m.eventRepo.GetDetectedEventsByStatus("pending", 0) // 0 = no limit
-	if err != nil {
-		return fmt.Errorf("failed to get pending events: %w", err)
-	}
-
-	if len(pendingEvents) == 0 {
-		m.logger.Info("No pending events found from previous runs")
-		return nil
-	}
-
-	m.logger.Infof("Found %d pending events from previous runs, processing...", len(pendingEvents))
-
-	processedCount := 0
-	failedCount := 0
-
-	for _, dbEvent := range pendingEvents {
-		// Convert back to DetectedEvent for processing
-		eventData, err := m.eventRepo.GetDetectedEventData(&dbEvent)
-		if err != nil {
-			m.logger.Errorf("Failed to parse event data for pending event %d: %v", dbEvent.ID, err)
-			failedCount++
-			continue
-		}
-
-		detectedEvent := DetectedEvent{
-			BlockNumber:     dbEvent.BlockNumber,
-			TxHash:          common.HexToHash(dbEvent.TxHash),
-			LogIndex:        dbEvent.LogIndex,
-			ContractAddress: common.HexToAddress(dbEvent.ContractAddress),
-			EventName:       dbEvent.EventName,
-			EventData:       eventData,
-			Timestamp:       dbEvent.ProcessedAt,
-			DatabaseID:      dbEvent.ID,
-		}
-
-		// Process the pending event
-		if err := m.handler.ProcessEvent(detectedEvent); err != nil {
-			m.logger.Errorf("Failed to process pending event %d: %v", dbEvent.ID, err)
-			failedCount++
-		} else {
-			processedCount++
-			m.logger.Debugf("Successfully processed pending event %d", dbEvent.ID)
-		}
-	}
-
-	m.logger.Infof("Finished processing pending events: %d successful, %d failed", processedCount, failedCount)
-	return nil
-}
