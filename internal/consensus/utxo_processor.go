@@ -198,7 +198,7 @@ func (up *UtxoProcessor) Stop() {
 
 // handleSubmitterChosen handles SubmitterChosen events from the event bus
 func (up *UtxoProcessor) handleSubmitterChosen(data any) {
-	event, ok := data.(DetectedEvent)
+	event, ok := data.(BlockchainEvent)
 	if !ok {
 		up.logger.Errorf("Invalid SubmitterChosen event data type: %T", data)
 		return

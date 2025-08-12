@@ -24,9 +24,10 @@ func createTestDatabase(t *testing.T) *gorm.DB {
 	// Auto-migrate all models
 	err = db.AutoMigrate(
 		&models.MigrateLog{},
-		&models.DetectedEvent{},
 		&models.EventScanState{},
-		&models.EventProcessingLog{},
+		&models.Deposit{},
+		&models.Withdrawal{},
+		&models.Proposers{},
 		&models.UTXO{},
 		&models.VIN{},
 		&models.VOUT{},
