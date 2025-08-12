@@ -28,6 +28,9 @@ func (r *MigrateRepository) initMigrateList() {
 
 	// Migration 2: Create event detection tables
 	r.migrateList[2] = r.createEventDetectionTables
+
+	// Migration 3: Create consensus-related tables
+	r.migrateList[3] = r.createConsensusTables
 }
 
 func (r *MigrateRepository) DoMigrate() error {
@@ -47,8 +50,14 @@ func (r *MigrateRepository) createMigrationLogTable() error {
 
 func (r *MigrateRepository) createEventDetectionTables() error {
 	return r.db.AutoMigrate(
-		&DetectedEvent{},
 		&EventScanState{},
-		&EventProcessingLog{},
+	)
+}
+
+func (r *MigrateRepository) createConsensusTables() error {
+	return r.db.AutoMigrate(
+		&Deposit{},
+		&Withdrawal{},
+		&Proposers{},
 	)
 }
