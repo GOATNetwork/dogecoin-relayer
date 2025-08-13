@@ -68,6 +68,7 @@ type DogeConfig struct {
 	StartHeight   int    `yaml:"start_height"`
 	Confirmations int    `yaml:"confirmations"`
 	NetworkType   string `yaml:"network_type"`
+	PubkeyBase64  string `yaml:"pubkey_base64"`
 }
 
 type ConsensusConfig struct {

@@ -171,10 +171,12 @@ func (m *DogeModule) processBlock(dogeBlock types.DogeBlockExt) {
 	// Get network parameters
 	network := types.GetDogeNetwork(m.cfg.NetworkType)
 
-	// For demonstration, we'll use a placeholder public key
-	// In a real implementation, you would get this from your wallet or TSS
-	// This should be replaced with actual public key from TSS or wallet
-	pubkeyBase64 := "placeholder_pubkey_base64"
+	// For production, read pubkey from config
+	pubkeyBase64 := m.cfg.PubkeyBase64
+	if pubkeyBase64 == "" {
+		m.logger.Warnf("doge.pubkey_base64 is empty, cannot derive addresses for transaction identification")
+		return
+	}
 	pubkeyBytes, err := types.DecodeBase64Pubkey(pubkeyBase64)
 	if err != nil {
 		m.logger.Errorf("Failed to decode pubkey: %v", err)

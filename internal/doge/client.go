@@ -1,6 +1,9 @@
 package doge
 
 import (
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 
 	"github.com/dogecoinw/doged/btcutil"
@@ -90,6 +93,33 @@ func (c *DogeClient) GetBlockHash(height int64) (*chainhash.Hash, error) {
 func (c *DogeClient) GetBlock(blockHash *chainhash.Hash) (*wire.MsgBlock, error) {
 	timer := metrics.NewTimer("doge", "get_block")
 
+	// Preferred path: use RawRequest to call getblock with verbosity=0 and decode
+	// This avoids issues where high-level GetBlock isn't registered in the rpc client.
+	if c.client != nil {
+		// Build params: ["<hash>", false]
+		var params []json.RawMessage
+		// hash string param
+		params = append(params, json.RawMessage(fmt.Sprintf("\"%s\"", blockHash.String())))
+		// verbosity false -> raw hex string (Dogecoin expects boolean, not integer)
+		params = append(params, json.RawMessage("false"))
+
+		if rawResp, err := c.client.RawRequest("getblock", params); err == nil {
+			var hexStr string
+			if uErr := json.Unmarshal(rawResp, &hexStr); uErr == nil {
+				if rawBytes, dErr := hex.DecodeString(hexStr); dErr == nil {
+					blk := &wire.MsgBlock{}
+					if deErr := blk.Deserialize(bytes.NewReader(rawBytes)); deErr == nil {
+						timer.RecordSuccess()
+						metrics.DogeRPCCalls.WithLabelValues("GetBlock", "success").Inc()
+						return blk, nil
+					}
+				}
+			}
+			// fallthrough to legacy path on any decode failure
+		}
+	}
+
+	// Fallback: legacy high-level call (may fail if method not registered)
 	result, err := c.client.GetBlock(blockHash)
 	if err != nil {
 		timer.RecordFailure()
