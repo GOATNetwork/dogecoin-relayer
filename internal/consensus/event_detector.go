@@ -29,8 +29,8 @@ type EventConfig struct {
 	IsActive        bool           `json:"is_active"`
 }
 
-// DetectedEvent represents a processed blockchain event
-type DetectedEvent struct {
+// BlockchainEvent represents a processed blockchain event (simplified, no DB persistence)
+type BlockchainEvent struct {
 	BlockNumber     uint64                 `json:"block_number"`
 	TxHash          common.Hash            `json:"tx_hash"`
 	LogIndex        uint                   `json:"log_index"`
@@ -38,7 +38,6 @@ type DetectedEvent struct {
 	EventName       string                 `json:"event_name"`
 	EventData       map[string]interface{} `json:"event_data"`
 	Timestamp       time.Time              `json:"timestamp"`
-	DatabaseID      uint                   `json:"database_id"`
 }
 
 // EventDetector monitors blockchain events
@@ -54,7 +53,7 @@ type EventDetector struct {
 	batchSize          uint64
 	scanInterval       time.Duration
 
-	eventChannel chan DetectedEvent
+	eventChannel chan BlockchainEvent
 	mu           sync.RWMutex
 	isRunning    bool
 
@@ -79,7 +78,7 @@ func NewEventDetector(rawAbiData string, configs []EventConfig, eventRepo *model
 		confirmationBlocks: 6,               // Default 6 confirmations
 		batchSize:          1000,            // Default batch size
 		scanInterval:       5 * time.Second, // Default 5 seconds
-		eventChannel:       make(chan DetectedEvent, 1000),
+		eventChannel:       make(chan BlockchainEvent, 1000),
 		logger:             log.WithField("component", "EventDetector"),
 	}
 
@@ -267,7 +266,7 @@ func (ed *EventDetector) Stop() {
 }
 
 // EventChannel returns the channel for receiving detected events
-func (ed *EventDetector) EventChannel() <-chan DetectedEvent {
+func (ed *EventDetector) EventChannel() <-chan BlockchainEvent {
 	return ed.eventChannel
 }
 
@@ -452,41 +451,18 @@ func (ed *EventDetector) scanContractEvents(configs []EventConfig, fromBlock, to
 			continue
 		}
 
-		// Save to database immediately
-		dbEvent := &models.DetectedEvent{
-			BlockNumber:     detectedEvent.BlockNumber,
-			TxHash:          detectedEvent.TxHash.Hex(),
-			LogIndex:        detectedEvent.LogIndex,
-			ContractAddress: detectedEvent.ContractAddress.Hex(),
-			EventName:       detectedEvent.EventName,
-			Status:          "pending",
-		}
-
-		if ed.eventRepo != nil {
-			if err := ed.eventRepo.CreateDetectedEvent(dbEvent, detectedEvent.EventData); err != nil {
-				ed.logger.Errorf("Failed to save detected event to database: %v", err)
-				// Do not block subsequent events
-			} else {
-				detectedCount++
-			}
-		} else {
-			ed.logger.Debugf("Event detected but not persisted (database not available): %s", detectedEvent.EventName)
-			// If database is not available, do not send to downstream to avoid processor depending on DB records
-			continue
-		}
-
-		// Bind DB auto-increment ID, then send to channel (non-blocking)
-		detectedEvent.DatabaseID = dbEvent.ID
+		// Send event directly to channel (no DB persistence for general events)
 		select {
 		case ed.eventChannel <- *detectedEvent:
+			detectedCount++
 		default:
-			ed.logger.Warn("Event channel is full, dropping event (but already saved to DB)")
+			ed.logger.Warn("Event channel is full, dropping event")
 		}
 	}
 
 	if detectedCount > 0 {
 		ed.logger.Infof(
-			"Detected and saved %d events for %d contract(s) in blocks %d-%d",
+			"Detected %d events for %d contract(s) in blocks %d-%d",
 			detectedCount, len(addresses), fromBlock, toBlock,
 		)
 	}
@@ -494,8 +470,8 @@ func (ed *EventDetector) scanContractEvents(configs []EventConfig, fromBlock, to
 	return nil
 }
 
-// parseEvent parses a raw log into a DetectedEvent
-func (ed *EventDetector) parseEvent(vlog types.Log, config EventConfig, contractABI abi.ABI, event abi.Event) (*DetectedEvent, error) {
+// parseEvent parses a raw log into a BlockchainEvent
+func (ed *EventDetector) parseEvent(vlog types.Log, config EventConfig, contractABI abi.ABI, event abi.Event) (*BlockchainEvent, error) {
 	// Unpack event data
 	eventData := make(map[string]interface{})
 	err := contractABI.UnpackIntoMap(eventData, config.EventName, vlog.Data)
@@ -515,7 +491,7 @@ func (ed *EventDetector) parseEvent(vlog types.Log, config EventConfig, contract
 		}
 	}
 
-	return &DetectedEvent{
+	return &BlockchainEvent{
 		BlockNumber:     vlog.BlockNumber,
 		TxHash:          vlog.TxHash,
 		LogIndex:        vlog.Index,

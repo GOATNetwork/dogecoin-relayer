@@ -15,21 +15,44 @@ type MigrateLog struct {
 	Desc    string `gorm:"type:varchar(255)" json:"desc"`
 }
 
-// DetectedEvent represents a blockchain event that has been detected and processed
-type DetectedEvent struct {
+type Deposit struct {
 	gorm.Model `swaggerignore:"true"`
 
-	BlockNumber     uint64    `gorm:"type:bigint;not null;index" json:"block_number"`
-	TxHash          string    `gorm:"type:varchar(66);not null;index" json:"tx_hash"` // 0x + 64 chars
-	LogIndex        uint      `gorm:"type:int;not null" json:"log_index"`
-	ContractAddress string    `gorm:"type:varchar(42);not null;index" json:"contract_address"`
-	EventName       string    `gorm:"type:varchar(100);not null;index" json:"event_name"`
-	EventData       string    `gorm:"type:text" json:"event_data"` // JSON string of event data
-	ProcessedAt     time.Time `gorm:"type:timestamp;not null" json:"processed_at"`
-	Status          string    `gorm:"type:varchar(20);default:'pending';index" json:"status"` // pending, processed, failed
+	TxId        string `gorm:"type:varchar(66);not null;index" json:"txid"`
+	Vout        int    `gorm:"type:int;not null" json:"vout"`
+	Address     string `gorm:"type:varchar(60)" json:"address"`
+	Amount      int64  `gorm:"type:bigint" json:"amount"`
+	TxBytes     []byte `gorm:"type:blob" json:"tx_bytes"`
+	Status      string `gorm:"type:varchar(20)" json:"status"`
+	EvmTxHash   string `gorm:"type:varchar(66)" json:"evm_tx_hash"`
+	EvmBlock    uint64 `gorm:"type:bigint" json:"evm_block"`
+	EvmLogIndex uint   `gorm:"type:int" json:"evm_log_index"`
+}
 
-	// Unique constraint to prevent duplicate event processing
-	UniqueIndex string `gorm:"uniqueIndex:idx_detected_event_unique;type:varchar(150);not null"`
+type Withdrawal struct {
+	gorm.Model `swaggerignore:"true"`
+
+	ReqTaskId      string `gorm:"type:varchar(255);not null;uniqueIndex" json:"req_task_id"`
+	ReqTxHash      string `gorm:"type:varchar(66)" json:"req_tx_hash"`
+	ReqBlock       uint64 `gorm:"type:bigint" json:"req_block"`
+	ReqLogIndex    uint   `gorm:"type:int" json:"req_log_index"`
+	Status         string `gorm:"type:varchar(20)" json:"status"`
+	TxId           string `gorm:"type:varchar(66)" json:"txid"`
+	Vout           int    `gorm:"type:int" json:"vout"`
+	TxBytes        []byte `gorm:"type:blob" json:"tx_bytes"`
+	FinishTxHash   string `gorm:"type:varchar(66)" json:"finish_tx_hash"`
+	FinishBlock    uint64 `gorm:"type:bigint" json:"finish_block"`
+	FinishLogIndex uint   `gorm:"type:int" json:"finish_log_index"`
+}
+
+type Proposers struct {
+	gorm.Model `swaggerignore:"true"`
+
+	Address      string `gorm:"type:varchar(60)" json:"address"`
+	Status       string `gorm:"type:varchar(20)" json:"status"`
+	PendingEvent string `gorm:"type:varchar(255)" json:"pending_event"`
+	JoinBlock    uint64 `gorm:"type:bigint" json:"join_block"`
+	ExitBlock    uint64 `gorm:"type:bigint" json:"exit_block"`
 }
 
 // EventScanState tracks the scanning progress for event detection
@@ -40,21 +63,6 @@ type EventScanState struct {
 	LastScannedAt      time.Time `gorm:"type:timestamp" json:"last_scanned_at,omitempty"`
 	ConfirmationBlocks uint64    `gorm:"type:bigint;default:6" json:"confirmation_blocks"`
 	IsActive           bool      `gorm:"default:true" json:"is_active"`
-}
-
-// EventProcessingLog tracks the processing status and any errors for detected events
-type EventProcessingLog struct {
-	gorm.Model `swaggerignore:"true"`
-
-	DetectedEventID uint      `gorm:"not null;index" json:"detected_event_id"`
-	ProcessingStep  string    `gorm:"type:varchar(100);not null" json:"processing_step"`
-	Status          string    `gorm:"type:varchar(20);not null" json:"status"` // success, failed, retry
-	ErrorMessage    string    `gorm:"type:text" json:"error_message,omitempty"`
-	ProcessedAt     time.Time `gorm:"type:timestamp;not null" json:"processed_at"`
-	RetryCount      int       `gorm:"default:0" json:"retry_count"`
-
-	// Foreign key relationship
-	DetectedEvent DetectedEvent `gorm:"foreignKey:DetectedEventID"`
 }
 
 // UTXO represents an unspent transaction output

@@ -8,5 +8,8 @@ const (
 	EventNameBridgeOutFinished = "BridgeOutFinished"
 
 	// Consensus-related events
-	EventNameSubmitterChosen = "SubmitterChosen"
+    EventNameSubmitterChosen    = "SubmitterChosen"
+    EventNameAddProposerReq     = "AddProposerRequested"
+    EventNameRemoveProposerReq  = "RemoveProposerRequested"
+    EventNameProposerConfirmed  = "ProposerConfirmed"
 )

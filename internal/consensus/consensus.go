@@ -82,7 +82,7 @@ func (c *ConsensusModule) Run(ctx context.Context) error {
 	c.logger.Info("Consensus module running")
 
 	// Start the event manager
-	if err := c.eventManager.Run(ctx); err != nil {
+	if err := c.eventManager.Start(ctx); err != nil {
 		return fmt.Errorf("failed to run event manager: %w", err)
 	}
 
