@@ -337,6 +337,7 @@ func (m *DogeModule) processTransaction(tx *wire.MsgTx, dogeBlock types.DogeBloc
         // Check if it's our address
         if _, ok := watchAddrSet[receiver]; ok {
             isUtxo = true
+            m.logger.Infof("Detected UTXO for watch address %s: txid=%s vout=%d amount=%d", receiver, txid, idx, vout.Value)
             utxos = append(utxos, &models.UTXO{
                 Uid:           "",
                 Txid:          txid,
@@ -396,8 +397,8 @@ func (m *DogeModule) processTransaction(tx *wire.MsgTx, dogeBlock types.DogeBloc
     }
 
 	// Save VINs and VOUTs to database
-	if isVin {
-		for _, vin := range vins {
+    if isVin {
+        for _, vin := range vins {
 			if isDeposit {
 				vin.Source = models.UTXO_SOURCE_DEPOSIT
 			} else if isConsolidation {
@@ -410,7 +411,7 @@ func (m *DogeModule) processTransaction(tx *wire.MsgTx, dogeBlock types.DogeBloc
 				m.logger.Errorf("Add vin %v err %v", vin, err)
 			}
 		}
-		for _, vout := range vouts {
+        for _, vout := range vouts {
 			if isDeposit {
 				vout.Source = models.UTXO_SOURCE_DEPOSIT
 			} else if isConsolidation {
@@ -426,8 +427,8 @@ func (m *DogeModule) processTransaction(tx *wire.MsgTx, dogeBlock types.DogeBloc
 	}
 
 	// Update send order status
-	if isWithdrawal || isSafebox || isConsolidation {
-		m.logger.Debugf("Update send order confirmed, txid: %s", txid)
+    if (isWithdrawal || isSafebox || isConsolidation) {
+        m.logger.Debugf("Update send order confirmed, txid: %s", txid)
 		err = m.state.UpdateSendOrderConfirmed(txid, dogeBlock.BlockNumber)
 		if err != nil {
 			m.logger.Debugf("Update send order confirmed %v err %v", txid, err)
