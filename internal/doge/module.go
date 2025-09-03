@@ -18,14 +18,14 @@ import (
 )
 
 type DogeModule struct {
-	cfg           config.DogeConfig
-	scanCfg       config.ScanConfig
-	conn          *models.DBConnection
-	logger        *log.Entry
-	client        *DogeClient
-	state         *models.StateRepository
-	blockCh       chan *types.DogeBlockExt
-	currentHeight int64
+    cfg           config.DogeConfig
+    scanCfg       config.ScanConfig
+    conn          *models.DBConnection
+    logger        *log.Entry
+    client        *DogeClient
+    state         *models.StateRepository
+    blockCh       chan *types.DogeBlockExt
+    currentHeight int64
 }
 
 var _ module.Module = (*DogeModule)(nil)
@@ -160,51 +160,65 @@ func (m *DogeModule) blockScanLoop(ctx context.Context) {
 
 // processBlock processes a single block and extracts P2PKH transactions
 func (m *DogeModule) processBlock(dogeBlock types.DogeBlockExt) {
-	m.logger.Debugf("Processing Dogecoin block, height: %d, hash: %s", dogeBlock.BlockNumber, dogeBlock.GetBlockHash().String())
+    m.logger.Debugf("Processing Dogecoin block, height: %d, hash: %s", dogeBlock.BlockNumber, dogeBlock.GetBlockHash().String())
 
-	// Verify SPV (simplified)
-	if err := types.VerifyBlockSPV(dogeBlock); err != nil {
-		m.logger.Errorf("Verify block SPV err %v", err)
-		return
-	}
+    // Verify SPV (simplified)
+    if err := types.VerifyBlockSPV(dogeBlock); err != nil {
+        m.logger.Errorf("Verify block SPV err %v", err)
+        return
+    }
 
-	// Get network parameters
-	network := types.GetDogeNetwork(m.cfg.NetworkType)
+    // Get network parameters
+    network := types.GetDogeNetwork(m.cfg.NetworkType)
 
-	// For demonstration, we'll use a placeholder public key
-	// In a real implementation, you would get this from your wallet or TSS
-	// This should be replaced with actual public key from TSS or wallet
-	pubkeyBase64 := "placeholder_pubkey_base64"
-	pubkeyBytes, err := types.DecodeBase64Pubkey(pubkeyBase64)
-	if err != nil {
-		m.logger.Errorf("Failed to decode pubkey: %v", err)
-		return
-	}
+    // Prepare watch addresses
+    watchAddrSet := make(map[string]struct{})
+    var pubkeyBytes []byte
 
-	// Generate addresses
-	p2pkhAddress, err := types.GenerateP2PKHAddress(pubkeyBytes, network)
-	if err != nil {
-		m.logger.Errorf("Failed to generate P2PKH address: %v", err)
-		return
-	}
-	p2wpkhAddress, err := types.GenerateP2WPKHAddress(pubkeyBytes, network)
-	if err != nil {
-		m.logger.Errorf("Failed to generate P2WPKH address: %v", err)
-		return
-	}
+    // Prefer explicit watch addresses if provided
+    if len(m.cfg.WatchAddresses) > 0 {
+        for _, a := range m.cfg.WatchAddresses {
+            if a != "" {
+                watchAddrSet[a] = struct{}{}
+            }
+        }
+        m.logger.Debugf("Using configured watch addresses: %d", len(watchAddrSet))
+    } else if m.cfg.WatchPubkeyBase64 != "" {
+        // Derive standard addresses from configured pubkey
+        var err error
+        pubkeyBytes, err = types.DecodeBase64Pubkey(m.cfg.WatchPubkeyBase64)
+        if err != nil {
+            m.logger.Errorf("Failed to decode configured pubkey: %v", err)
+            return
+        }
+        p2pkhAddress, err := types.GenerateP2PKHAddress(pubkeyBytes, network)
+        if err != nil {
+            m.logger.Errorf("Failed to generate P2PKH address: %v", err)
+            return
+        }
+        p2wpkhAddress, err := types.GenerateP2WPKHAddress(pubkeyBytes, network)
+        if err != nil {
+            m.logger.Errorf("Failed to generate P2WPKH address: %v", err)
+            return
+        }
+        watchAddrSet[p2pkhAddress] = struct{}{}
+        watchAddrSet[p2wpkhAddress] = struct{}{}
+        m.logger.Debugf("Using derived watch addresses - P2PKH: %s, P2WPKH: %s", p2pkhAddress, p2wpkhAddress)
+    } else {
+        // No addresses configured; continue scanning but skip ownership-based classification
+        m.logger.Debug("No watch addresses or pubkey configured; scanning without address filter")
+    }
 
-	m.logger.Debugf("Generated addresses - P2PKH: %s, P2WPKH: %s", p2pkhAddress, p2wpkhAddress)
-
-	// Process each transaction in the block
-	for _, tx := range dogeBlock.Transactions {
-		m.processTransaction(tx, dogeBlock, p2pkhAddress, p2wpkhAddress, network, pubkeyBytes)
-	}
+    // Process each transaction in the block
+    for _, tx := range dogeBlock.Transactions {
+        m.processTransaction(tx, dogeBlock, watchAddrSet, network, pubkeyBytes)
+    }
 
 	m.logger.Debugf("Processed Dogecoin block %d", dogeBlock.BlockNumber)
 }
 
 // processTransaction processes a single transaction
-func (m *DogeModule) processTransaction(tx *wire.MsgTx, dogeBlock types.DogeBlockExt, p2pkhAddress, p2wpkhAddress string, network *chaincfg.Params, pubkeyBytes []byte) {
+func (m *DogeModule) processTransaction(tx *wire.MsgTx, dogeBlock types.DogeBlockExt, watchAddrSet map[string]struct{}, network *chaincfg.Params, pubkeyBytes []byte) {
 	var utxos []*models.UTXO
 	var vins []*models.VIN
 	var vouts []*models.VOUT
@@ -265,14 +279,14 @@ func (m *DogeModule) processTransaction(tx *wire.MsgTx, dogeBlock types.DogeBloc
 			}
 		}
 
-		// Check if sender matches our addresses
-		if sender == p2pkhAddress || sender == p2wpkhAddress {
-			isVin = true
-			if len(tx.TxOut) == 1 {
-				isConsolidation = true
-			} else {
-				isWithdrawal = true
-			}
+    // Check if sender matches our addresses
+    if _, ok := watchAddrSet[sender]; ok {
+        isVin = true
+        if len(tx.TxOut) == 1 {
+            isConsolidation = true
+        } else {
+            isWithdrawal = true
+        }
 			vins = append(vins, &models.VIN{
 				OrderId:   "",
 				BtcHeight: dogeBlock.BlockNumber,
@@ -288,10 +302,19 @@ func (m *DogeModule) processTransaction(tx *wire.MsgTx, dogeBlock types.DogeBloc
 	}
 
 	// Check for deposit
-	var receiverType, evmAddr string
-	magicBytes := []byte("placeholder_magic_bytes") // In real implementation, get from config
-	minDepositAmount := int64(1000000)              // 1 DOGE in satoshis
-	isDeposit, evmAddr, _ = types.IsUtxoDogeDepositV1(tx, []string{p2pkhAddress, p2wpkhAddress}, network, minDepositAmount, magicBytes)
+    var receiverType, evmAddr string
+    // Decode magic bytes from config (hex string); ignore error and use empty if not provided
+    magicBytes := parseHexOrRaw(m.cfg.DepositMagicBytes)
+    minDepositAmount := m.cfg.MinDepositAmount
+    if minDepositAmount <= 0 {
+        minDepositAmount = 1_000_000 // default 1 DOGE
+    }
+    // Build watch address slice for deposit detection
+    watchList := make([]string, 0, len(watchAddrSet))
+    for a := range watchAddrSet {
+        watchList = append(watchList, a)
+    }
+    isDeposit, evmAddr, _ = types.IsUtxoDogeDepositV1(tx, watchList, network, minDepositAmount, magicBytes)
 
 	// Process outputs (VOUTs) - extract real addresses
 	for idx, vout := range tx.TxOut {
@@ -311,27 +334,27 @@ func (m *DogeModule) processTransaction(tx *wire.MsgTx, dogeBlock types.DogeBloc
 			receiverType = models.WALLET_TYPE_UNKNOWN
 		}
 
-		// Check if it's our address
-		if receiver == p2pkhAddress || receiver == p2wpkhAddress {
-			isUtxo = true
-			utxos = append(utxos, &models.UTXO{
-				Uid:           "",
-				Txid:          txid,
-				PkScript:      vout.PkScript,
-				OutIndex:      idx,
-				Amount:        vout.Value,
-				Receiver:      receiver,
-				WalletVersion: "1",
-				Sender:        sender,
-				EvmAddr:       evmAddr,
-				Source:        models.UTXO_SOURCE_UNKNOWN,
-				ReceiverType:  receiverType,
-				Status:        models.UTXO_STATUS_CONFIRMED,
-				ReceiveBlock:  dogeBlock.BlockNumber,
-				SpentBlock:    0,
-				UpdatedAt:     time.Now(),
-			})
-		}
+        // Check if it's our address
+        if _, ok := watchAddrSet[receiver]; ok {
+            isUtxo = true
+            utxos = append(utxos, &models.UTXO{
+                Uid:           "",
+                Txid:          txid,
+                PkScript:      vout.PkScript,
+                OutIndex:      idx,
+                Amount:        vout.Value,
+                Receiver:      receiver,
+                WalletVersion: "1",
+                Sender:        sender,
+                EvmAddr:       evmAddr,
+                Source:        models.UTXO_SOURCE_UNKNOWN,
+                ReceiverType:  receiverType,
+                Status:        models.UTXO_STATUS_CONFIRMED,
+                ReceiveBlock:  dogeBlock.BlockNumber,
+                SpentBlock:    0,
+                UpdatedAt:     time.Now(),
+            })
+        }
 		vouts = append(vouts, &models.VOUT{
 			OrderId:    "",
 			BtcHeight:  dogeBlock.BlockNumber,
@@ -348,29 +371,29 @@ func (m *DogeModule) processTransaction(tx *wire.MsgTx, dogeBlock types.DogeBloc
 	}
 
 	// Save UTXOs to database
-	if isUtxo {
-		for _, utxo := range utxos {
-			if isDeposit {
-				utxo.Source = models.UTXO_SOURCE_DEPOSIT
-			} else if isConsolidation {
-				utxo.Source = models.UTXO_SOURCE_CONSOLIDATION
-			} else if isWithdrawal {
-				utxo.Source = models.UTXO_SOURCE_WITHDRAWAL
-			}
+    if isUtxo {
+        for _, utxo := range utxos {
+            if isDeposit {
+                utxo.Source = models.UTXO_SOURCE_DEPOSIT
+            } else if isConsolidation {
+                utxo.Source = models.UTXO_SOURCE_CONSOLIDATION
+            } else if isWithdrawal {
+                utxo.Source = models.UTXO_SOURCE_WITHDRAWAL
+            }
 
-			noWitnessTx, _ := types.SerializeTransactionNoWitness(tx)
-			merkleRoot, proofBytes, txIndex, err := types.GenerateSPVProof(utxo.Txid, []string{txid})
-			if err != nil {
-				m.logger.Errorf("GenerateSPVProof err %v, txid: %s", err, utxo.Txid)
-				continue
-			}
+            noWitnessTx, _ := types.SerializeTransactionNoWitness(tx)
+            merkleRoot, proofBytes, txIndex, err := types.GenerateSPVProof(utxo.Txid, []string{txid})
+            if err != nil {
+                m.logger.Errorf("GenerateSPVProof err %v, txid: %s", err, utxo.Txid)
+                continue
+            }
 
-			err = m.state.AddUtxo(utxo, pubkeyBytes, dogeBlock.GetBlockHash().String(), dogeBlock.BlockNumber, noWitnessTx, merkleRoot, proofBytes, txIndex, isDeposit)
-			if err != nil {
-				m.logger.Errorf("Add utxo %v err %v", utxo, err)
-			}
-		}
-	}
+            err = m.state.AddUtxo(utxo, pubkeyBytes, dogeBlock.GetBlockHash().String(), dogeBlock.BlockNumber, noWitnessTx, merkleRoot, proofBytes, txIndex, isDeposit)
+            if err != nil {
+                m.logger.Errorf("Add utxo %v err %v", utxo, err)
+            }
+        }
+    }
 
 	// Save VINs and VOUTs to database
 	if isVin {
@@ -418,6 +441,43 @@ func (m *DogeModule) processTransaction(tx *wire.MsgTx, dogeBlock types.DogeBloc
 			}
 		}
 	}
+}
+
+// parseHexOrRaw parses a hex string like "0xdeadbeef" or "deadbeef" into bytes.
+// If s is empty or invalid hex, it returns the raw bytes of s.
+func parseHexOrRaw(s string) []byte {
+    if s == "" {
+        return []byte{}
+    }
+    // trim 0x/0X prefix
+    if len(s) > 2 && (s[:2] == "0x" || s[:2] == "0X") {
+        s = s[2:]
+    }
+    // hex decode
+    dst := make([]byte, len(s)/2)
+    n := 0
+    for i := 0; i+1 < len(s); i += 2 {
+        var b byte
+        for k := 0; k < 2; k++ {
+            c := s[i+k]
+            var v byte
+            switch {
+            case '0' <= c && c <= '9':
+                v = c - '0'
+            case 'a' <= c && c <= 'f':
+                v = c - 'a' + 10
+            case 'A' <= c && c <= 'F':
+                v = c - 'A' + 10
+            default:
+                // not hex
+                return []byte(s)
+            }
+            b = (b << 4) | v
+        }
+        dst[n] = b
+        n++
+    }
+    return dst[:n]
 }
 
 func init() {
