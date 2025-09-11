@@ -154,16 +154,20 @@ func (up *UtxoProcessor) processWithdrawalUTXO(utxo *models.UTXO) error {
 
 // getUnprocessedDepositUTXOs retrieves unprocessed deposit UTXOs from database
 func (up *UtxoProcessor) getUnprocessedDepositUTXOs() ([]*models.UTXO, error) {
-	var utxos []*models.UTXO
+    var utxos []*models.UTXO
 
-	// Query for deposit UTXOs that haven't been processed yet
-	err := up.conn.GetDB().Where(
-		"source = ? AND status = ? AND id > ? AND evm_addr != ?",
-		models.UTXO_SOURCE_DEPOSIT,
-		models.UTXO_STATUS_CONFIRMED,
-		up.lastProcessedId,
-		"", // Non-empty EVM address required for deposits
-	).Limit(up.batchSize).Find(&utxos).Error
+    // Query for deposit UTXOs that haven't been processed yet
+    // NOTE: Previously this query filtered out rows with empty evm_addr.
+    // That caused valid deposit UTXOs to be skipped when evm_addr was not
+    // populated yet during ingestion. We now fetch by source/status/id only
+    // and defer the evm address check to the batching step, where UTXOs with
+    // missing EVM address are explicitly skipped with a warning.
+    err := up.conn.GetDB().Where(
+        "source = ? AND status = ? AND id > ?",
+        models.UTXO_SOURCE_DEPOSIT,
+        models.UTXO_STATUS_CONFIRMED,
+        up.lastProcessedId,
+    ).Limit(up.batchSize).Find(&utxos).Error
 
 	if err != nil {
 		return nil, err
