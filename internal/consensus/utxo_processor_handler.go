@@ -7,30 +7,60 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/internal/p2p"
 	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
-	"github.com/goat-network/dogecoin-relayer/pkg/global"
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
 )
 
 func (up *UtxoProcessor) registerP2PHandler() {
 	go func() {
-		p2pConfig := global.GetConfig().P2P
-		time.Sleep(time.Duration(p2pConfig.ListenWaitSeconds+p2pConfig.ConnectionWaitSeconds+15) * time.Second)
+		// Wait for P2P network to be fully initialized
+		up.logger.Infof("Waiting for P2P network initialization...")
+		time.Sleep(30 * time.Second) // Wait for network to be fully ready
 
-		p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
-		if !ok {
-			panic(fmt.Errorf("p2p module not found"))
+		// Retry registration until P2P module is available and network is ready
+		maxRetries := 30
+		for i := 0; i < maxRetries; i++ {
+			p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
+			if !ok {
+				up.logger.Debugf("P2P module not found, retrying in 2 seconds... (%d/%d)", i+1, maxRetries)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			// Check if network is initialized
+			network := p2pModule.(*P2PModule).GetNetwork()
+			if network == nil {
+				up.logger.Debugf("P2P network not initialized, retrying in 2 seconds... (%d/%d)", i+1, maxRetries)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			// register a handler for deposit proposal message
+			err1 := p2pModule.(p2p.P2PSender).RegisterP2PHandler(types.P2PMessageTypeDepositProposal, func(msg *types.P2PBroadcastMessage) error {
+				up.logger.Infof("🎯 Received P2P deposit proposal message for session %s from proposer", msg.SessionID)
+				return up.handleP2PDepositProposal(msg)
+			})
+
+			// register a handler for bridge out (withdrawal) message
+			err2 := p2pModule.(p2p.P2PSender).RegisterP2PHandler(types.P2PMessageTypeBridgeOut, func(msg *types.P2PBroadcastMessage) error {
+				up.logger.Infof("🎯 Received P2P withdrawal proposal message for session %s", msg.SessionID)
+				return up.handleP2PWithdrawalProposal(msg)
+			})
+
+			if err1 != nil || err2 != nil {
+				up.logger.Errorf("Failed to register handlers: deposit=%v, withdrawal=%v", err1, err2)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			up.logger.Infof("✅ P2P handlers registered successfully for UTXO processor")
+			return
 		}
-		// register a handler for bridge in message
-		p2pModule.(p2p.P2PSender).RegisterP2PHandler(types.P2PMessageTypeBridgeIn, func(msg *types.P2PBroadcastMessage) error {
-			return up.handleP2PDepositProposal(msg)
-		})
-		// register a handler for bridge out (withdrawal) message
-		p2pModule.(p2p.P2PSender).RegisterP2PHandler(types.P2PMessageTypeBridgeOut, func(msg *types.P2PBroadcastMessage) error {
-			return up.handleP2PWithdrawalProposal(msg)
-		})
+
+		up.logger.Errorf("❌ Failed to register P2P handlers after %d retries", maxRetries)
 	}()
 }
 
@@ -83,32 +113,59 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 	}
 	up.logger.Infof("Received deposit proposal for batch %s from proposer %s", proposal.BatchID, proposal.Proposer)
 
+	// Don't convert to full UTXOs for validation - use lightweight UTXOs directly
+	// This avoids loading heavy database objects into the proposal
+
+	// Parse total amount from string for internal use
+	totalAmount, ok := new(big.Int).SetString(proposal.TotalAmountStr, 10)
+	if !ok {
+		return fmt.Errorf("invalid total amount format: %s", proposal.TotalAmountStr)
+	}
+	proposal.TotalAmount = totalAmount
+
 	// Validate the proposal
 	if err := up.validateDepositProposal(proposal); err != nil {
 		up.logger.Errorf("Invalid deposit proposal: %v", err)
 		return fmt.Errorf("invalid deposit proposal: %w", err)
 	}
 
+	// Convert lightweight UTXOs to full UTXOs only when needed for processing
+	fullUTXOs := make([]*models.UTXO, len(proposal.LightweightUTXOs))
+	for i, lightUTXO := range proposal.LightweightUTXOs {
+		var utxo models.UTXO
+		err := up.conn.GetDB().Where("uid = ?", lightUTXO.Uid).First(&utxo).Error
+		if err != nil {
+			return fmt.Errorf("failed to find UTXO %s: %w", lightUTXO.Uid, err)
+		}
+		fullUTXOs[i] = &utxo
+	}
+
 	// Create pending batch entry for tracking
 	batch := &BridgeInBatch{
 		ID:                big.NewInt(0), // Will be set based on batch ID
-		UTXOs:             proposal.UTXOs,
-		TotalAmount:       proposal.TotalAmount,
+		UTXOs:             fullUTXOs,
+		TotalAmount:       totalAmount,
 		TransactionParams: nil, // Will be constructed from UTXOs if needed
+	}
+
+	// Generate calldata locally since it's not sent via P2P
+	calldata, err := up.generateBridgeInCalldata(batch)
+	if err != nil {
+		return fmt.Errorf("failed to generate calldata for received proposal: %w", err)
 	}
 
 	pending := &pendingBatch{
 		batchType:    "deposit",
 		depositBatch: batch,
-		calldata:     proposal.Calldata,
-		utxos:        proposal.UTXOs,
+		calldata:     calldata,
+		utxos:        fullUTXOs,
 	}
 
 	// Store the pending batch for when signature comes back
 	up.pendingBatches.Store(proposal.SessionID, pending)
 
 	// Create hash to sign for verifyAndCall function
-	hash := crypto.Keccak256(proposal.Calldata)
+	hash := crypto.Keccak256(calldata)
 
 	// Request TSS signature for the proposal
 	up.callTssSign(proposal.SessionID, hash)
@@ -172,31 +229,30 @@ func (up *UtxoProcessor) validateDepositProposal(proposal *DepositProposal) erro
 	if proposal.SessionID == "" {
 		return fmt.Errorf("session ID is required")
 	}
-	if len(proposal.UTXOs) == 0 {
+	if len(proposal.LightweightUTXOs) == 0 {
 		return fmt.Errorf("UTXOs list cannot be empty")
 	}
-	if proposal.TotalAmount == nil || proposal.TotalAmount.Cmp(big.NewInt(0)) <= 0 {
-		return fmt.Errorf("total amount must be positive")
-	}
-	if len(proposal.Calldata) == 0 {
-		return fmt.Errorf("calldata cannot be empty")
+	// Parse total amount from string
+	totalAmount, ok := new(big.Int).SetString(proposal.TotalAmountStr, 10)
+	if !ok || totalAmount.Cmp(big.NewInt(0)) <= 0 {
+		return fmt.Errorf("total amount must be a positive number, got: %s", proposal.TotalAmountStr)
 	}
 	if proposal.Proposer == "" {
 		return fmt.Errorf("proposer address is required")
 	}
 
-	// Calculate total amount from UTXOs and verify it matches proposal
+	// Calculate total amount from lightweight UTXOs and verify it matches proposal
 	calculatedTotal := big.NewInt(0)
-	for _, utxo := range proposal.UTXOs {
-		if utxo.Amount <= 0 {
+	for _, lightUTXO := range proposal.LightweightUTXOs {
+		if lightUTXO.Amount <= 0 {
 			return fmt.Errorf("UTXO amount must be positive")
 		}
-		calculatedTotal.Add(calculatedTotal, big.NewInt(utxo.Amount))
+		calculatedTotal.Add(calculatedTotal, big.NewInt(lightUTXO.Amount))
 	}
 
-	if calculatedTotal.Cmp(proposal.TotalAmount) != 0 {
+	if calculatedTotal.Cmp(totalAmount) != 0 {
 		return fmt.Errorf("calculated total amount (%s) does not match proposal total amount (%s)",
-			calculatedTotal.String(), proposal.TotalAmount.String())
+			calculatedTotal.String(), totalAmount.String())
 	}
 
 	// TODO: Add more sophisticated validation:

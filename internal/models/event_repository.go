@@ -1,6 +1,7 @@
 package models
 
 import (
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -26,6 +27,42 @@ func (r *EventRepository) BeginTransaction() *gorm.DB {
 // If the function returns an error the transaction is rolled back; otherwise it's committed.
 func (r *EventRepository) WithTransaction(fn func(tx *gorm.DB) error) error {
 	return r.db.Transaction(func(tx *gorm.DB) error { return fn(tx) })
+}
+
+// WithTransactionRetry runs a transaction with retry logic for database lock errors
+func (r *EventRepository) WithTransactionRetry(fn func(tx *gorm.DB) error) error {
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		err := r.db.Transaction(func(tx *gorm.DB) error {
+			return fn(tx)
+		})
+
+		if err == nil {
+			return nil
+		}
+
+		// Check if it's a database lock error
+		if isLockError(err) && i < maxRetries-1 {
+			// Wait with exponential backoff
+			time.Sleep(time.Duration(100*(i+1)) * time.Millisecond)
+			continue
+		}
+
+		return err
+	}
+	return nil
+}
+
+// isLockError checks if the error is related to database locking
+func isLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "database is locked") ||
+		strings.Contains(errStr, "database lock") ||
+		strings.Contains(errStr, "busy") ||
+		strings.Contains(errStr, "timeout")
 }
 
 // getDB returns tx if provided; otherwise returns the repository base DB.

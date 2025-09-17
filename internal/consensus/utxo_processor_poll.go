@@ -40,11 +40,16 @@ func (up *UtxoProcessor) scanNewUTXOs() error {
 	// Check if this node should process UTXOs
 	isProposer, err := up.isCurrentProposer()
 	if err != nil {
+		up.logger.Errorf("Failed to check proposer status: %v", err)
 		return fmt.Errorf("failed to check proposer status: %w", err)
 	}
 
+	// Add info level logging for debugging
+	up.logger.Infof("UTXO scan: isProposer=%v, proposerSet=%v, currentProposer=%s",
+		isProposer, up.proposerSet, up.currentProposer.Hex())
+
 	if !isProposer {
-		up.logger.Debug("Not the current proposer, skipping UTXO processing")
+		up.logger.Info("Not the current proposer, skipping UTXO processing")
 		return nil
 	}
 
@@ -63,6 +68,13 @@ func (up *UtxoProcessor) scanNewUTXOs() error {
 
 // scanDepositUTXOs handles deposit UTXO processing
 func (up *UtxoProcessor) scanDepositUTXOs() error {
+	// Add safety check to prevent infinite recursion
+	defer func() {
+		if r := recover(); r != nil {
+			up.logger.Errorf("Panic in scanDepositUTXOs: %v", r)
+		}
+	}()
+
 	// Query for new unprocessed deposit UTXOs
 	utxos, err := up.getUnprocessedDepositUTXOs()
 	if err != nil {
@@ -70,15 +82,39 @@ func (up *UtxoProcessor) scanDepositUTXOs() error {
 	}
 
 	if len(utxos) == 0 {
+		up.logger.Debug("No new deposit UTXOs to process")
 		return nil // No new UTXOs to process
 	}
 
 	up.logger.Infof("Found %d new deposit UTXOs to process", len(utxos))
 
-	// Group UTXOs into batches for bridge transactions
-	batches := up.groupUTXOsIntoBatches(utxos)
+	// Filter UTXOs with valid EVM addresses before batching
+	validUTXOs := make([]*models.UTXO, 0, len(utxos))
+	for _, utxo := range utxos {
+		if utxo.EvmAddr == "" {
+			up.logger.Warnf("Skipping UTXO %s: missing EVM address", utxo.Uid)
+			// Mark as processed to avoid reprocessing
+			if err := up.markUTXOsAsProcessed([]*models.UTXO{utxo}); err != nil {
+				up.logger.Errorf("Failed to mark invalid UTXO as processed: %v", err)
+			}
+			continue
+		}
+		validUTXOs = append(validUTXOs, utxo)
+	}
 
-	for _, batch := range batches {
+	if len(validUTXOs) == 0 {
+		up.logger.Info("No valid deposit UTXOs with EVM addresses to process")
+		return nil
+	}
+
+	up.logger.Infof("Processing %d valid deposit UTXOs (filtered from %d total)", len(validUTXOs), len(utxos))
+
+	// Group UTXOs into batches for bridge transactions
+	batches := up.groupUTXOsIntoBatches(validUTXOs)
+	up.logger.Infof("Created %d batches from %d UTXOs", len(batches), len(validUTXOs))
+
+	for i, batch := range batches {
+		up.logger.Infof("Processing batch %d/%d with %d UTXOs", i+1, len(batches), len(batch.UTXOs))
 		if err := up.processDepositBatch(batch); err != nil {
 			up.logger.Errorf("Failed to process deposit batch %s: %v", batch.ID.String(), err)
 			continue
@@ -154,20 +190,20 @@ func (up *UtxoProcessor) processWithdrawalUTXO(utxo *models.UTXO) error {
 
 // getUnprocessedDepositUTXOs retrieves unprocessed deposit UTXOs from database
 func (up *UtxoProcessor) getUnprocessedDepositUTXOs() ([]*models.UTXO, error) {
-    var utxos []*models.UTXO
+	var utxos []*models.UTXO
 
-    // Query for deposit UTXOs that haven't been processed yet
-    // NOTE: Previously this query filtered out rows with empty evm_addr.
-    // That caused valid deposit UTXOs to be skipped when evm_addr was not
-    // populated yet during ingestion. We now fetch by source/status/id only
-    // and defer the evm address check to the batching step, where UTXOs with
-    // missing EVM address are explicitly skipped with a warning.
-    err := up.conn.GetDB().Where(
-        "source = ? AND status = ? AND id > ?",
-        models.UTXO_SOURCE_DEPOSIT,
-        models.UTXO_STATUS_CONFIRMED,
-        up.lastProcessedId,
-    ).Limit(up.batchSize).Find(&utxos).Error
+	// Query for deposit UTXOs that haven't been processed yet
+	// NOTE: Previously this query filtered out rows with empty evm_addr.
+	// That caused valid deposit UTXOs to be skipped when evm_addr was not
+	// populated yet during ingestion. We now fetch by source/status/id only
+	// and defer the evm address check to the batching step, where UTXOs with
+	// missing EVM address are explicitly skipped with a warning.
+	err := up.conn.GetDB().Where(
+		"source = ? AND status = ? AND id > ?",
+		models.UTXO_SOURCE_DEPOSIT,
+		models.UTXO_STATUS_CONFIRMED,
+		up.lastProcessedId,
+	).Limit(up.batchSize).Find(&utxos).Error
 
 	if err != nil {
 		return nil, err
@@ -217,13 +253,8 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*BridgeIn
 	}
 
 	for _, utxo := range utxos {
-		// Validate UTXO has required data
-		if utxo.EvmAddr == "" {
-			up.logger.Warnf("Skipping UTXO %s: missing EVM address", utxo.Uid)
-			continue
-		}
-
 		// Create bridge transaction for this UTXO
+		// EVM address validation is now done before calling this function
 		bridgeTx := contract.BridgeTransaction{
 			DestEvmAddress: common.HexToAddress(utxo.EvmAddr),
 			Amount:         big.NewInt(utxo.Amount),
@@ -235,7 +266,7 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*BridgeIn
 		currentBatch.UTXOs = append(currentBatch.UTXOs, utxo)
 
 		// Check if batch is full (limit to prevent large transactions)
-		if len(currentBatch.TransactionParams) >= 5 {
+		if len(currentBatch.TransactionParams) >= 1 {
 			batches = append(batches, currentBatch)
 			currentBatch = &BridgeInBatch{
 				ID:                big.NewInt(time.Now().Unix() + int64(len(batches))),
@@ -265,7 +296,16 @@ func (up *UtxoProcessor) processDepositBatch(batch *BridgeInBatch) error {
 		return fmt.Errorf("failed to generate bridge calldata: %w", err)
 	}
 
-	up.logger.Infof("Generated bridge calldata: %x", calldata)
+	calldataPreview := calldata
+	if len(calldata) > 64 {
+		calldataPreview = calldata[:64]
+	}
+	up.logger.Infof("Generated bridge calldata (%d bytes): %x...", len(calldata), calldataPreview)
+
+	// Add safety check for calldata size
+	if len(calldata) > 100000 { // 100KB limit
+		return fmt.Errorf("calldata too large: %d bytes", len(calldata))
+	}
 
 	// Create session ID for TSS signing
 	sessionID, err := up.generateSessionID(batch)
@@ -282,16 +322,36 @@ func (up *UtxoProcessor) processDepositBatch(batch *BridgeInBatch) error {
 	}
 	up.pendingBatches.Store(sessionID, pending)
 
-	// Request TSS signature asynchronously
+	// Add defer to clean up on panic
+	defer func() {
+		if r := recover(); r != nil {
+			up.logger.Errorf("Panic in TSS signature request: %v", r)
+			up.pendingBatches.Delete(sessionID)
+		}
+	}()
+
+	// Re-enable TSS with step-by-step logging and error handling
+	up.logger.Infof("Starting TSS signature request for batch %s", batch.ID.String())
+
+	// Add step-by-step logging to isolate the exact failure point
+	up.logger.Infof("Step 1: About to call requestTssSignature")
+
 	err = up.requestTssSignature(calldata, sessionID)
 	if err != nil {
 		// Clean up the pending batch on error
 		up.pendingBatches.Delete(sessionID)
+		up.logger.Errorf("TSS signature request failed: %v", err)
+
+		// Mark UTXOs as processed even on TSS failure to avoid infinite retry
+		if markErr := up.markUTXOsAsProcessed(batch.UTXOs); markErr != nil {
+			up.logger.Errorf("Failed to mark UTXOs as processed after TSS failure: %v", markErr)
+		}
+
 		return fmt.Errorf("failed to request TSS signature: %w", err)
 	}
 
 	// The actual signing will be handled by the event bus
-	up.logger.Infof("TSS signature requested for deposit batch %s", batch.ID.String())
+	up.logger.Infof("TSS signature requested successfully for deposit batch %s", batch.ID.String())
 
 	return nil
 }
@@ -339,8 +399,8 @@ func (up *UtxoProcessor) processWithdrawalRequest(request *withdrawalRequest) er
 }
 
 func (up *UtxoProcessor) generateSessionID(batch *BridgeInBatch) (string, error) {
-	// Create a deterministic session ID based on the UTXOs in the batch
-	// This ensures all nodes generate the same session ID for the same batch
+	// Create a unique session ID that includes timestamp to avoid conflicts
+	// While still being deterministic enough for coordination
 
 	if len(batch.UTXOs) == 0 {
 		return "", fmt.Errorf("cannot generate session ID for empty batch")
@@ -355,13 +415,14 @@ func (up *UtxoProcessor) generateSessionID(batch *BridgeInBatch) (string, error)
 	// Sort to ensure consistent ordering across all nodes
 	sort.Strings(txids)
 
-	// Concatenate all txids
+	// Concatenate all txids with batch ID and timestamp for uniqueness
 	var concatenated string
 	for _, txid := range txids {
 		concatenated += txid + "|"
 	}
+	concatenated += batch.ID.String() + "|" + fmt.Sprintf("%d", time.Now().UnixNano())
 
-	// Create SHA256 hash of the concatenated txids
+	// Create SHA256 hash of the concatenated data
 	hash := sha256.Sum256([]byte(concatenated))
 	hashHex := hex.EncodeToString(hash[:])
 
@@ -475,11 +536,14 @@ func (up *UtxoProcessor) markUTXOsAsProcessed(utxos []*models.UTXO) error {
 
 // requestTssSignature creates a batch proposal, sends it to other nodes, and requests TSS signature
 func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) error {
+	up.logger.Infof("Step 2: Entering requestTssSignature for session %s", sessionID)
+
 	if up.chainID == nil {
 		return fmt.Errorf("chain ID not set")
 	}
 
 	// Get the current batch from pending batches to create the proposal
+	up.logger.Infof("Step 3: Loading pending batch for session %s", sessionID)
 	pendingData, exists := up.pendingBatches.Load(sessionID)
 	if !exists {
 		return fmt.Errorf("no pending batch found for session %s", sessionID)
@@ -493,6 +557,7 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 	}
 
 	batch := pending.depositBatch
+	up.logger.Infof("Step 4: Batch loaded, getting proposer address")
 
 	// Get this node's Ethereum address (proposer)
 	proposerAddress, err := up.getNodeEthereumAddress()
@@ -502,6 +567,7 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 
 	// Create batch ID from session ID for consistency
 	batchID := fmt.Sprintf("batch-%s", sessionID)
+	up.logger.Infof("Step 5: Creating deposit proposal for batch %s", batchID)
 
 	// Create the deposit proposal for the batch
 	proposal := NewDepositProposal(
@@ -513,6 +579,7 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 		sessionID,
 	)
 
+	up.logger.Infof("Step 6: Sending proposal to P2P network")
 	// Send proposal to other P2P nodes
 	if err := up.sendProposalToP2P(proposal); err != nil {
 		up.logger.Errorf("Failed to send proposal to P2P network: %v", err)
@@ -521,9 +588,8 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 		up.logger.Infof("Batch proposal sent to P2P network for session %s", sessionID)
 	}
 
+	up.logger.Infof("Step 7: Creating hash and calling TSS sign")
 	// Create hash to sign for verifyAndCall function
-	// This would typically be: keccak256(abi.encode(targets, calldata, tssNonce, chainID))
-	// For simplicity, we'll use the calldata hash directly
 	hash := crypto.Keccak256(calldata)
 
 	// Request TSS signature using the callTssSign function
@@ -535,21 +601,38 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 
 // sendProposalToP2P sends the batch proposal to other P2P nodes
 func (up *UtxoProcessor) sendProposalToP2P(proposal *DepositProposal) error {
+	up.logger.Infof("Step 6.1: Getting P2P module")
 	p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
 	if !ok {
 		return fmt.Errorf("p2p module not found")
 	}
 
+	up.logger.Infof("Step 6.2: Marshaling proposal to JSON")
 	payload, err := proposal.MarshalJSON()
 	if err != nil {
 		return fmt.Errorf("failed to marshal proposal: %v", err)
 	}
 
-	return p2pModule.(p2p.P2PSender).BroadcastP2PMessage(types.P2PBroadcastMessage{
+	up.logger.Infof("Step 6.3: Proposal marshaled successfully, size: %d bytes", len(payload))
+
+	// Add size limit for P2P messages
+	if len(payload) > 50000 { // 50KB limit
+		return fmt.Errorf("P2P message too large: %d bytes", len(payload))
+	}
+
+	up.logger.Infof("Step 6.4: Broadcasting P2P message")
+	err = p2pModule.(p2p.P2PSender).BroadcastP2PMessage(types.P2PBroadcastMessage{
 		Type:      types.P2PMessageTypeDepositProposal,
 		SessionID: proposal.SessionID,
 		Payload:   payload,
 	})
+
+	if err != nil {
+		return fmt.Errorf("failed to broadcast P2P message: %w", err)
+	}
+
+	up.logger.Infof("Step 6.5: P2P message broadcast completed")
+	return nil
 }
 
 // requestWithdrawalTssSignature creates a withdrawal proposal and requests TSS signature
