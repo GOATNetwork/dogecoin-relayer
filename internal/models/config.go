@@ -61,24 +61,42 @@ func (conn *DBConnection) initDB(sqliteCfg *config.SqliteConfig, gormCfg *config
 	logMode := parseGormLogLevel(gormCfg.LogLevel)
 	gLogger := gormlogger.Default.LogMode(logMode)
 
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{Logger: gLogger})
+	// Configure SQLite with optimized settings for concurrent access
+	dsn := dbPath + "?cache=shared&mode=rwc&_journal_mode=WAL&_synchronous=NORMAL&_timeout=5000&_busy_timeout=5000"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: gLogger})
 	if err != nil {
 		return fmt.Errorf("failed to open sqlite db: %w", err)
 	}
+
+	// Execute additional PRAGMA statements for better concurrency
+	db.Exec("PRAGMA journal_mode=WAL")
+	db.Exec("PRAGMA synchronous=NORMAL")
+	db.Exec("PRAGMA cache_size=10000")
+	db.Exec("PRAGMA temp_store=memory")
+	db.Exec("PRAGMA mmap_size=268435456") // 256MB
 
 	// Tune connection pool
 	sqlDB, err := db.DB()
 	if err != nil {
 		return fmt.Errorf("failed to get underlying sql DB: %w", err)
 	}
+	// Set optimized connection pool settings for SQLite
 	if gormCfg.MaxIdleConns > 0 {
 		sqlDB.SetMaxIdleConns(gormCfg.MaxIdleConns)
+	} else {
+		sqlDB.SetMaxIdleConns(5) // Default for SQLite
 	}
+
 	if gormCfg.MaxOpenConns > 0 {
 		sqlDB.SetMaxOpenConns(gormCfg.MaxOpenConns)
+	} else {
+		sqlDB.SetMaxOpenConns(10) // Conservative limit for SQLite
 	}
+
 	if gormCfg.ConnMaxLifetime > 0 {
 		sqlDB.SetConnMaxLifetime(time.Duration(gormCfg.ConnMaxLifetime) * time.Second)
+	} else {
+		sqlDB.SetConnMaxLifetime(30 * time.Minute) // Default connection lifetime
 	}
 
 	conn.DB = db
