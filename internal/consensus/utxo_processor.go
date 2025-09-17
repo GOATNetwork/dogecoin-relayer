@@ -87,7 +87,7 @@ func NewUtxoProcessor(conn *models.DBConnection, bridgeContractAddress, abiPath 
 		bridgeContract:  common.HexToAddress(bridgeContractAddress),
 		abiPath:         abiPath,
 		pollInterval:    10 * time.Second, // Poll every 10 seconds
-		batchSize:       10,               // Process 10 UTXOs at a time
+		batchSize:       1,                // Process 1 UTXO at a time for debugging
 		lastProcessedId: 0,
 		ctx:             ctx,
 		cancel:          cancel,
@@ -212,14 +212,34 @@ func (up *UtxoProcessor) handleSubmitterChosen(data any) {
 
 	// Parse the submitter address from event data
 	// The event data should contain the chosen submitter address
-	if submitterAddr, ok := event.EventData["submitter"].(string); ok {
-		newProposer := common.HexToAddress(submitterAddr)
-		up.updateCurrentProposer(newProposer)
-	} else if submitterAddr, ok := event.EventData["chosen"].(string); ok {
-		newProposer := common.HexToAddress(submitterAddr)
-		up.updateCurrentProposer(newProposer)
+	var submitterAddr string
+
+	// Debug: Log the actual types of event data
+	for key, value := range event.EventData {
+		up.logger.Infof("Event data debug: key=%s, value=%v, type=%T", key, value, value)
+	}
+
+	// Try different field names and types
+	if addr, ok := event.EventData["submitter"].(string); ok {
+		submitterAddr = addr
+	} else if addr, ok := event.EventData["chosen"].(string); ok {
+		submitterAddr = addr
+	} else if addr, ok := event.EventData["newSubmitter"].(string); ok {
+		submitterAddr = addr
+	} else if addr, ok := event.EventData["submitter"].(common.Address); ok {
+		submitterAddr = addr.Hex()
+	} else if addr, ok := event.EventData["chosen"].(common.Address); ok {
+		submitterAddr = addr.Hex()
+	} else if addr, ok := event.EventData["newSubmitter"].(common.Address); ok {
+		submitterAddr = addr.Hex()
 	} else {
 		up.logger.Errorf("Could not extract submitter address from SubmitterChosen event: %+v", event.EventData)
+		return
+	}
+
+	if submitterAddr != "" {
+		newProposer := common.HexToAddress(submitterAddr)
+		up.updateCurrentProposer(newProposer)
 	}
 }
 
@@ -251,7 +271,7 @@ func (up *UtxoProcessor) isCurrentProposer() (bool, error) {
 	}
 
 	isProposer := up.currentProposer == nodeAddress
-	up.logger.Debugf("Proposer check: current=%s, node=%s, isProposer=%v",
+	up.logger.Infof("Proposer check: current=%s, node=%s, isProposer=%v",
 		up.currentProposer.Hex(), nodeAddress.Hex(), isProposer)
 
 	return isProposer, nil
