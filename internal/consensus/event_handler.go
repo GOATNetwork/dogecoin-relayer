@@ -12,6 +12,7 @@ import (
 	"github.com/goat-network/dogecoin-relayer/pkg/global"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
 	log "github.com/sirupsen/logrus"
+	"gorm.io/gorm"
 )
 
 // EventHandler manages event detection and processing
@@ -170,24 +171,20 @@ func (eh *EventHandler) processBridgeOutProposed(event BlockchainEvent) error {
 		return fmt.Errorf("failed to parse BridgeOutProposed.taskId: %w", err)
 	}
 
-	// Create withdrawal record with explicit transaction
-	tx := eh.eventRepo.BeginTransaction()
-	withdrawal := &models.Withdrawal{
-		ReqTaskId:   taskId,
-		ReqTxHash:   event.TxHash.Hex(),
-		ReqBlock:    event.BlockNumber,
-		ReqLogIndex: event.LogIndex,
-		Status:      "init", // Initial status when BridgeOutProposed is detected
-	}
+	// Create withdrawal record with retry transaction
+	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
+		withdrawal := &models.Withdrawal{
+			ReqTaskId:   taskId,
+			ReqTxHash:   event.TxHash.Hex(),
+			ReqBlock:    event.BlockNumber,
+			ReqLogIndex: event.LogIndex,
+			Status:      "init", // Initial status when BridgeOutProposed is detected
+		}
+		return eh.eventRepo.CreateOrUpdateWithdrawal(tx, withdrawal)
+	})
 
-	if err := eh.eventRepo.CreateOrUpdateWithdrawal(tx, withdrawal); err != nil {
-		tx.Rollback()
+	if err != nil {
 		return fmt.Errorf("failed to create/update withdrawal: %w", err)
-	}
-
-	if err := tx.Commit().Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	logger.Infof("Created/updated withdrawal record for taskId=%s", taskId)
@@ -280,22 +277,18 @@ func (eh *EventHandler) processSubmitterChosen(event BlockchainEvent) error {
 	if submitterAddr != "" {
 		logger.Infof("New submitter chosen: %s", submitterAddr)
 
-		// Update proposer record with explicit transaction
-		tx := eh.eventRepo.BeginTransaction()
-		proposer := &models.Proposers{
-			Address:   submitterAddr,
-			Status:    "ok", // Active submitter
-			JoinBlock: event.BlockNumber,
-		}
+		// Update proposer record with retry transaction
+		err := eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
+			proposer := &models.Proposers{
+				Address:   submitterAddr,
+				Status:    "ok", // Active submitter
+				JoinBlock: event.BlockNumber,
+			}
+			return eh.eventRepo.CreateOrUpdateProposer(tx, proposer)
+		})
 
-		if err := eh.eventRepo.CreateOrUpdateProposer(tx, proposer); err != nil {
-			tx.Rollback()
+		if err != nil {
 			return fmt.Errorf("failed to create/update proposer: %w", err)
-		}
-
-		if err := tx.Commit().Error; err != nil {
-			tx.Rollback()
-			return fmt.Errorf("failed to commit transaction: %w", err)
 		}
 
 		logger.Infof("Updated proposer record for address=%s", submitterAddr)
