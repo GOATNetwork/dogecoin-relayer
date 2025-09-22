@@ -2,6 +2,7 @@ package tss
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
@@ -32,6 +33,15 @@ func (m *TssModule) handleSignStart(data any) {
 			errorMessage = ssResp.Message
 		}
 
+		// Check if session already exists - this is normal for coordinated signing
+		if ssResp != nil && ssResp.Message != "" &&
+			(ssResp.Message == "session already exists" ||
+				strings.Contains(ssResp.Message, "already exists")) {
+			m.logger.Infof("Session %s already exists, joining existing session", req.SessionID)
+			m.activeSessions.Store(req.SessionID, time.Now())
+			return
+		}
+
 		m.eventBus.Publish(eventbus.EventTssSigResponse, types.TssSigResponse{
 			SessionID: req.SessionID,
 			Success:   false,
@@ -41,6 +51,15 @@ func (m *TssModule) handleSignStart(data any) {
 		return
 	}
 	if !ssResp.Success {
+		// Check if session already exists - this is normal for coordinated signing
+		if ssResp.Message != "" &&
+			(ssResp.Message == "session already exists" ||
+				strings.Contains(ssResp.Message, "already exists")) {
+			m.logger.Infof("Session %s already exists, joining existing session", req.SessionID)
+			m.activeSessions.Store(req.SessionID, time.Now())
+			return
+		}
+
 		m.logger.Errorf("sign start response failed: %s, session id: %s", ssResp.Message, req.SessionID)
 		m.eventBus.Publish(eventbus.EventTssSigResponse, types.TssSigResponse{
 			SessionID: req.SessionID,

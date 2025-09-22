@@ -66,6 +66,101 @@ func (up *UtxoProcessor) scanNewUTXOs() error {
 	return nil
 }
 
+// pendingBatchRetryLoop monitors pending batches and retries failed sessions
+func (up *UtxoProcessor) pendingBatchRetryLoop() {
+	ticker := time.NewTicker(30 * time.Second) // Check every 30 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-up.ctx.Done():
+			up.logger.Info("Pending batch retry loop stopping...")
+			return
+		case <-ticker.C:
+			if err := up.retryPendingBatches(); err != nil {
+				up.logger.Errorf("Failed to retry pending batches: %v", err)
+			}
+		}
+	}
+}
+
+// retryPendingBatches checks and retries pending batches that may have failed
+func (up *UtxoProcessor) retryPendingBatches() error {
+	// Only proposer should retry and rebroadcast
+	isProposer, err := up.isCurrentProposer()
+	if err != nil {
+		return fmt.Errorf("failed to check proposer status: %w", err)
+	}
+
+	if !isProposer {
+		return nil // Only proposer retries
+	}
+
+	retryCount := 0
+	up.pendingBatches.Range(func(key, value interface{}) bool {
+		sessionID := key.(string)
+		pending := value.(*pendingBatch)
+
+		// Check if this is a deposit batch that needs retry
+		if pending.batchType == "deposit" && pending.depositBatch != nil {
+			up.logger.Infof("Retrying pending deposit batch for session %s", sessionID)
+
+			// Recreate and send proposal
+			if err := up.retryDepositBatch(sessionID, pending); err != nil {
+				up.logger.Errorf("Failed to retry deposit batch %s: %v", sessionID, err)
+			} else {
+				retryCount++
+			}
+		}
+
+		return true // Continue iteration
+	})
+
+	if retryCount > 0 {
+		up.logger.Infof("Retried %d pending deposit batches", retryCount)
+	}
+
+	return nil
+}
+
+// retryDepositBatch retries a specific deposit batch
+func (up *UtxoProcessor) retryDepositBatch(sessionID string, pending *pendingBatch) error {
+	batch := pending.depositBatch
+
+	// Get proposer address
+	proposerAddress, err := up.getNodeEthereumAddress()
+	if err != nil {
+		return fmt.Errorf("failed to get proposer address: %w", err)
+	}
+
+	// Create batch ID from session ID
+	batchID := fmt.Sprintf("batch-%s", sessionID)
+
+	// Recreate the deposit proposal
+	proposal := NewDepositProposal(
+		batchID,
+		batch.UTXOs,
+		batch.TotalAmount,
+		pending.calldata,
+		proposerAddress.Hex(),
+		sessionID,
+	)
+
+	// Rebroadcast proposal to P2P network
+	if err := up.sendProposalToP2P(proposal); err != nil {
+		up.logger.Errorf("Failed to rebroadcast proposal: %v", err)
+	} else {
+		up.logger.Infof("Rebroadcast proposal for session %s", sessionID)
+	}
+
+	// Re-request TSS signature
+	hash := crypto.Keccak256(pending.calldata)
+	up.callTssSign(sessionID, hash)
+	up.logger.Infof("Re-requested TSS signature for session %s", sessionID)
+
+	return nil
+}
+
 // scanDepositUTXOs handles deposit UTXO processing
 func (up *UtxoProcessor) scanDepositUTXOs() error {
 	// Add safety check to prevent infinite recursion
@@ -399,8 +494,8 @@ func (up *UtxoProcessor) processWithdrawalRequest(request *withdrawalRequest) er
 }
 
 func (up *UtxoProcessor) generateSessionID(batch *BridgeInBatch) (string, error) {
-	// Create a unique session ID that includes timestamp to avoid conflicts
-	// While still being deterministic enough for coordination
+	// Create a deterministic session ID based on the UTXOs in the batch
+	// This ensures all nodes generate the same session ID for the same batch
 
 	if len(batch.UTXOs) == 0 {
 		return "", fmt.Errorf("cannot generate session ID for empty batch")
@@ -415,14 +510,13 @@ func (up *UtxoProcessor) generateSessionID(batch *BridgeInBatch) (string, error)
 	// Sort to ensure consistent ordering across all nodes
 	sort.Strings(txids)
 
-	// Concatenate all txids with batch ID and timestamp for uniqueness
+	// Concatenate all txids
 	var concatenated string
 	for _, txid := range txids {
 		concatenated += txid + "|"
 	}
-	concatenated += batch.ID.String() + "|" + fmt.Sprintf("%d", time.Now().UnixNano())
 
-	// Create SHA256 hash of the concatenated data
+	// Create SHA256 hash of the concatenated txids
 	hash := sha256.Sum256([]byte(concatenated))
 	hashHex := hex.EncodeToString(hash[:])
 

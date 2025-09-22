@@ -179,6 +179,9 @@ func (up *UtxoProcessor) Start() error {
 	// Start the polling loop
 	go up.pollLoop()
 
+	// Start pending batch monitoring and retry loop
+	go up.pendingBatchRetryLoop()
+
 	return nil
 }
 

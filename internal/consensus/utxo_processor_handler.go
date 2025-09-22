@@ -3,6 +3,7 @@ package consensus
 import (
 	"fmt"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -31,7 +32,7 @@ func (up *UtxoProcessor) registerP2PHandler() {
 			}
 
 			// Check if network is initialized
-			network := p2pModule.(*P2PModule).GetNetwork()
+			network := p2pModule.(*p2p.P2PModule).GetNetwork()
 			if network == nil {
 				up.logger.Debugf("P2P network not initialized, retrying in 2 seconds... (%d/%d)", i+1, maxRetries)
 				time.Sleep(2 * time.Second)
@@ -74,8 +75,8 @@ func (up *UtxoProcessor) handleTssSignature(data any) {
 
 	up.logger.Infof("Received TSS signature response for session %s, success: %v", resp.SessionID, resp.Success)
 
-	// Retrieve the pending batch
-	pendingData, exists := up.pendingBatches.LoadAndDelete(resp.SessionID)
+	// Retrieve the pending batch (but don't delete yet)
+	pendingData, exists := up.pendingBatches.Load(resp.SessionID)
 	if !exists {
 		up.logger.Warnf("No pending batch found for session %s", resp.SessionID)
 		return
@@ -85,6 +86,9 @@ func (up *UtxoProcessor) handleTssSignature(data any) {
 
 	if resp.Success {
 		up.logger.Infof("TSS signature successful for session %s", resp.SessionID)
+		// Remove from pending batches on success
+		up.pendingBatches.Delete(resp.SessionID)
+
 		// Continue with transaction submission
 		err := up.completeBatchWithSignature(pending, resp.RawSig)
 		if err != nil {
@@ -92,7 +96,17 @@ func (up *UtxoProcessor) handleTssSignature(data any) {
 		}
 	} else {
 		up.logger.Errorf("TSS signing failed for session %s: %s", resp.SessionID, resp.Message)
-		// Handle failure - could implement retry logic here
+
+		// For timeout errors, keep the batch for retry; for other errors, remove it
+		if strings.Contains(resp.Message, "timeout") || strings.Contains(resp.Message, "timed out") {
+			up.logger.Infof("Keeping batch %s for retry due to timeout", resp.SessionID)
+		} else {
+			// Remove from pending batches for non-timeout errors
+			up.pendingBatches.Delete(resp.SessionID)
+			up.logger.Infof("Removed batch %s due to non-timeout error", resp.SessionID)
+		}
+
+		// Handle failure
 		up.handleBatchSigningFailure(pending, resp.Message)
 	}
 }
