@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,6 +44,53 @@ type pendingBatch struct {
 	withdrawalRequest *withdrawalRequest
 	calldata          []byte
 	utxos             []*models.UTXO
+	baseSessionID     string
+	currentSessionID  string
+	nextAttempt       int
+	lastAttempt       time.Time
+	nextRetryAt       time.Time
+}
+
+func (up *UtxoProcessor) assignNewTssSession(pending *pendingBatch) string {
+	attempt := pending.nextAttempt
+	sessionID := pending.baseSessionID
+	if attempt > 0 {
+		sessionID = fmt.Sprintf("%s-%d", pending.baseSessionID, attempt)
+	}
+
+	// Update attempt counters for next round
+	if pending.currentSessionID != "" {
+		up.tssSessionAliases.Delete(pending.currentSessionID)
+	}
+	pending.currentSessionID = sessionID
+	pending.nextAttempt++
+	pending.lastAttempt = time.Now()
+	retryDelay := up.tssRequestRetryBackoff
+	if retryDelay <= 0 {
+		retryDelay = 15 * time.Second
+	}
+	pending.nextRetryAt = pending.lastAttempt.Add(retryDelay)
+
+	up.tssSessionAliases.Store(sessionID, pending.baseSessionID)
+	return sessionID
+}
+
+func (up *UtxoProcessor) registerExistingTssSession(pending *pendingBatch, sessionID string) {
+	base := pending.baseSessionID
+	if base == "" {
+		base = sessionID
+		pending.baseSessionID = base
+	}
+	if attempt, ok := extractAttemptIndex(base, sessionID); ok {
+		if attempt+1 > pending.nextAttempt {
+			pending.nextAttempt = attempt + 1
+		}
+	}
+	if pending.currentSessionID != "" && pending.currentSessionID != sessionID {
+		up.tssSessionAliases.Delete(pending.currentSessionID)
+	}
+	pending.currentSessionID = sessionID
+	up.tssSessionAliases.Store(sessionID, base)
 }
 
 // UtxoProcessor manages UTXO processing for bridge operations
@@ -62,7 +111,12 @@ type UtxoProcessor struct {
 	proposerSet     bool           // Whether we have received proposer info
 
 	// Pending batches waiting for TSS signatures
-	pendingBatches sync.Map // sessionID -> *pendingBatch
+	pendingBatches    sync.Map // base session ID -> *pendingBatch
+	tssSessionAliases sync.Map // actual TSS session ID -> base session ID
+
+	// Retry configuration
+	tssRequestMaxRetries   int
+	tssRequestRetryBackoff time.Duration
 
 	// Polling configuration
 	pollInterval    time.Duration
@@ -80,21 +134,41 @@ func NewUtxoProcessor(conn *models.DBConnection, bridgeContractAddress, abiPath 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	up := &UtxoProcessor{
-		conn:            conn,
-		state:           models.NewStateRepository(conn.GetDB()),
-		logger:          types.InitLogEntry("utxo-processor"),
-		eventBus:        global.GetEventBus(),
-		bridgeContract:  common.HexToAddress(bridgeContractAddress),
-		abiPath:         abiPath,
-		pollInterval:    10 * time.Second, // Poll every 10 seconds
-		batchSize:       1,                // Process 1 UTXO at a time for debugging
-		lastProcessedId: 0,
-		ctx:             ctx,
-		cancel:          cancel,
-		isRunning:       false,
+		conn:                   conn,
+		state:                  models.NewStateRepository(conn.GetDB()),
+		logger:                 types.InitLogEntry("utxo-processor"),
+		eventBus:               global.GetEventBus(),
+		bridgeContract:         common.HexToAddress(bridgeContractAddress),
+		abiPath:                abiPath,
+		pollInterval:           10 * time.Second, // Poll every 10 seconds
+		batchSize:              1,                // Process 1 UTXO at a time for debugging
+		lastProcessedId:        0,
+		ctx:                    ctx,
+		cancel:                 cancel,
+		isRunning:              false,
+		tssRequestMaxRetries:   3,
+		tssRequestRetryBackoff: 60 * time.Second,
 	}
 
 	return up
+}
+
+func extractAttemptIndex(baseSession, currentSession string) (int, bool) {
+	if baseSession == "" {
+		return 0, false
+	}
+	if currentSession == baseSession {
+		return 0, true
+	}
+	if !strings.HasPrefix(currentSession, baseSession+"-") {
+		return 0, false
+	}
+	suffix := currentSession[len(baseSession)+1:]
+	value, err := strconv.Atoi(suffix)
+	if err != nil {
+		return 0, false
+	}
+	return value, true
 }
 
 // SetContractBuilder sets the contract builder for generating calldata

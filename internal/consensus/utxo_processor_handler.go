@@ -1,8 +1,10 @@
 package consensus
 
 import (
+	"bytes"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/internal/p2p"
+	"github.com/goat-network/dogecoin-relayer/pkg/contract"
 	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
@@ -73,21 +76,24 @@ func (up *UtxoProcessor) handleTssSignature(data any) {
 		return
 	}
 
-	up.logger.Infof("Received TSS signature response for session %s, success: %v", resp.SessionID, resp.Success)
-
-	// Retrieve the pending batch (but don't delete yet)
-	pendingData, exists := up.pendingBatches.Load(resp.SessionID)
+	key, pending, exists := up.loadPendingForSession(resp.SessionID)
 	if !exists {
-		up.logger.Warnf("No pending batch found for session %s", resp.SessionID)
+		up.logger.Warnf("No pending batch found for TSS session %s", resp.SessionID)
 		return
 	}
 
-	pending := pendingData.(*pendingBatch)
+	baseSessionID := pending.baseSessionID
+	if baseSessionID == "" {
+		baseSessionID = key
+	}
+
+	up.logger.Infof("Received TSS signature response for session %s (base session %s), success: %v", resp.SessionID, baseSessionID, resp.Success)
 
 	if resp.Success {
 		up.logger.Infof("TSS signature successful for session %s", resp.SessionID)
 		// Remove from pending batches on success
-		up.pendingBatches.Delete(resp.SessionID)
+		up.pendingBatches.Delete(key)
+		up.tssSessionAliases.Delete(resp.SessionID)
 
 		// Continue with transaction submission
 		err := up.completeBatchWithSignature(pending, resp.RawSig)
@@ -99,24 +105,71 @@ func (up *UtxoProcessor) handleTssSignature(data any) {
 
 		// For timeout errors, keep the batch for retry; for other errors, remove it
 		if strings.Contains(resp.Message, "timeout") || strings.Contains(resp.Message, "timed out") {
+			now := time.Now()
+			retryDelay := up.tssRequestRetryBackoff
+			if retryDelay <= 0 {
+				retryDelay = 15 * time.Second
+			}
+			pending.lastAttempt = now
+			pending.nextRetryAt = now.Add(retryDelay)
+			up.pendingBatches.Store(key, pending)
 			up.logger.Infof("Keeping batch %s for retry due to timeout", resp.SessionID)
 		} else {
 			// Remove from pending batches for non-timeout errors
-			up.pendingBatches.Delete(resp.SessionID)
-			up.logger.Infof("Removed batch %s due to non-timeout error", resp.SessionID)
+			up.pendingBatches.Delete(key)
+			up.logger.Infof("Removed batch %s due to non-timeout error", baseSessionID)
 		}
+		up.tssSessionAliases.Delete(resp.SessionID)
 
 		// Handle failure
 		up.handleBatchSigningFailure(pending, resp.Message)
 	}
 }
 
-func (up *UtxoProcessor) callTssSign(sessionID string, calldata []byte) {
+func (up *UtxoProcessor) callTssSign(sessionID string, calldata []byte) string {
 	up.eventBus.Publish(eventbus.EventTssSigRequest, types.TssSigRequest{
 		SessionID:  sessionID,
 		UnsignHash: calldata,
 	})
 	up.logger.Debugf("Sent TSS sign request for session %s", sessionID)
+	return sessionID
+}
+
+func (up *UtxoProcessor) loadPendingForSession(sessionID string) (string, *pendingBatch, bool) {
+	if data, ok := up.pendingBatches.Load(sessionID); ok {
+		return sessionID, data.(*pendingBatch), true
+	}
+
+	if alias, ok := up.tssSessionAliases.Load(sessionID); ok {
+		base, ok := alias.(string)
+		if ok {
+			if data, ok := up.pendingBatches.Load(base); ok {
+				return base, data.(*pendingBatch), true
+			}
+		}
+	}
+
+	if base, ok := stripRetrySuffix(sessionID); ok {
+		if data, ok := up.pendingBatches.Load(base); ok {
+			return base, data.(*pendingBatch), true
+		}
+	}
+
+	return "", nil, false
+}
+
+func stripRetrySuffix(sessionID string) (string, bool) {
+	idx := strings.LastIndex(sessionID, "-")
+	if idx == -1 || idx+1 >= len(sessionID) {
+		return sessionID, false
+	}
+
+	suffix := sessionID[idx+1:]
+	if _, err := strconv.Atoi(suffix); err != nil {
+		return sessionID, false
+	}
+
+	return sessionID[:idx], true
 }
 
 func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage) error {
@@ -155,11 +208,29 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 	}
 
 	// Create pending batch entry for tracking
+	txParams := make([]contract.BridgeTransaction, len(fullUTXOs))
+	for i, utxo := range fullUTXOs {
+		txParams[i] = contract.BridgeTransaction{
+			DestEvmAddress: common.HexToAddress(utxo.EvmAddr),
+			Amount:         big.NewInt(utxo.Amount),
+			TxBytes:        []byte(utxo.Txid),
+		}
+	}
+
+	batchID := new(big.Int)
+	derivedID, err := deriveDeterministicIDFromSession(proposal.SessionID)
+	if err != nil {
+		up.logger.Errorf("Failed to derive deterministic batch ID for session %s: %v", proposal.SessionID, err)
+		return fmt.Errorf("failed to derive batch ID: %w", err)
+	}
+	batchID = derivedID
+	up.logger.Infof("Handler: derived batch ID %s from session %s", batchID.String(), proposal.SessionID)
+
 	batch := &BridgeInBatch{
-		ID:                big.NewInt(0), // Will be set based on batch ID
+		ID:                batchID,
 		UTXOs:             fullUTXOs,
 		TotalAmount:       totalAmount,
-		TransactionParams: nil, // Will be constructed from UTXOs if needed
+		TransactionParams: txParams,
 	}
 
 	// Generate calldata locally since it's not sent via P2P
@@ -168,24 +239,49 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 		return fmt.Errorf("failed to generate calldata for received proposal: %w", err)
 	}
 
-	pending := &pendingBatch{
-		batchType:    "deposit",
-		depositBatch: batch,
-		calldata:     calldata,
-		utxos:        fullUTXOs,
+	baseSessionID := proposal.SessionID
+	if base, ok := stripRetrySuffix(proposal.SessionID); ok {
+		baseSessionID = base
 	}
 
-	// Store the pending batch for when signature comes back
-	up.pendingBatches.Store(proposal.SessionID, pending)
+	var pending *pendingBatch
+	var key string
+	if existingKey, existing, ok := up.loadPendingForSession(baseSessionID); ok {
+		pending = existing
+		key = existingKey
+	} else {
+		pending = &pendingBatch{
+			batchType:     "deposit",
+			baseSessionID: baseSessionID,
+		}
+		key = baseSessionID
+	}
+
+	pending.depositBatch = batch
+	pending.withdrawalRequest = nil
+	pending.calldata = calldata
+	pending.utxos = fullUTXOs
+	up.registerExistingTssSession(pending, proposal.SessionID)
+	up.pendingBatches.Store(key, pending)
 
 	// Create hash to sign for verifyAndCall function
 	hash := crypto.Keccak256(calldata)
 
 	// Request TSS signature for the proposal
-	up.callTssSign(proposal.SessionID, hash)
+	selfAddress, addrErr := up.getNodeEthereumAddress()
+	if addrErr != nil {
+		return fmt.Errorf("failed to get node address: %w", addrErr)
+	}
 
-	up.logger.Infof("TSS signature requested for received proposal batch %s with session ID: %s",
-		proposal.BatchID, proposal.SessionID)
+	if strings.EqualFold(proposal.Proposer, selfAddress.Hex()) {
+		up.logger.Debugf("Skipping TSS sign initiation for proposer node on session %s", proposal.SessionID)
+		return nil
+	}
+
+	tssSessionID := pending.currentSessionID
+	up.callTssSign(tssSessionID, hash)
+	up.logger.Infof("Joined TSS signing for proposal batch %s with session %s (base session %s)",
+		proposal.BatchID, tssSessionID, pending.baseSessionID)
 
 	return nil
 }
@@ -212,24 +308,66 @@ func (up *UtxoProcessor) handleP2PWithdrawalProposal(msg *types.P2PBroadcastMess
 		TaskIds:     proposal.TaskIds,
 	}
 
-	pending := &pendingBatch{
-		batchType:         "withdrawal",
-		withdrawalRequest: request,
-		calldata:          proposal.Calldata,
-		utxos:             proposal.UTXOs,
+	derivedID, err := deriveDeterministicIDFromSession(proposal.SessionID)
+	if err != nil {
+		up.logger.Errorf("Failed to derive deterministic withdrawal ID for session %s: %v", proposal.SessionID, err)
+		return fmt.Errorf("failed to derive withdrawal ID: %w", err)
+	}
+	request.ID = derivedID
+	up.logger.Infof("Handler: derived withdrawal ID %s from session %s", request.ID.String(), proposal.SessionID)
+
+	calldata, err := up.generateBridgeOutFinishCalldata(request)
+	if err != nil {
+		return fmt.Errorf("failed to regenerate withdrawal calldata: %w", err)
 	}
 
-	// Store the pending batch for when signature comes back
-	up.pendingBatches.Store(proposal.SessionID, pending)
+	if len(proposal.Calldata) > 0 && !bytes.Equal(proposal.Calldata, calldata) {
+		return fmt.Errorf("withdrawal proposal calldata mismatch for session %s", proposal.SessionID)
+	}
+
+	baseSessionID := proposal.SessionID
+	if base, ok := stripRetrySuffix(proposal.SessionID); ok {
+		baseSessionID = base
+	}
+
+	var pending *pendingBatch
+	var key string
+	if existingKey, existing, ok := up.loadPendingForSession(baseSessionID); ok {
+		pending = existing
+		key = existingKey
+	} else {
+		pending = &pendingBatch{
+			batchType:     "withdrawal",
+			baseSessionID: baseSessionID,
+		}
+		key = baseSessionID
+	}
+
+	pending.depositBatch = nil
+	pending.withdrawalRequest = request
+	pending.calldata = calldata
+	pending.utxos = proposal.UTXOs
+	up.registerExistingTssSession(pending, proposal.SessionID)
+	up.pendingBatches.Store(key, pending)
 
 	// Create hash to sign for verifyAndCall function
-	hash := crypto.Keccak256(proposal.Calldata)
+	hash := crypto.Keccak256(calldata)
 
 	// Request TSS signature for the proposal
-	up.callTssSign(proposal.SessionID, hash)
+	selfAddress, addrErr := up.getNodeEthereumAddress()
+	if addrErr != nil {
+		return fmt.Errorf("failed to get node address: %w", addrErr)
+	}
 
-	up.logger.Infof("TSS signature requested for received withdrawal proposal batch %s with session ID: %s",
-		proposal.BatchID, proposal.SessionID)
+	if strings.EqualFold(proposal.Proposer, selfAddress.Hex()) {
+		up.logger.Debugf("Skipping TSS sign initiation for proposer node on withdrawal session %s", proposal.SessionID)
+		return nil
+	}
+
+	tssSessionID := pending.currentSessionID
+	up.callTssSign(tssSessionID, hash)
+	up.logger.Infof("Joined TSS signing for withdrawal batch %s with session %s (base session %s)",
+		proposal.BatchID, tssSessionID, pending.baseSessionID)
 
 	return nil
 }

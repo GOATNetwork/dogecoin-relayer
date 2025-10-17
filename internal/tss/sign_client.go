@@ -81,7 +81,7 @@ func (c *SignClient) StartSign(ctx context.Context, sessionID string, unsignHash
 		return nil, fmt.Errorf("tss url is not set")
 	}
 
-	c.logger.Infof("TSS request: URL=%s, SessionID=%s", url, sessionID)
+	c.logger.Infof("TSS request: URL=%s, SessionID=%s, Hash=%x, HashLength=%d", url, sessionID, unsignHash, len(unsignHash))
 	resp, err := c.httpClient.Post(url, "application/json", bytes.NewBuffer(body))
 	if err != nil {
 		return nil, fmt.Errorf("http request failed: %w", err)
