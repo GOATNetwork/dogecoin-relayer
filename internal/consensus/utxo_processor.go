@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/internal/p2p"
 	"github.com/goat-network/dogecoin-relayer/internal/tss"
@@ -49,6 +50,7 @@ type pendingBatch struct {
 	nextAttempt       int
 	lastAttempt       time.Time
 	nextRetryAt       time.Time
+	tssNonce          *big.Int
 }
 
 func (up *UtxoProcessor) assignNewTssSession(pending *pendingBatch) string {
@@ -95,16 +97,17 @@ func (up *UtxoProcessor) registerExistingTssSession(pending *pendingBatch, sessi
 
 // UtxoProcessor manages UTXO processing for bridge operations
 type UtxoProcessor struct {
-	conn            *models.DBConnection
-	state           *models.StateRepository
-	logger          *log.Entry
-	eventBus        *eventbus.Bus
-	contractBuilder *contract.Contract
-	bridgeContract  common.Address
-	abiPath         string
-	tssClient       *tss.SignClient
-	chainID         *big.Int
-	p2pModule       *p2p.P2PModule // Reference to P2P module for accessing public key
+	conn               *models.DBConnection
+	state              *models.StateRepository
+	logger             *log.Entry
+	eventBus           *eventbus.Bus
+	contractBuilder    *contract.Contract
+	bridgeContract     common.Address
+	entryPointContract common.Address
+	abiPath            string
+	tssClient          *tss.SignClient
+	chainID            *big.Int
+	p2pModule          *p2p.P2PModule // Reference to P2P module for accessing public key
 
 	// Current proposer state
 	currentProposer common.Address // Cached from SubmitterChosen events
@@ -130,7 +133,7 @@ type UtxoProcessor struct {
 }
 
 // NewUtxoProcessor creates a new UTXO processor
-func NewUtxoProcessor(conn *models.DBConnection, bridgeContractAddress, abiPath string) *UtxoProcessor {
+func NewUtxoProcessor(conn *models.DBConnection, bridgeContractAddress, entryPointAddress, abiPath string) *UtxoProcessor {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	up := &UtxoProcessor{
@@ -139,6 +142,7 @@ func NewUtxoProcessor(conn *models.DBConnection, bridgeContractAddress, abiPath 
 		logger:                 types.InitLogEntry("utxo-processor"),
 		eventBus:               global.GetEventBus(),
 		bridgeContract:         common.HexToAddress(bridgeContractAddress),
+		entryPointContract:     common.HexToAddress(entryPointAddress),
 		abiPath:                abiPath,
 		pollInterval:           10 * time.Second, // Poll every 10 seconds
 		batchSize:              1,                // Process 1 UTXO at a time for debugging
@@ -194,7 +198,7 @@ func (up *UtxoProcessor) Start() error {
 
 	// Create contract builder for generating bridge calldata
 	contractBuilder, err := contract.NewEntryPoint(
-		up.bridgeContract,
+		up.entryPointContract,
 		GetEthClient(),
 		up.abiPath,
 	)
@@ -352,4 +356,91 @@ func (up *UtxoProcessor) isCurrentProposer() (bool, error) {
 		up.currentProposer.Hex(), nodeAddress.Hex(), isProposer)
 
 	return isProposer, nil
+}
+
+func (up *UtxoProcessor) fetchTssNonce() (*big.Int, error) {
+	if up.contractBuilder == nil {
+		return nil, fmt.Errorf("contract builder not configured")
+	}
+
+	ctx, cancel := context.WithTimeout(up.ctx, 10*time.Second)
+	defer cancel()
+
+	nonce, err := up.contractBuilder.GetTssNonce(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch tss nonce: %w", err)
+	}
+
+	return nonce, nil
+}
+
+func (up *UtxoProcessor) computeVerifyAndCallDigest(calldata []byte, tssNonce *big.Int) ([]byte, [32]byte, error) {
+	if up.chainID == nil {
+		return nil, [32]byte{}, fmt.Errorf("chain ID not set")
+	}
+	if tssNonce == nil {
+		return nil, [32]byte{}, fmt.Errorf("tss nonce not provided")
+	}
+
+	targets := []common.Address{up.bridgeContract}
+	calldataArray := [][]byte{calldata}
+
+	hash, err := contract.CreateVerifyAndCallHash(targets, calldataArray, tssNonce, up.chainID)
+	if err != nil {
+		return nil, [32]byte{}, fmt.Errorf("failed to create verifyAndCall hash: %w", err)
+	}
+
+	prefix := []byte("\x19Ethereum Signed Message:\n32")
+	digest := crypto.Keccak256(prefix, hash[:])
+
+	return digest, hash, nil
+}
+
+// cleanupStaleSessions removes pending sessions that exhausted retries or sat idle too long.
+func (up *UtxoProcessor) cleanupStaleSessions() {
+	now := time.Now()
+	maxAge := up.tssRequestRetryBackoff * time.Duration(up.tssRequestMaxRetries+1)
+	if maxAge <= 0 {
+		maxAge = 10 * time.Minute
+	}
+
+	up.pendingBatches.Range(func(key, value interface{}) bool {
+		baseID, ok := key.(string)
+		if !ok {
+			return true
+		}
+
+		pending, ok := value.(*pendingBatch)
+		if !ok {
+			up.pendingBatches.Delete(baseID)
+			return true
+		}
+
+		// Remove batches that already hit retry ceiling.
+		if up.tssRequestMaxRetries > 0 && pending.nextAttempt >= up.tssRequestMaxRetries {
+			up.logger.Warnf("Removing %s session %s after exhausting retries", pending.batchType, baseID)
+			up.removePendingSession(baseID, pending)
+			return true
+		}
+
+		// Remove batches that have been idle for too long.
+		if !pending.lastAttempt.IsZero() && now.Sub(pending.lastAttempt) > maxAge {
+			up.logger.Warnf("Cleaning up stale %s session %s (last attempt %s ago)", pending.batchType, baseID, now.Sub(pending.lastAttempt))
+			up.removePendingSession(baseID, pending)
+		}
+		return true
+	})
+}
+
+func (up *UtxoProcessor) removePendingSession(baseID string, pending *pendingBatch) {
+	up.pendingBatches.Delete(baseID)
+	if pending == nil {
+		return
+	}
+	if pending.currentSessionID != "" {
+		up.tssSessionAliases.Delete(pending.currentSessionID)
+	}
+	if pending.baseSessionID != "" && pending.baseSessionID != baseID {
+		up.tssSessionAliases.Delete(pending.baseSessionID)
+	}
 }

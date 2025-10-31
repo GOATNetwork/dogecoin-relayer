@@ -16,17 +16,18 @@ type MigrateLog struct {
 }
 
 type Deposit struct {
-	gorm.Model `swaggerignore:"true"`
+    gorm.Model `swaggerignore:"true"`
 
-	TxId        string `gorm:"type:varchar(66);not null;index" json:"txid"`
-	Vout        int    `gorm:"type:int;not null" json:"vout"`
-	Address     string `gorm:"type:varchar(60)" json:"address"`
-	Amount      int64  `gorm:"type:bigint" json:"amount"`
-	TxBytes     []byte `gorm:"type:blob" json:"tx_bytes"`
-	Status      string `gorm:"type:varchar(20)" json:"status"`
-	EvmTxHash   string `gorm:"type:varchar(66)" json:"evm_tx_hash"`
-	EvmBlock    uint64 `gorm:"type:bigint" json:"evm_block"`
-	EvmLogIndex uint   `gorm:"type:int" json:"evm_log_index"`
+    TxId        string `gorm:"type:varchar(66);not null;index" json:"txid"`
+    Vout        int    `gorm:"type:int;not null" json:"vout"`
+    Address     string `gorm:"type:varchar(60)" json:"address"`
+    EvmAddr     string `gorm:"type:varchar(255)" json:"evm_addr"`
+    Amount      int64  `gorm:"type:bigint" json:"amount"`
+    TxBytes     []byte `gorm:"type:blob" json:"tx_bytes"`
+    Status      string `gorm:"type:varchar(20)" json:"status"`
+    EvmTxHash   string `gorm:"type:varchar(66)" json:"evm_tx_hash"`
+    EvmBlock    uint64 `gorm:"type:bigint" json:"evm_block"`
+    EvmLogIndex uint   `gorm:"type:int" json:"evm_log_index"`
 }
 
 type Withdrawal struct {

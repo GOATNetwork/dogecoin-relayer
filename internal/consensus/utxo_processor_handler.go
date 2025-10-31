@@ -210,10 +210,17 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 	// Create pending batch entry for tracking
 	txParams := make([]contract.BridgeTransaction, len(fullUTXOs))
 	for i, utxo := range fullUTXOs {
+		txBytes := []byte(utxo.Txid)
+		var dep models.Deposit
+		if err := up.conn.GetDB().Where("tx_id = ? AND vout = ?", utxo.Txid, utxo.OutIndex).First(&dep).Error; err == nil && len(dep.TxBytes) > 0 {
+			txBytes = dep.TxBytes
+		} else {
+			up.logger.Warnf("Deposit tx bytes missing for %s:%d, falling back to txid bytes", utxo.Txid, utxo.OutIndex)
+		}
 		txParams[i] = contract.BridgeTransaction{
 			DestEvmAddress: common.HexToAddress(utxo.EvmAddr),
 			Amount:         big.NewInt(utxo.Amount),
-			TxBytes:        []byte(utxo.Txid),
+			TxBytes:        txBytes,
 		}
 	}
 
@@ -261,11 +268,16 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 	pending.withdrawalRequest = nil
 	pending.calldata = calldata
 	pending.utxos = fullUTXOs
+	pending.tssNonce = new(big.Int).Set(proposal.TssNonce)
 	up.registerExistingTssSession(pending, proposal.SessionID)
 	up.pendingBatches.Store(key, pending)
 
 	// Create hash to sign for verifyAndCall function
-	hash := crypto.Keccak256(calldata)
+	digest, baseHash, err := up.computeVerifyAndCallDigest(calldata, pending.tssNonce)
+	if err != nil {
+		return fmt.Errorf("failed to compute signing digest: %w", err)
+	}
+	up.logger.Infof("P2P deposit proposal base hash: %x (nonce=%s)", baseHash[:], pending.tssNonce.String())
 
 	// Request TSS signature for the proposal
 	selfAddress, addrErr := up.getNodeEthereumAddress()
@@ -279,7 +291,7 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 	}
 
 	tssSessionID := pending.currentSessionID
-	up.callTssSign(tssSessionID, hash)
+	up.callTssSign(tssSessionID, digest)
 	up.logger.Infof("Joined TSS signing for proposal batch %s with session %s (base session %s)",
 		proposal.BatchID, tssSessionID, pending.baseSessionID)
 
@@ -347,11 +359,16 @@ func (up *UtxoProcessor) handleP2PWithdrawalProposal(msg *types.P2PBroadcastMess
 	pending.withdrawalRequest = request
 	pending.calldata = calldata
 	pending.utxos = proposal.UTXOs
+	pending.tssNonce = new(big.Int).Set(proposal.TssNonce)
 	up.registerExistingTssSession(pending, proposal.SessionID)
 	up.pendingBatches.Store(key, pending)
 
 	// Create hash to sign for verifyAndCall function
-	hash := crypto.Keccak256(calldata)
+	digest, baseHash, err := up.computeVerifyAndCallDigest(calldata, pending.tssNonce)
+	if err != nil {
+		return fmt.Errorf("failed to compute withdrawal signing digest: %w", err)
+	}
+	up.logger.Infof("P2P withdrawal proposal base hash: %x (nonce=%s)", baseHash[:], pending.tssNonce.String())
 
 	// Request TSS signature for the proposal
 	selfAddress, addrErr := up.getNodeEthereumAddress()
@@ -365,7 +382,7 @@ func (up *UtxoProcessor) handleP2PWithdrawalProposal(msg *types.P2PBroadcastMess
 	}
 
 	tssSessionID := pending.currentSessionID
-	up.callTssSign(tssSessionID, hash)
+	up.callTssSign(tssSessionID, digest)
 	up.logger.Infof("Joined TSS signing for withdrawal batch %s with session %s (base session %s)",
 		proposal.BatchID, tssSessionID, pending.baseSessionID)
 
@@ -407,6 +424,18 @@ func (up *UtxoProcessor) validateDepositProposal(proposal *DepositProposal) erro
 			calculatedTotal.String(), totalAmount.String())
 	}
 
+	if proposal.TssNonceStr == "" {
+		return fmt.Errorf("tss nonce is required")
+	}
+
+	tssNonce, ok := new(big.Int).SetString(proposal.TssNonceStr, 10)
+	if !ok {
+		return fmt.Errorf("invalid tss nonce: %s", proposal.TssNonceStr)
+	}
+
+	proposal.TotalAmount = totalAmount
+	proposal.TssNonce = tssNonce
+
 	// TODO: Add more sophisticated validation:
 	// - Verify UTXOs exist and are unspent
 	// - Validate calldata structure
@@ -441,6 +470,15 @@ func (up *UtxoProcessor) validateWithdrawalProposal(proposal *WithdrawalProposal
 	if len(proposal.TaskIds) == 0 {
 		return fmt.Errorf("task IDs are required for withdrawals")
 	}
+	if proposal.TssNonceStr == "" {
+		return fmt.Errorf("tss nonce is required for withdrawals")
+	}
+
+	tssNonce, ok := new(big.Int).SetString(proposal.TssNonceStr, 10)
+	if !ok {
+		return fmt.Errorf("invalid tss nonce: %s", proposal.TssNonceStr)
+	}
+	proposal.TssNonce = tssNonce
 
 	// Calculate total amount from UTXOs and verify it matches proposal
 	calculatedTotal := big.NewInt(0)

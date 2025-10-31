@@ -108,7 +108,7 @@ func (r *EventRepository) CreateOrUpdateScanState(state *EventScanState) error {
 
 // CreateOrUpdateDeposit creates a new deposit or updates the existing one matched by (tx_id, vout).
 func (r *EventRepository) CreateOrUpdateDeposit(tx *gorm.DB, deposit *Deposit) error {
-	db := r.getDB(tx)
+    db := r.getDB(tx)
 
 	var existing Deposit
 	err := db.Where("tx_id = ? AND vout = ?", deposit.TxId, deposit.Vout).First(&existing).Error
@@ -120,13 +120,14 @@ func (r *EventRepository) CreateOrUpdateDeposit(tx *gorm.DB, deposit *Deposit) e
 	}
 
 	// Update mutable fields
-	updates := map[string]any{
-		"address":       deposit.Address,
-		"amount":        deposit.Amount,
-		"tx_bytes":      deposit.TxBytes,
-		"status":        deposit.Status,
-		"evm_tx_hash":   deposit.EvmTxHash,
-		"evm_block":     deposit.EvmBlock,
+    updates := map[string]any{
+        "address":       deposit.Address,
+        "evm_addr":      deposit.EvmAddr,
+        "amount":        deposit.Amount,
+        "tx_bytes":      deposit.TxBytes,
+        "status":        deposit.Status,
+        "evm_tx_hash":   deposit.EvmTxHash,
+        "evm_block":     deposit.EvmBlock,
 		"evm_log_index": deposit.EvmLogIndex,
 		"updated_at":    time.Now(),
 	}

@@ -72,7 +72,12 @@ func (c *ConsensusModule) Init(cfg any, conn *models.DBConnection) error {
 	c.eventManager = eventManager
 
 	// Initialize the UTXO processor
-	c.utxoProcessor = NewUtxoProcessor(conn, c.cfg.EventDetection.ContractBridge, c.cfg.EventDetection.AbiPath)
+	c.utxoProcessor = NewUtxoProcessor(
+		conn,
+		c.cfg.EventDetection.ContractBridge,
+		c.cfg.EventDetection.ContractEntryPoint,
+		c.cfg.EventDetection.AbiPath,
+	)
 
 	c.logger.Info("Consensus module initialized successfully")
 	return nil

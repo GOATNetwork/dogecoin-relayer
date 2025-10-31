@@ -38,6 +38,8 @@ func (up *UtxoProcessor) pollLoop() {
 
 // scanNewUTXOs checks for new deposit UTXOs and processes them
 func (up *UtxoProcessor) scanNewUTXOs() error {
+	up.cleanupStaleSessions()
+
 	// Check if this node should process UTXOs
 	isProposer, err := up.isCurrentProposer()
 	if err != nil {
@@ -256,10 +258,25 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*BridgeIn
 	for _, utxo := range utxos {
 		// Create bridge transaction for this UTXO
 		// EVM address validation is now done before calling this function
+		// IMPORTANT: txBytes must be the raw Dogecoin transaction bytes (no-witness)
+		// We persist these in deposits.tx_bytes when scanning blocks; fetch them here.
+		var txBytes []byte
+		{
+			var dep models.Deposit
+			if err := up.conn.GetDB().Where("tx_id = ? AND vout = ?", utxo.Txid, utxo.OutIndex).First(&dep).Error; err == nil {
+				txBytes = dep.TxBytes
+			}
+			if len(txBytes) == 0 {
+				// Fallback: use txid bytes if deposit record missing or tx bytes empty
+				up.logger.Warnf("Deposit raw bytes missing for %s:%d, falling back to txid bytes", utxo.Txid, utxo.OutIndex)
+				txBytes = []byte(utxo.Txid)
+			}
+		}
+
 		bridgeTx := contract.BridgeTransaction{
 			DestEvmAddress: common.HexToAddress(utxo.EvmAddr),
 			Amount:         big.NewInt(utxo.Amount),
-			TxBytes:        []byte(utxo.Txid), // Store transaction ID as bytes
+			TxBytes:        txBytes,
 		}
 
 		currentBatch.TransactionParams = append(currentBatch.TransactionParams, bridgeTx)
@@ -432,6 +449,13 @@ func (up *UtxoProcessor) processDepositBatch(batch *BridgeInBatch) error {
 	}
 	up.logger.Infof("Generated bridge calldata (%d bytes): %x...", len(calldata), calldataPreview)
 
+	// Fetch current TSS nonce to include in signing payload
+	tssNonce, err := up.fetchTssNonce()
+	if err != nil {
+		return fmt.Errorf("failed to fetch tss nonce: %w", err)
+	}
+	up.logger.Infof("Using TSS nonce %s for batch %s", tssNonce.String(), batch.ID.String())
+
 	// Add safety check for calldata size
 	if len(calldata) > 100000 { // 100KB limit
 		return fmt.Errorf("calldata too large: %d bytes", len(calldata))
@@ -444,6 +468,7 @@ func (up *UtxoProcessor) processDepositBatch(batch *BridgeInBatch) error {
 		calldata:      calldata,
 		utxos:         batch.UTXOs,
 		baseSessionID: sessionID,
+		tssNonce:      new(big.Int).Set(tssNonce),
 	}
 	actualSessionID := up.assignNewTssSession(pending)
 	up.pendingBatches.Store(pending.baseSessionID, pending)
@@ -509,6 +534,13 @@ func (up *UtxoProcessor) processWithdrawalRequest(request *withdrawalRequest) er
 
 	up.logger.Infof("Generated bridgeOutFinish calldata: %x", calldata)
 
+	// Fetch current TSS nonce
+	tssNonce, err := up.fetchTssNonce()
+	if err != nil {
+		return fmt.Errorf("failed to fetch tss nonce: %w", err)
+	}
+	up.logger.Infof("Using TSS nonce %s for withdrawal request %s", tssNonce.String(), request.ID.String())
+
 	// Store the pending request data
 	pending := &pendingBatch{
 		batchType:         "withdrawal",
@@ -516,6 +548,7 @@ func (up *UtxoProcessor) processWithdrawalRequest(request *withdrawalRequest) er
 		calldata:          calldata,
 		utxos:             []*models.UTXO{request.UTXO}, // Convert single UTXO to slice for compatibility
 		baseSessionID:     sessionID,
+		tssNonce:          new(big.Int).Set(tssNonce),
 	}
 	actualSessionID := up.assignNewTssSession(pending)
 	up.pendingBatches.Store(pending.baseSessionID, pending)
@@ -746,6 +779,7 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 		batch.UTXOs,
 		batch.TotalAmount,
 		calldata,
+		pending.tssNonce,
 		proposerAddress.Hex(),
 		sessionID,
 	)
@@ -761,14 +795,22 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 
 	up.logger.Infof("Step 7: Creating hash and calling TSS sign")
 	// Create hash to sign for verifyAndCall function
-	hash := crypto.Keccak256(calldata)
+	if pending.tssNonce == nil {
+		return fmt.Errorf("pending batch missing tss nonce")
+	}
+
+	digest, baseHash, err := up.computeVerifyAndCallDigest(calldata, pending.tssNonce)
+	if err != nil {
+		return fmt.Errorf("failed to compute signing digest: %w", err)
+	}
 
 	// Print calldata hash for debugging
-	up.logger.Infof("Calldata hash for TSS signing: %x", hash)
+	up.logger.Infof("verifyAndCall base hash: %x (nonce=%s)", baseHash[:], pending.tssNonce.String())
+	up.logger.Infof("Signing digest for TSS (keccak with prefix) %x", digest)
 	up.logger.Infof("Calldata length: %d bytes", len(calldata))
 
 	// Request TSS signature using the callTssSign function
-	up.callTssSign(sessionID, hash)
+	up.callTssSign(sessionID, digest)
 	up.logger.Infof("TSS signing requested for batch %s with session %s (base session %s)", batchID, sessionID, baseSessionID)
 
 	return nil
@@ -843,6 +885,7 @@ func (up *UtxoProcessor) requestWithdrawalTssSignature(calldata []byte, sessionI
 		request.TotalAmount,
 		calldata,
 		request.TaskIds,
+		pending.tssNonce,
 		proposerAddress.Hex(),
 		sessionID,
 	)
@@ -856,14 +899,22 @@ func (up *UtxoProcessor) requestWithdrawalTssSignature(calldata []byte, sessionI
 	}
 
 	// Create hash to sign for verifyAndCall function
-	hash := crypto.Keccak256(calldata)
+	if pending.tssNonce == nil {
+		return fmt.Errorf("pending withdrawal batch missing tss nonce")
+	}
+
+	digest, baseHash, err := up.computeVerifyAndCallDigest(calldata, pending.tssNonce)
+	if err != nil {
+		return fmt.Errorf("failed to compute withdrawal signing digest: %w", err)
+	}
 
 	// Print calldata hash for debugging
-	up.logger.Infof("Withdrawal calldata hash for TSS signing: %x", hash)
+	up.logger.Infof("Withdrawal verifyAndCall base hash: %x (nonce=%s)", baseHash[:], pending.tssNonce.String())
+	up.logger.Infof("Withdrawal signing digest: %x", digest)
 	up.logger.Infof("Withdrawal calldata length: %d bytes", len(calldata))
 
 	// Request TSS signature using the callTssSign function
-	up.callTssSign(sessionID, hash)
+	up.callTssSign(sessionID, digest)
 	up.logger.Infof("TSS signing requested for withdrawal request %s with session %s (base session %s)", requestID, sessionID, baseSessionID)
 
 	return nil

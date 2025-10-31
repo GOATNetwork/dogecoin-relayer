@@ -36,14 +36,16 @@ type DepositProposal struct {
 	TotalAmountStr   string             `json:"total_amount"`      // Total amount as string to avoid big.Int issues
 	Proposer         string             `json:"proposer"`          // Address of the proposer node
 	SessionID        string             `json:"session_id"`        // TSS session ID for signing
+	TssNonceStr      string             `json:"tss_nonce"`         // TSS nonce encoded as decimal string
 
 	// Keep original data for internal use (not serialized in P2P)
 	UTXOs       []*models.UTXO `json:"-"` // Original UTXOs (excluded from JSON)
 	Calldata    []byte         `json:"-"` // Calldata (excluded from JSON)
 	TotalAmount *big.Int       `json:"-"` // Original big.Int (excluded from JSON)
+	TssNonce    *big.Int       `json:"-"`
 }
 
-func NewDepositProposal(batchID string, utxos []*models.UTXO, totalAmount *big.Int, calldata []byte, proposer, sessionID string) *DepositProposal {
+func NewDepositProposal(batchID string, utxos []*models.UTXO, totalAmount *big.Int, calldata []byte, tssNonce *big.Int, proposer, sessionID string) *DepositProposal {
 	// Convert full UTXOs to lightweight versions for P2P
 	lightweightUTXOs := make([]*LightweightUTXO, len(utxos))
 	for i, utxo := range utxos {
@@ -56,9 +58,11 @@ func NewDepositProposal(batchID string, utxos []*models.UTXO, totalAmount *big.I
 		TotalAmountStr:   totalAmount.String(), // Convert to string for safe JSON
 		Proposer:         proposer,
 		SessionID:        sessionID,
+		TssNonceStr:      tssNonce.String(),
 		UTXOs:            utxos,       // Keep original for internal use
 		Calldata:         calldata,    // Keep original for internal use
 		TotalAmount:      totalAmount, // Keep original for internal use
+		TssNonce:         new(big.Int).Set(tssNonce),
 	}
 }
 
@@ -69,6 +73,7 @@ type P2PDepositProposal struct {
 	TotalAmountStr   string             `json:"total_amount"`
 	Proposer         string             `json:"proposer"`
 	SessionID        string             `json:"session_id"`
+	TssNonceStr      string             `json:"tss_nonce"`
 }
 
 func (d *DepositProposal) MarshalJSON() ([]byte, error) {
@@ -79,6 +84,7 @@ func (d *DepositProposal) MarshalJSON() ([]byte, error) {
 		TotalAmountStr:   d.TotalAmountStr,
 		Proposer:         d.Proposer,
 		SessionID:        d.SessionID,
+		TssNonceStr:      d.TssNonceStr,
 	}
 	return json.Marshal(p2pProposal)
 }
@@ -97,6 +103,7 @@ func (d *DepositProposal) UnmarshalJSON(data []byte) error {
 	d.TotalAmountStr = p2pProposal.TotalAmountStr
 	d.Proposer = p2pProposal.Proposer
 	d.SessionID = p2pProposal.SessionID
+	d.TssNonceStr = p2pProposal.TssNonceStr
 
 	// Don't set UTXOs, Calldata, TotalAmount - these will be set separately
 	return nil
@@ -111,9 +118,11 @@ type WithdrawalProposal struct {
 	TaskIds     []*big.Int     `json:"task_ids"`     // Task IDs associated with this withdrawal batch
 	Proposer    string         `json:"proposer"`     // Address of the proposer node
 	SessionID   string         `json:"session_id"`   // TSS session ID for signing
+	TssNonceStr string         `json:"tss_nonce"`
+	TssNonce    *big.Int       `json:"-"`
 }
 
-func NewWithdrawalProposal(batchID string, utxos []*models.UTXO, totalAmount *big.Int, calldata []byte, taskIds []*big.Int, proposer, sessionID string) *WithdrawalProposal {
+func NewWithdrawalProposal(batchID string, utxos []*models.UTXO, totalAmount *big.Int, calldata []byte, taskIds []*big.Int, tssNonce *big.Int, proposer, sessionID string) *WithdrawalProposal {
 	return &WithdrawalProposal{
 		BatchID:     batchID,
 		UTXOs:       utxos,
@@ -122,6 +131,8 @@ func NewWithdrawalProposal(batchID string, utxos []*models.UTXO, totalAmount *bi
 		TaskIds:     taskIds,
 		Proposer:    proposer,
 		SessionID:   sessionID,
+		TssNonceStr: tssNonce.String(),
+		TssNonce:    new(big.Int).Set(tssNonce),
 	}
 }
 

@@ -129,7 +129,7 @@ func TestNewUtxoProcessor(t *testing.T) {
 	conn := createMockDBConnection(t)
 	bridgeContractAddress := "0x1234567890123456789012345678901234567890"
 
-	processor := NewUtxoProcessor(conn, bridgeContractAddress, "")
+	processor := NewUtxoProcessor(conn, bridgeContractAddress, bridgeContractAddress, "")
 
 	require.NotNil(t, processor)
 	assert.Equal(t, conn, processor.conn)
@@ -143,7 +143,7 @@ func TestNewUtxoProcessor(t *testing.T) {
 
 func TestUtxoProcessor_StartStop(t *testing.T) {
 	conn := createMockDBConnection(t)
-	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "")
+	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "0x1234567890123456789012345678901234567890", "")
 
 	setupEventBus()
 
@@ -167,7 +167,7 @@ func TestUtxoProcessor_StartStop(t *testing.T) {
 
 func TestUtxoProcessor_GetUnprocessedDepositUTXOs(t *testing.T) {
 	conn := createMockDBConnection(t)
-	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "")
+	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "0x1234567890123456789012345678901234567890", "")
 
 	// Create test deposit UTXOs
 	depositUTXOs := []*models.UTXO{
@@ -199,7 +199,7 @@ func TestUtxoProcessor_GetUnprocessedDepositUTXOs(t *testing.T) {
 
 func TestUtxoProcessor_GetUnprocessedWithdrawalUTXOs(t *testing.T) {
 	conn := createMockDBConnection(t)
-	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "")
+	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "0x1234567890123456789012345678901234567890", "")
 
 	// Create test withdrawal UTXOs
 	withdrawalUTXOs := []*models.UTXO{
@@ -230,7 +230,7 @@ func TestUtxoProcessor_GetUnprocessedWithdrawalUTXOs(t *testing.T) {
 
 func TestUtxoProcessor_GroupUTXOsIntoBatches(t *testing.T) {
 	conn := createMockDBConnection(t)
-	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "")
+	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "0x1234567890123456789012345678901234567890", "")
 
 	// Create test deposit UTXOs
 	depositUTXOs := []*models.UTXO{
@@ -272,7 +272,7 @@ func TestUtxoProcessor_GroupUTXOsIntoBatches(t *testing.T) {
 
 func TestUtxoProcessor_CreateWithdrawalRequestFromUTXO(t *testing.T) {
 	conn := createMockDBConnection(t)
-	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "")
+	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "0x1234567890123456789012345678901234567890", "")
 
 	// Create test withdrawal UTXO
 	withdrawalUTXO := createTestWithdrawalUTXO("withdraw1", 1000000)
@@ -301,7 +301,7 @@ func TestUtxoProcessor_CreateWithdrawalRequestFromUTXO(t *testing.T) {
 
 func TestUtxoProcessor_GetVOUTsForTransaction(t *testing.T) {
 	conn := createMockDBConnection(t)
-	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "")
+	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "0x1234567890123456789012345678901234567890", "")
 
 	// Create test VOUTs
 	vouts := []*models.VOUT{
@@ -333,7 +333,7 @@ func TestUtxoProcessor_GetVOUTsForTransaction(t *testing.T) {
 
 func TestUtxoProcessor_MarkUTXOsAsProcessed(t *testing.T) {
 	conn := createMockDBConnection(t)
-	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "")
+	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "0x1234567890123456789012345678901234567890", "")
 
 	// Create test UTXOs
 	utxos := []*models.UTXO{
@@ -361,7 +361,7 @@ func TestUtxoProcessor_MarkUTXOsAsProcessed(t *testing.T) {
 
 func TestUtxoProcessor_GenerateSessionID(t *testing.T) {
 	conn := createMockDBConnection(t)
-	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "")
+	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "0x1234567890123456789012345678901234567890", "")
 
 	// Create test batch
 	utxos := []*models.UTXO{
@@ -406,7 +406,7 @@ func TestUtxoProcessor_GenerateSessionID(t *testing.T) {
 
 func TestUtxoProcessor_GenerateWithdrawalSessionID(t *testing.T) {
 	conn := createMockDBConnection(t)
-	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "")
+	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "0x1234567890123456789012345678901234567890", "")
 
 	// Create test withdrawal request
 	withdrawalUTXO := createTestWithdrawalUTXO("withdraw1", 1000000)
@@ -443,7 +443,7 @@ func TestUtxoProcessor_GenerateWithdrawalSessionID(t *testing.T) {
 
 func TestUtxoProcessor_GetStats(t *testing.T) {
 	conn := createMockDBConnection(t)
-	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "")
+	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "0x1234567890123456789012345678901234567890", "")
 
 	stats := processor.GetStats()
 
@@ -460,7 +460,7 @@ func TestUtxoProcessor_GetStats(t *testing.T) {
 
 func TestUtxoProcessor_DatabaseIntegration(t *testing.T) {
 	conn := createMockDBConnection(t)
-	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "")
+	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "0x1234567890123456789012345678901234567890", "")
 
 	// Create and insert test deposit UTXOs
 	depositUTXOs := []*models.UTXO{
@@ -528,7 +528,7 @@ func BenchmarkUtxoProcessor_GroupUTXOsIntoBatches(b *testing.B) {
 	}
 
 	conn := createMockDBConnectionBench()
-	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "")
+	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "0x1234567890123456789012345678901234567890", "")
 
 	// Create many test UTXOs
 	var utxos []*models.UTXO
@@ -555,7 +555,7 @@ func BenchmarkUtxoProcessor_GenerateSessionID(b *testing.B) {
 	}
 
 	conn := createMockDBConnectionBench()
-	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "")
+	processor := NewUtxoProcessor(conn, "0x1234567890123456789012345678901234567890", "0x1234567890123456789012345678901234567890", "")
 
 	utxos := []*models.UTXO{
 		createTestDepositUTXO("tx1", 1000000, "0x1111111111111111111111111111111111111111"),

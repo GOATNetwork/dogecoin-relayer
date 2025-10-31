@@ -520,23 +520,24 @@ func (m *DogeModule) handleSpendingTransaction(txid string, vins []*models.VIN, 
 }
 
 func (m *DogeModule) recordDeposit(utxo *models.UTXO, txid string, txBytes []byte) error {
-	if m.eventRepo == nil {
-		return nil
-	}
+    if m.eventRepo == nil {
+        return nil
+    }
 
-	deposit := &models.Deposit{
-		TxId:        txid,
-		Vout:        utxo.OutIndex,
-		Address:     utxo.Receiver,
-		Amount:      utxo.Amount,
-		TxBytes:     txBytes,
-		Status:      "pending",
-		EvmTxHash:   "",
-		EvmBlock:    0,
-		EvmLogIndex: 0,
-	}
+    deposit := &models.Deposit{
+        TxId:        txid,
+        Vout:        utxo.OutIndex,
+        Address:     utxo.Receiver,
+        EvmAddr:     utxo.EvmAddr,
+        Amount:      utxo.Amount,
+        TxBytes:     txBytes,
+        Status:      "pending",
+        EvmTxHash:   "",
+        EvmBlock:    0,
+        EvmLogIndex: 0,
+    }
 
-	return m.eventRepo.CreateOrUpdateDeposit(nil, deposit)
+    return m.eventRepo.CreateOrUpdateDeposit(nil, deposit)
 }
 
 // parseHexOrRaw parses a hex string like "0xdeadbeef" or "deadbeef" into bytes.
