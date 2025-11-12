@@ -46,13 +46,13 @@ func NewEntryPointWithABI(address common.Address, backend bind.ContractBackend, 
 
 func (contract *Contract) GetCurrentProposer() (common.Address, error) {
 	var out []interface{}
-	err := contract.contract.Call(&bind.CallOpts{}, &out, "nextSubmitter")
+	err := contract.contract.Call(&bind.CallOpts{}, &out, "nextProposer")
 	if err != nil {
 		return common.Address{}, fmt.Errorf("failed to get current proposer: %w", err)
 	}
 
 	if len(out) == 0 {
-		return common.Address{}, fmt.Errorf("no result returned from nextSubmitter call")
+		return common.Address{}, fmt.Errorf("no result returned from nextProposer call")
 	}
 
 	proposer, ok := out[0].(common.Address)

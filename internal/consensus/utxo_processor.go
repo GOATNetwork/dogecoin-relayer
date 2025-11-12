@@ -294,9 +294,9 @@ func (up *UtxoProcessor) handleProposerSelected(data any) {
 		return
 	}
 
-	// Parse the submitter address from event data
-	// The event data should contain the chosen submitter address
-	var submitterAddr string
+	// Parse the proposer address from event data
+	// The event data should contain the chosen proposer address
+	var proposerAddr string
 
 	// Debug: Log the actual types of event data
 	for key, value := range event.EventData {
@@ -304,25 +304,25 @@ func (up *UtxoProcessor) handleProposerSelected(data any) {
 	}
 
 	// Try different field names and types
-	if addr, ok := event.EventData["submitter"].(string); ok {
-		submitterAddr = addr
+	if addr, ok := event.EventData["proposer"].(string); ok {
+		proposerAddr = addr
 	} else if addr, ok := event.EventData["chosen"].(string); ok {
-		submitterAddr = addr
-	} else if addr, ok := event.EventData["newSubmitter"].(string); ok {
-		submitterAddr = addr
-	} else if addr, ok := event.EventData["submitter"].(common.Address); ok {
-		submitterAddr = addr.Hex()
+		proposerAddr = addr
+	} else if addr, ok := event.EventData["newProposer"].(string); ok {
+		proposerAddr = addr
+	} else if addr, ok := event.EventData["proposer"].(common.Address); ok {
+		proposerAddr = addr.Hex()
 	} else if addr, ok := event.EventData["chosen"].(common.Address); ok {
-		submitterAddr = addr.Hex()
-	} else if addr, ok := event.EventData["newSubmitter"].(common.Address); ok {
-		submitterAddr = addr.Hex()
+		proposerAddr = addr.Hex()
+	} else if addr, ok := event.EventData["newProposer"].(common.Address); ok {
+		proposerAddr = addr.Hex()
 	} else {
 		up.logger.Errorf("Could not extract proposer address from ProposerSelected event: %+v", event.EventData)
 		return
 	}
 
-	if submitterAddr != "" {
-		newProposer := common.HexToAddress(submitterAddr)
+	if proposerAddr != "" {
+		newProposer := common.HexToAddress(proposerAddr)
 		up.updateCurrentProposer(newProposer)
 	}
 }
