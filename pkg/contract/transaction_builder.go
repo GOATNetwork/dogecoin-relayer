@@ -63,6 +63,23 @@ func (contract *Contract) GetCurrentProposer() (common.Address, error) {
 	return proposer, nil
 }
 
+// GetTssSigner returns the current tssSigner address from EntryPoint
+func (contract *Contract) GetTssSigner() (common.Address, error) {
+	var out []interface{}
+	err := contract.contract.Call(&bind.CallOpts{}, &out, "tssSigner")
+	if err != nil {
+		return common.Address{}, fmt.Errorf("failed to get tssSigner: %w", err)
+	}
+	if len(out) == 0 {
+		return common.Address{}, fmt.Errorf("no result returned from tssSigner call")
+	}
+	addr, ok := out[0].(common.Address)
+	if !ok {
+		return common.Address{}, fmt.Errorf("failed to convert tssSigner to address")
+	}
+	return addr, nil
+}
+
 // GenerateBridgeInTxData generates the transaction data for the bridgeIn function call
 func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction) ([]byte, error) {
 	// Convert the bridgeTxs to the format expected by the ABI

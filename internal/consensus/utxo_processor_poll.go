@@ -448,6 +448,7 @@ func (up *UtxoProcessor) processDepositBatch(batch *BridgeInBatch) error {
 		calldataPreview = calldata[:64]
 	}
 	up.logger.Infof("Generated bridge calldata (%d bytes): %x...", len(calldata), calldataPreview)
+	up.logger.Debugf("Bridge calldata (full hex): %x", calldata)
 
 	// Fetch current TSS nonce to include in signing payload
 	tssNonce, err := up.fetchTssNonce()

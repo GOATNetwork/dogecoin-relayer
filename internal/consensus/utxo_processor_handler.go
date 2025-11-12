@@ -90,13 +90,60 @@ func (up *UtxoProcessor) handleTssSignature(data any) {
 	up.logger.Infof("Received TSS signature response for session %s (base session %s), success: %v", resp.SessionID, baseSessionID, resp.Success)
 
 	if resp.Success {
+		// Pre-check signer to provide a clear error before sending on-chain tx
+		// Compute digest again from pending data
+		digest, _, derr := up.computeVerifyAndCallDigest(pending.calldata, pending.tssNonce)
+		if derr == nil {
+			// Recover signer from signature
+			recovered := common.Address{}
+			sig := make([]byte, len(resp.RawSig))
+			copy(sig, resp.RawSig)
+			if len(sig) == 65 {
+				// go-ethereum expects V as 0/1 for recovery
+				if sig[64] >= 27 {
+					sig[64] -= 27
+				}
+				if pub, err := crypto.SigToPub(digest, sig); err == nil {
+					recovered = crypto.PubkeyToAddress(*pub)
+				}
+			}
+			// Fetch expected tssSigner from contract
+			if up.contractBuilder != nil {
+				if expected, err := up.contractBuilder.GetTssSigner(); err == nil {
+					if (recovered != common.Address{}) && recovered != expected {
+						up.logger.Errorf("Invalid Signer (precheck): recovered=%s expected=%s tssNonce=%s",
+							recovered.Hex(), expected.Hex(), pending.tssNonce.String())
+						// Do not submit on-chain to avoid revert; mark as handled
+						up.pendingBatches.Delete(key)
+						up.tssSessionAliases.Delete(resp.SessionID)
+						return
+					}
+				}
+			}
+		}
+
+		isProposer, err := up.isCurrentProposer()
+		if err != nil {
+			up.logger.Warnf("Failed to verify proposer status for session %s: %v", resp.SessionID, err)
+		}
+		if !isProposer {
+			up.logger.Infof("Not current proposer, skipping on-chain submission for session %s", resp.SessionID)
+			up.pendingBatches.Delete(key)
+			up.tssSessionAliases.Delete(resp.SessionID)
+			return
+		}
+
 		up.logger.Infof("TSS signature successful for session %s", resp.SessionID)
 		// Remove from pending batches on success
 		up.pendingBatches.Delete(key)
 		up.tssSessionAliases.Delete(resp.SessionID)
 
+		up.logger.Debugf("verifyAndCall target: %s", up.bridgeContract.Hex())
+		up.logger.Debugf("verifyAndCall calldata: %x", pending.calldata)
+		up.logger.Debugf("verifyAndCall digest: %x", resp.RawSig)
+
 		// Continue with transaction submission
-		err := up.completeBatchWithSignature(pending, resp.RawSig)
+		err = up.completeBatchWithSignature(pending, resp.RawSig)
 		if err != nil {
 			up.logger.Errorf("Failed to complete batch with signature: %v", err)
 		}
