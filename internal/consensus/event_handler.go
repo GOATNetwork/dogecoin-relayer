@@ -61,8 +61,8 @@ func (eh *EventHandler) ProcessEvent(event BlockchainEvent) error {
 		processingErr = eh.processBridgeOutProposed(event)
 	case types.EventNameBridgeOutFinished:
 		processingErr = eh.processBridgeOutFinished(event)
-	case types.EventNameSubmitterChosen:
-		processingErr = eh.processSubmitterChosen(event)
+	case types.EventNameProposerSelected:
+		processingErr = eh.processProposerSelected(event)
 	case types.EventNameAddProposerReq:
 		processingErr = eh.processAddProposerRequested(event)
 	case types.EventNameRemoveProposerReq:
@@ -242,46 +242,47 @@ func (eh *EventHandler) processBridgeOutFinished(event BlockchainEvent) error {
 	return nil
 }
 
-// processSubmitterChosen handles SubmitterChosen events
-func (eh *EventHandler) processSubmitterChosen(event BlockchainEvent) error {
-	// TODO: handle by proposer manager
-	logger := eh.logger.WithField("event", "SubmitterChosen")
+// processProposerSelected handles ProposerSelected events
+func (eh *EventHandler) processProposerSelected(event BlockchainEvent) error {
+	logger := eh.logger.WithField("event", "ProposerSelected")
 
-	logger.Infof("SubmitterChosen event detected: Tx %s at block %d",
+	logger.Infof("ProposerSelected event detected: Tx %s at block %d",
 		event.TxHash.Hex(), event.BlockNumber)
 
-	// Extract the chosen submitter address from event data
-	var submitterAddr string
+	// Extract the chosen proposer address from event data
+	var proposerAddr string
 	if event.EventData != nil {
 		// Log the event data for debugging
 		eventDataJSON, err := json.MarshalIndent(event.EventData, "", "  ")
 		if err == nil {
-			logger.Debugf("SubmitterChosen event data:\n%s", string(eventDataJSON))
+			logger.Debugf("ProposerSelected event data:\n%s", string(eventDataJSON))
 		}
 
-		// Try to extract submitter address from common field names
-		if addr, err := readAddress(event.EventData["newSubmitter"]); err == nil {
-			submitterAddr = addr
+		// Try to extract proposer address from common field names
+		if addr, err := readAddress(event.EventData["newProposer"]); err == nil {
+			proposerAddr = addr
+		} else if addr, err := readAddress(event.EventData["proposer"]); err == nil {
+			proposerAddr = addr
 		} else {
 			// Log available fields for debugging
 			var fields []string
 			for key := range event.EventData {
 				fields = append(fields, key)
 			}
-			logger.Warnf("Could not find submitter address in event data. Available fields: %v", fields)
+			logger.Warnf("Could not find proposer address in event data. Available fields: %v", fields)
 		}
 	} else {
-		logger.Warn("SubmitterChosen event has no data")
+		logger.Warn("ProposerSelected event has no data")
 	}
 
-	if submitterAddr != "" {
-		logger.Infof("New submitter chosen: %s", submitterAddr)
+	if proposerAddr != "" {
+		logger.Infof("New proposer selected: %s", proposerAddr)
 
 		// Update proposer record with retry transaction
 		err := eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
 			proposer := &models.Proposers{
-				Address:   submitterAddr,
-				Status:    "ok", // Active submitter
+				Address:   proposerAddr,
+				Status:    "ok", // Active proposer
 				JoinBlock: event.BlockNumber,
 			}
 			return eh.eventRepo.CreateOrUpdateProposer(tx, proposer)
@@ -291,15 +292,15 @@ func (eh *EventHandler) processSubmitterChosen(event BlockchainEvent) error {
 			return fmt.Errorf("failed to create/update proposer: %w", err)
 		}
 
-		logger.Infof("Updated proposer record for address=%s", submitterAddr)
+		logger.Infof("Updated proposer record for address=%s", proposerAddr)
 
 		// Publish to event bus for UTXO processor to update current proposer
-		eh.eventBus.Publish(eventbus.EventSubmitterChosen, event)
+		eh.eventBus.Publish(eventbus.EventProposerSelected, event)
 		return nil
 	}
 
 	// Publish to event bus anyway
-	eh.eventBus.Publish(eventbus.EventSubmitterChosen, event)
+	eh.eventBus.Publish(eventbus.EventProposerSelected, event)
 	return nil
 }
 

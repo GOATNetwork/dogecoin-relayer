@@ -25,7 +25,7 @@ const (
 	EventBridgeInDetected  EventType = "consensus:bridge:in:detected"
 	EventBridgeOutProposed EventType = "consensus:bridge:out:proposed"
 	EventBridgeOutFinished EventType = "consensus:bridge:out:finished"
-	EventSubmitterChosen   EventType = "consensus:submitter:chosen"
+	EventProposerSelected  EventType = "consensus:proposer:selected"
 )
 
 // Event represents an event with a payload

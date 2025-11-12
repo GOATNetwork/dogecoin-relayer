@@ -53,6 +53,8 @@ type pendingBatch struct {
 	tssNonce          *big.Int
 }
 
+const proposerRefreshInterval = 30 * time.Second
+
 func (up *UtxoProcessor) assignNewTssSession(pending *pendingBatch) string {
 	attempt := pending.nextAttempt
 	sessionID := pending.baseSessionID
@@ -110,8 +112,9 @@ type UtxoProcessor struct {
 	p2pModule          *p2p.P2PModule // Reference to P2P module for accessing public key
 
 	// Current proposer state
-	currentProposer common.Address // Cached from SubmitterChosen events
-	proposerSet     bool           // Whether we have received proposer info
+	currentProposer     common.Address // Cached from ProposerSelected events
+	proposerSet         bool           // Whether we have received proposer info
+	lastProposerRefresh time.Time
 
 	// Pending batches waiting for TSS signatures
 	pendingBatches    sync.Map // base session ID -> *pendingBatch
@@ -251,8 +254,8 @@ func (up *UtxoProcessor) Start() error {
 	up.registerP2PHandler()
 	// Subscribe to TSS signature responses
 	up.eventBus.Subscribe(eventbus.EventTssSigResponse, up.handleTssSignature)
-	// Subscribe to SubmitterChosen events to track current proposer
-	up.eventBus.Subscribe(eventbus.EventSubmitterChosen, up.handleSubmitterChosen)
+	// Subscribe to proposer selection events to track current proposer
+	up.eventBus.Subscribe(eventbus.EventProposerSelected, up.handleProposerSelected)
 
 	// Start the polling loop
 	go up.pollLoop()
@@ -272,22 +275,22 @@ func (up *UtxoProcessor) Stop() {
 	up.logger.Info("Stopping UTXO manager")
 	// Unsubscribe from events
 	up.eventBus.Unsubscribe(eventbus.EventTssSigResponse, up.handleTssSignature)
-	up.eventBus.Unsubscribe(eventbus.EventSubmitterChosen, up.handleSubmitterChosen)
+	up.eventBus.Unsubscribe(eventbus.EventProposerSelected, up.handleProposerSelected)
 	up.cancel()
 	up.isRunning = false
 }
 
-// handleSubmitterChosen handles SubmitterChosen events from the event bus
-func (up *UtxoProcessor) handleSubmitterChosen(data any) {
+// handleProposerSelected handles ProposerSelected events from the event bus
+func (up *UtxoProcessor) handleProposerSelected(data any) {
 	event, ok := data.(BlockchainEvent)
 	if !ok {
-		up.logger.Errorf("Invalid SubmitterChosen event data type: %T", data)
+		up.logger.Errorf("Invalid ProposerSelected event data type: %T", data)
 		return
 	}
 
 	// Extract proposer address from event data
 	if event.EventData == nil {
-		up.logger.Errorf("SubmitterChosen event has no data")
+		up.logger.Errorf("ProposerSelected event has no data")
 		return
 	}
 
@@ -314,7 +317,7 @@ func (up *UtxoProcessor) handleSubmitterChosen(data any) {
 	} else if addr, ok := event.EventData["newSubmitter"].(common.Address); ok {
 		submitterAddr = addr.Hex()
 	} else {
-		up.logger.Errorf("Could not extract submitter address from SubmitterChosen event: %+v", event.EventData)
+		up.logger.Errorf("Could not extract proposer address from ProposerSelected event: %+v", event.EventData)
 		return
 	}
 
@@ -329,10 +332,25 @@ func (up *UtxoProcessor) updateCurrentProposer(newProposer common.Address) {
 	oldProposer := up.currentProposer
 	up.currentProposer = newProposer
 	up.proposerSet = true
+	up.lastProposerRefresh = time.Now()
 
 	if oldProposer != newProposer {
 		up.logger.Infof("Proposer updated: %s → %s", oldProposer.Hex(), newProposer.Hex())
 	}
+}
+
+func (up *UtxoProcessor) refreshProposerFromContract() error {
+	if up.contractBuilder == nil {
+		return fmt.Errorf("contract builder not configured")
+	}
+
+	proposer, err := up.contractBuilder.GetCurrentProposer()
+	if err != nil {
+		return fmt.Errorf("failed to query current proposer: %w", err)
+	}
+
+	up.updateCurrentProposer(proposer)
+	return nil
 }
 
 // isCurrentProposer checks if this node is the current proposer using cached state
@@ -343,11 +361,15 @@ func (up *UtxoProcessor) isCurrentProposer() (bool, error) {
 		return false, fmt.Errorf("failed to get node address: %w", err)
 	}
 
-	// If we haven't received proposer info yet, fall back to contract query
+	needsRefresh := !up.proposerSet || time.Since(up.lastProposerRefresh) > proposerRefreshInterval
+	if needsRefresh {
+		if err := up.refreshProposerFromContract(); err != nil {
+			up.logger.Warnf("Failed to refresh proposer from contract: %v", err)
+		}
+	}
+
 	if !up.proposerSet {
-		up.logger.Debug("No proposer info from events yet, querying contract...")
-		// TODO: Query contract as fallback
-		// For now, return false to skip processing until we get events
+		up.logger.Debug("Proposer not set; skipping processing until refresh succeeds")
 		return false, nil
 	}
 

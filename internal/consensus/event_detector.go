@@ -128,7 +128,7 @@ func CreateRequiredEventConfigs(cfg config.EventDetectionConfig, abiFilePath str
 	contractAddresses = append(contractAddresses, common.HexToAddress(cfg.ContractBridge))
 	eventNames = append(eventNames, eventTypes.EventNameBridgeOutFinished)
 	contractAddresses = append(contractAddresses, common.HexToAddress(cfg.ContractEntryPoint))
-	eventNames = append(eventNames, eventTypes.EventNameSubmitterChosen)
+	eventNames = append(eventNames, eventTypes.EventNameProposerSelected)
 	rawAbiData, configs, err := CreateEventConfig(abiFilePath, contractAddresses, eventNames)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create event config: %w", err)
@@ -146,18 +146,25 @@ func CreateEventConfig(abiFilePath string, contractAddresses []common.Address, e
 
 	// Validate all event names exist in ABI before creating configs
 	eventSignatures := make(map[string]string)
+	filteredEventNames := make([]string, 0, len(eventNames))
 	for _, eventName := range eventNames {
 		event, exists := parsedABI.Events[eventName]
 		if !exists {
-			return "", nil, fmt.Errorf("event %s not found in ABI", eventName)
+			log.Warnf("Event %s not found in ABI, skipping subscription", eventName)
+			continue
 		}
 		eventSignatures[eventName] = generateEventSignature(event)
+		filteredEventNames = append(filteredEventNames, eventName)
+	}
+
+	if len(filteredEventNames) == 0 {
+		return "", nil, fmt.Errorf("none of the requested events exist in ABI")
 	}
 
 	// Generate configs for all combinations of addresses and events
 	var configs []EventConfig
 	for _, contractAddress := range contractAddresses {
-		for _, eventName := range eventNames {
+		for _, eventName := range filteredEventNames {
 			configs = append(configs, EventConfig{
 				ContractAddress: contractAddress,
 				EventName:       eventName,
