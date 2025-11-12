@@ -646,7 +646,7 @@ func (up *UtxoProcessor) generateBridgeInCalldata(batch *BridgeInBatch) ([]byte,
 	}
 
 	// Generate the bridge transaction calldata
-	calldata, err := up.contractBuilder.GenerateBridgeInTxData(batch.TransactionParams, batch.ID)
+	calldata, err := up.contractBuilder.GenerateBridgeInTxData(batch.TransactionParams)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate bridge transaction data: %w", err)
 	}

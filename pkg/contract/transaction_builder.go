@@ -64,9 +64,9 @@ func (contract *Contract) GetCurrentProposer() (common.Address, error) {
 }
 
 // GenerateBridgeInTxData generates the transaction data for the bridgeIn function call
-func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction, batchId *big.Int) ([]byte, error) {
+func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction) ([]byte, error) {
 	// Convert the bridgeTxs to the format expected by the ABI
-	// The bridgeIn function expects: bridgeIn(IDogechain.BridgeTransaction[] memory bridgeTxs, uint256 batchId)
+	// The bridgeIn function expects: bridgeIn(IDogechain.BridgeTransaction[] memory bridgeTxs)
 
 	// Create the array type for BridgeTransaction[]
 	bridgeTransactionArrayType, err := abi.NewType("tuple[]", "struct BridgeTransaction[]", []abi.ArgumentMarshaling{
@@ -100,17 +100,16 @@ func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction, 
 	// Create arguments for the bridgeIn function
 	arguments := abi.Arguments{
 		{Type: bridgeTransactionArrayType, Name: "bridgeTxs"},
-		{Type: Uint256Type, Name: "batchId"},
 	}
 
 	// Pack the arguments
-	calldata, err := arguments.Pack(bridgeTransactionStructs, batchId)
+	calldata, err := arguments.Pack(bridgeTransactionStructs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to pack bridgeIn arguments: %w", err)
 	}
 
 	// Get the function selector for bridgeIn
-	bridgeInSelector := crypto.Keccak256([]byte("bridgeIn((address,uint256,bytes)[],uint256)"))[:4]
+	bridgeInSelector := crypto.Keccak256([]byte("bridgeIn((address,uint256,bytes)[])"))[:4]
 
 	// Combine function selector with calldata
 	txData := append(bridgeInSelector, calldata...)
