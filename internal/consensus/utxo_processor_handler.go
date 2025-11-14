@@ -90,6 +90,24 @@ func (up *UtxoProcessor) handleTssSignature(data any) {
 	up.logger.Infof("Received TSS signature response for session %s (base session %s), success: %v", resp.SessionID, baseSessionID, resp.Success)
 
 	if resp.Success {
+		// Optional sanity: compare TSS common address (group key) with on-chain tssSigner
+		if up.tssClient != nil && up.contractBuilder != nil {
+			if expected, err := up.contractBuilder.GetTssSigner(); err == nil {
+				if addr, err2 := up.tssClient.GetEvmAddress(up.ctx, resp.SessionID); err2 == nil {
+					if addr != expected {
+						up.logger.Errorf("TSS address mismatch (common/group): tss_api=%s onchain=%s (possible SkipPath/kdd misalignment)", addr.Hex(), expected.Hex())
+						// Do not submit on-chain to avoid revert; mark as handled
+						up.pendingBatches.Delete(key)
+						up.tssSessionAliases.Delete(resp.SessionID)
+						return
+					}
+					up.logger.Infof("TSS address check passed: %s matches on-chain tssSigner", addr.Hex())
+				} else {
+					up.logger.Warnf("Failed to fetch TSS EVM address from common API: %v", err2)
+				}
+			}
+		}
+
 		// Pre-check signer to provide a clear error before sending on-chain tx
 		// Compute digest again from pending data
 		digest, _, derr := up.computeVerifyAndCallDigest(pending.calldata, pending.tssNonce)
@@ -612,7 +630,7 @@ func (up *UtxoProcessor) sendCalldataToBridge(calldata []byte, signature []byte)
 	}
 
 	// For verifyAndCall, we need to construct the full transaction data
-	// This typically involves encoding targets, calldata array, and signature
+	// targeting the bridge contract through the entry point
 	targets := []common.Address{up.bridgeContract}
 	calldataArray := [][]byte{calldata}
 
@@ -624,7 +642,7 @@ func (up *UtxoProcessor) sendCalldataToBridge(calldata []byte, signature []byte)
 
 	// Send the transaction using SendTx from consensus.go
 	// The transaction value is 0 since we're just calling a contract function
-	tx, err := SendTx(up.ctx, privateKey, up.chainID, &up.bridgeContract, big.NewInt(0), verifyAndCallData)
+	tx, err := SendTx(up.ctx, privateKey, up.chainID, &up.entryPointContract, big.NewInt(0), verifyAndCallData)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("failed to send transaction: %w", err)
 	}

@@ -156,5 +156,12 @@ func (c *SignClient) GetEvmAddress(ctx context.Context, sessionID string) (commo
 		return common.Address{}, fmt.Errorf("failed to decode address response: %w", err)
 	}
 
+	// Log the returned KDD and XY for diagnostics, if provided
+	if addressResponse.KDD != nil {
+		c.logger.Infof("TSS address (derived) response: kdd=%s addr=%s", addressResponse.KDD.String(), addressResponse.Address)
+	} else {
+		c.logger.Infof("TSS address (derived) response: addr=%s", addressResponse.Address)
+	}
+
 	return common.HexToAddress(addressResponse.Address), nil
 }
