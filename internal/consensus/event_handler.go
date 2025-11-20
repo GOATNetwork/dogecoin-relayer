@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
@@ -99,7 +100,7 @@ func (eh *EventHandler) processBridgeIn(event BlockchainEvent) error {
 		event.BlockNumber,
 		string(eventDataJSON))
 
-	// Extract txHash (bytes32) from event data and convert to 0x-hex string
+	// Extract txHash (bytes32) from event data
 	rawTxHash, ok := event.EventData["txHash"]
 	if !ok {
 		return fmt.Errorf("missing txHash in BridgeIn event data")
@@ -110,47 +111,48 @@ func (eh *EventHandler) processBridgeIn(event BlockchainEvent) error {
 		return fmt.Errorf("failed to parse BridgeIn.txHash: %w", err)
 	}
 
-	// Update all deposits with the matching TxId (vout not available in event)
-	tx := eh.eventRepo.BeginTransaction()
-	var matchingDeposits []models.Deposit
-	if err := tx.Where("tx_id = ?", txIdHex).Find(&matchingDeposits).Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("query deposits by tx_id failed: %w", err)
+	txIdBytes, err := types.DecodeDogecoinHash(strings.TrimPrefix(txIdHex, "0x"))
+	if err != nil {
+		return fmt.Errorf("failed to decode Dogecoin txId: %w", err)
 	}
+	txId := fmt.Sprintf("%x", txIdBytes)
 
-	if len(matchingDeposits) == 0 {
-		tx.Rollback()
-		return fmt.Errorf("no deposit found for txId=%s; ensure UTXO detection created it earlier", txIdHex)
-	}
-	if len(matchingDeposits) != 1 {
-		tx.Rollback()
-		return fmt.Errorf("expected exactly 1 deposit for txId=%s, got %d", txIdHex, len(matchingDeposits))
-	}
+	logger.Infof("Processing BridgeIn for Dogecoin txId=%s", txId)
+	
+	// Use repository's transaction wrapper for automatic rollback on error
+	return eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+		var matchingDeposits []models.Deposit
+		if err := tx.Where("tx_id = ?", txId).Find(&matchingDeposits).Error; err != nil {
+			return fmt.Errorf("query deposits by tx_id failed: %w", err)
+		}
 
-	dep := matchingDeposits[0]
-	if err := eh.eventRepo.UpdateDepositStatus(tx, dep.ID, "confirmed"); err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed updating deposit status: %w", err)
-	}
-	// Also set EVM fields
-	dep.EvmTxHash = event.TxHash.Hex()
-	dep.EvmBlock = event.BlockNumber
-	dep.EvmLogIndex = event.LogIndex
-	if err := tx.Model(&models.Deposit{}).Where("id = ?", dep.ID).Updates(map[string]any{
-		"evm_tx_hash":   dep.EvmTxHash,
-		"evm_block":     dep.EvmBlock,
-		"evm_log_index": dep.EvmLogIndex,
-	}).Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed updating deposit EVM fields: %w", err)
-	}
-	logger.Infof("Updated deposit %d for txId=%s to confirmed with EVM fields", dep.ID, txIdHex)
+		if len(matchingDeposits) == 0 {
+			return fmt.Errorf("no deposit found for txId=%s; ensure UTXO detection created it earlier", txId)
+		}
+		if len(matchingDeposits) != 1 {
+			return fmt.Errorf("expected exactly 1 deposit for txId=%s, got %d", txId, len(matchingDeposits))
+		}
 
-	if err := tx.Commit().Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-	return nil
+		dep := matchingDeposits[0]
+		if err := eh.eventRepo.UpdateDepositStatus(tx, dep.ID, "confirmed"); err != nil {
+			return fmt.Errorf("failed updating deposit status: %w", err)
+		}
+		
+		// Also set EVM fields
+		dep.EvmTxHash = event.TxHash.Hex()
+		dep.EvmBlock = event.BlockNumber
+		dep.EvmLogIndex = event.LogIndex
+		if err := tx.Model(&models.Deposit{}).Where("id = ?", dep.ID).Updates(map[string]any{
+			"evm_tx_hash":   dep.EvmTxHash,
+			"evm_block":     dep.EvmBlock,
+			"evm_log_index": dep.EvmLogIndex,
+		}).Error; err != nil {
+			return fmt.Errorf("failed updating deposit EVM fields: %w", err)
+		}
+		
+		logger.Infof("Updated deposit %d for txId=%s to confirmed with EVM fields", dep.ID, txIdHex)
+		return nil
+	})
 }
 
 // processBridgeOutProposed handles BridgeOutProposed events
@@ -211,30 +213,27 @@ func (eh *EventHandler) processBridgeOutFinished(event BlockchainEvent) error {
 		return fmt.Errorf("failed to parse BridgeOutFinished.taskIds: %w", err)
 	}
 
-	// Update withdrawal to final state with explicit transaction
-	tx := eh.eventRepo.BeginTransaction()
-	for _, taskId := range taskIds {
-		if err := eh.eventRepo.SetWithdrawalFinishInfo(tx, taskId,
-			event.TxHash.Hex(), event.BlockNumber, event.LogIndex); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("failed to set withdrawal finish info (taskId=%s): %w", taskId, err)
-		}
+	// Update withdrawal to final state using transaction wrapper
+	err = eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+		for _, taskId := range taskIds {
+			if err := eh.eventRepo.SetWithdrawalFinishInfo(tx, taskId,
+				event.TxHash.Hex(), event.BlockNumber, event.LogIndex); err != nil {
+				return fmt.Errorf("failed to set withdrawal finish info (taskId=%s): %w", taskId, err)
+			}
 
-		withdrawal, err := eh.eventRepo.GetWithdrawalByTask(tx, taskId)
-		if err != nil {
-			tx.Rollback()
-			return fmt.Errorf("failed to get withdrawal (taskId=%s): %w", taskId, err)
+			withdrawal, err := eh.eventRepo.GetWithdrawalByTask(tx, taskId)
+			if err != nil {
+				return fmt.Errorf("failed to get withdrawal (taskId=%s): %w", taskId, err)
+			}
+			if err := eh.eventRepo.UpdateWithdrawalStatus(tx, withdrawal.ID, "confirmed"); err != nil {
+				return fmt.Errorf("failed to update withdrawal status (taskId=%s): %w", taskId, err)
+			}
+			logger.Infof("Updated withdrawal %s to confirmed state", taskId)
 		}
-		if err := eh.eventRepo.UpdateWithdrawalStatus(tx, withdrawal.ID, "confirmed"); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("failed to update withdrawal status (taskId=%s): %w", taskId, err)
-		}
-		logger.Infof("Updated withdrawal %s to confirmed state", taskId)
-	}
-
-	if err := tx.Commit().Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	// Publish to event bus
@@ -316,20 +315,17 @@ func (eh *EventHandler) processAddProposerRequested(event BlockchainEvent) error
 	// Save pending state with serialized event data
 	payload, _ := json.Marshal(event.EventData)
 
-	tx := eh.eventRepo.BeginTransaction()
-	proposer := &models.Proposers{
-		Address:      proposerAddr,
-		Status:       "pending",
-		PendingEvent: string(payload),
-		JoinBlock:    0,
-	}
-	if err := eh.eventRepo.CreateOrUpdateProposer(tx, proposer); err != nil {
-		tx.Rollback()
+	err = eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+		proposer := &models.Proposers{
+			Address:      proposerAddr,
+			Status:       "pending",
+			PendingEvent: string(payload),
+			JoinBlock:    0,
+		}
+		return eh.eventRepo.CreateOrUpdateProposer(tx, proposer)
+	})
+	if err != nil {
 		return fmt.Errorf("failed to mark proposer pending add: %w", err)
-	}
-	if err := tx.Commit().Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 	logger.Infof("Proposer %s marked pending add", proposerAddr)
 	return nil
@@ -345,20 +341,17 @@ func (eh *EventHandler) processRemoveProposerRequested(event BlockchainEvent) er
 
 	payload, _ := json.Marshal(event.EventData)
 
-	tx := eh.eventRepo.BeginTransaction()
-	// keep status pending, store pending event, set exit block when confirmed later
-	proposer := &models.Proposers{
-		Address:      proposerAddr,
-		Status:       "pending",
-		PendingEvent: string(payload),
-	}
-	if err := eh.eventRepo.CreateOrUpdateProposer(tx, proposer); err != nil {
-		tx.Rollback()
+	err = eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+		// keep status pending, store pending event, set exit block when confirmed later
+		proposer := &models.Proposers{
+			Address:      proposerAddr,
+			Status:       "pending",
+			PendingEvent: string(payload),
+		}
+		return eh.eventRepo.CreateOrUpdateProposer(tx, proposer)
+	})
+	if err != nil {
 		return fmt.Errorf("failed to mark proposer pending remove: %w", err)
-	}
-	if err := tx.Commit().Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 	logger.Infof("Proposer %s marked pending remove", proposerAddr)
 	return nil
@@ -372,40 +365,39 @@ func (eh *EventHandler) processProposerConfirmed(event BlockchainEvent) error {
 		return fmt.Errorf("invalid proposer in ProposerConfirmed: %w", err)
 	}
 
-	tx := eh.eventRepo.BeginTransaction()
-	rec, err := eh.eventRepo.GetProposer(tx, proposerAddr)
-	if err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to load proposer %s: %w", proposerAddr, err)
-	}
-
-	// Decide whether it’s confirming an add or a remove based on PendingEvent content
-	finalStatus := rec.Status
-	if finalStatus == "pending" {
-		// If no previous status, treat as add confirmation
-		finalStatus = "ok"
-		if rec.JoinBlock == 0 {
-			rec.JoinBlock = event.BlockNumber
+	var finalStatus string
+	err = eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+		rec, err := eh.eventRepo.GetProposer(tx, proposerAddr)
+		if err != nil {
+			return fmt.Errorf("failed to load proposer %s: %w", proposerAddr, err)
 		}
-	} else if finalStatus == "ok" {
-		// If currently ok and got a pending remove earlier, set exit
-		finalStatus = "exit"
-		rec.ExitBlock = event.BlockNumber
-	}
 
-	if err := tx.Model(&models.Proposers{}).Where("id = ?", rec.ID).Updates(map[string]any{
-		"status":        finalStatus,
-		"pending_event": "",
-		"join_block":    rec.JoinBlock,
-		"exit_block":    rec.ExitBlock,
-	}).Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to confirm proposer change: %w", err)
-	}
+		// Decide whether it's confirming an add or a remove based on PendingEvent content
+		finalStatus = rec.Status
+		if finalStatus == "pending" {
+			// If no previous status, treat as add confirmation
+			finalStatus = "ok"
+			if rec.JoinBlock == 0 {
+				rec.JoinBlock = event.BlockNumber
+			}
+		} else if finalStatus == "ok" {
+			// If currently ok and got a pending remove earlier, set exit
+			finalStatus = "exit"
+			rec.ExitBlock = event.BlockNumber
+		}
 
-	if err := tx.Commit().Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		if err := tx.Model(&models.Proposers{}).Where("id = ?", rec.ID).Updates(map[string]any{
+			"status":        finalStatus,
+			"pending_event": "",
+			"join_block":    rec.JoinBlock,
+			"exit_block":    rec.ExitBlock,
+		}).Error; err != nil {
+			return fmt.Errorf("failed to confirm proposer change: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	logger.Infof("Proposer %s confirmed; status=%s", proposerAddr, finalStatus)
 	return nil

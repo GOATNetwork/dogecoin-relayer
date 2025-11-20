@@ -1,9 +1,11 @@
 package models
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )
 
@@ -31,7 +33,7 @@ func (r *EventRepository) WithTransaction(fn func(tx *gorm.DB) error) error {
 
 // WithTransactionRetry runs a transaction with retry logic for database lock errors
 func (r *EventRepository) WithTransactionRetry(fn func(tx *gorm.DB) error) error {
-	maxRetries := 3
+	maxRetries := 5 // Increased from 3
 	for i := 0; i < maxRetries; i++ {
 		err := r.db.Transaction(func(tx *gorm.DB) error {
 			return fn(tx)
@@ -43,8 +45,20 @@ func (r *EventRepository) WithTransactionRetry(fn func(tx *gorm.DB) error) error
 
 		// Check if it's a database lock error
 		if isLockError(err) && i < maxRetries-1 {
-			// Wait with exponential backoff
-			time.Sleep(time.Duration(100*(i+1)) * time.Millisecond)
+			// Exponential backoff with jitter: 50ms, 100ms, 200ms, 400ms, 800ms
+			backoffMs := 50 * (1 << uint(i))
+			// Add small jitter to avoid thundering herd
+			jitterMs := backoffMs / 10 // 10% jitter
+			waitTime := time.Duration(backoffMs+jitterMs) * time.Millisecond
+
+			// Log on retries to help debug
+			if i >= 2 {
+				// Only log after 2nd retry to reduce noise
+				log.Printf("WARN: Database lock detected, retry %d/%d after %v: %v",
+					i+1, maxRetries, waitTime, err)
+			}
+
+			time.Sleep(waitTime)
 			continue
 		}
 
@@ -62,7 +76,8 @@ func isLockError(err error) bool {
 	return strings.Contains(errStr, "database is locked") ||
 		strings.Contains(errStr, "database lock") ||
 		strings.Contains(errStr, "busy") ||
-		strings.Contains(errStr, "timeout")
+		strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "locked")
 }
 
 // getDB returns tx if provided; otherwise returns the repository base DB.
@@ -106,10 +121,21 @@ func (r *EventRepository) CreateOrUpdateScanState(state *EventScanState) error {
 
 // Deposit operations
 
-// CreateOrUpdateDeposit creates a new deposit or updates the existing one matched by (tx_id, vout).
+// CreateOrUpdateDeposit creates a new deposit or updates the existing one matched by (tx_id, vout) with retry on lock errors.
 func (r *EventRepository) CreateOrUpdateDeposit(tx *gorm.DB, deposit *Deposit) error {
-    db := r.getDB(tx)
+	// If we're already in a transaction, execute directly without retry
+	if tx != nil {
+		return r.createOrUpdateDepositImpl(tx, deposit)
+	}
+	
+	// For non-transactional updates, use retry logic
+	return r.WithTransactionRetry(func(innerTx *gorm.DB) error {
+		return r.createOrUpdateDepositImpl(innerTx, deposit)
+	})
+}
 
+// createOrUpdateDepositImpl is the internal implementation of CreateOrUpdateDeposit
+func (r *EventRepository) createOrUpdateDepositImpl(db *gorm.DB, deposit *Deposit) error {
 	var existing Deposit
 	err := db.Where("tx_id = ? AND vout = ?", deposit.TxId, deposit.Vout).First(&existing).Error
 	if err != nil {
@@ -120,14 +146,14 @@ func (r *EventRepository) CreateOrUpdateDeposit(tx *gorm.DB, deposit *Deposit) e
 	}
 
 	// Update mutable fields
-    updates := map[string]any{
-        "address":       deposit.Address,
-        "evm_addr":      deposit.EvmAddr,
-        "amount":        deposit.Amount,
-        "tx_bytes":      deposit.TxBytes,
-        "status":        deposit.Status,
-        "evm_tx_hash":   deposit.EvmTxHash,
-        "evm_block":     deposit.EvmBlock,
+	updates := map[string]any{
+		"address":       deposit.Address,
+		"evm_addr":      deposit.EvmAddr,
+		"amount":        deposit.Amount,
+		"tx_bytes":      deposit.TxBytes,
+		"status":        deposit.Status,
+		"evm_tx_hash":   deposit.EvmTxHash,
+		"evm_block":     deposit.EvmBlock,
 		"evm_log_index": deposit.EvmLogIndex,
 		"updated_at":    time.Now(),
 	}
@@ -155,14 +181,62 @@ func (r *EventRepository) ListDepositsByStatus(tx *gorm.DB, status string, limit
 	return list, query.Find(&list).Error
 }
 
-// UpdateDepositStatus updates status of a deposit by primary key ID.
+// UpdateDepositStatus updates status of a deposit by primary key ID with retry on lock errors.
 func (r *EventRepository) UpdateDepositStatus(tx *gorm.DB, id uint, status string) error {
 	db := r.getDB(tx)
-	return db.Model(&Deposit{}).Where("id = ?", id).Updates(map[string]any{
-		"status":     status,
-		"updated_at": time.Now(),
-	}).Error
+	
+	// If we're already in a transaction, don't retry (let the outer transaction handle it)
+	if tx != nil {
+		return db.Model(&Deposit{}).Where("id = ?", id).Updates(map[string]any{
+			"status":     status,
+			"updated_at": time.Now(),
+		}).Error
+	}
+	
+	// For non-transactional updates, use retry logic
+	return r.WithTransactionRetry(func(innerTx *gorm.DB) error {
+		return innerTx.Model(&Deposit{}).Where("id = ?", id).Updates(map[string]any{
+			"status":     status,
+			"updated_at": time.Now(),
+		}).Error
+	})
 }
+
+// BatchGetDepositsByTxIds retrieves multiple deposits in a single query
+// Returns a map keyed by "txid:vout" for quick lookup
+func (r *EventRepository) BatchGetDepositsByTxIds(tx *gorm.DB, txidVouts []struct{ TxId string; Vout int }) (map[string]Deposit, error) {
+	db := r.getDB(tx)
+	
+	if len(txidVouts) == 0 {
+		return make(map[string]Deposit), nil
+	}
+
+	var deposits []Deposit
+	query := db
+	
+	// Build OR conditions for batch query
+	for i, tv := range txidVouts {
+		if i == 0 {
+			query = query.Where("tx_id = ? AND vout = ?", tv.TxId, tv.Vout)
+		} else {
+			query = query.Or("tx_id = ? AND vout = ?", tv.TxId, tv.Vout)
+		}
+	}
+	
+	if err := query.Find(&deposits).Error; err != nil {
+		return nil, err
+	}
+	
+	// Build result map
+	result := make(map[string]Deposit, len(deposits))
+	for _, dep := range deposits {
+		key := fmt.Sprintf("%s:%d", dep.TxId, dep.Vout)
+		result[key] = dep
+	}
+	
+	return result, nil
+}
+
 
 // Withdrawal operations
 

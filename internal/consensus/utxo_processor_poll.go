@@ -16,6 +16,7 @@ import (
 	"github.com/goat-network/dogecoin-relayer/pkg/contract"
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
+	"gorm.io/gorm"
 )
 
 // pollLoop continuously polls for new UTXOs
@@ -255,6 +256,41 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*BridgeIn
 		UTXOs:             make([]*models.UTXO, 0),
 	}
 
+	// Pre-fetch all deposit records in a single query to avoid per-UTXO queries
+	// This prevents database lock contention
+	depositMap := make(map[string]models.Deposit)
+	if len(utxos) > 0 {
+		var deposits []models.Deposit
+		// Build condition for batch query
+		var conditions []map[string]interface{}
+		for _, utxo := range utxos {
+			conditions = append(conditions, map[string]interface{}{
+				"tx_id": utxo.Txid,
+				"vout":  utxo.OutIndex,
+			})
+		}
+		
+		// Query all deposits in one go
+		// Note: This uses OR conditions, which is less efficient but safer than N+1 queries
+		if len(conditions) > 0 {
+			query := up.conn.GetDB()
+			for i, cond := range conditions {
+				if i == 0 {
+					query = query.Where("tx_id = ? AND vout = ?", cond["tx_id"], cond["vout"])
+				} else {
+					query = query.Or("tx_id = ? AND vout = ?", cond["tx_id"], cond["vout"])
+				}
+			}
+			query.Find(&deposits)
+			
+			// Build map for quick lookup
+			for i := range deposits {
+				key := fmt.Sprintf("%s:%d", deposits[i].TxId, deposits[i].Vout)
+				depositMap[key] = deposits[i]
+			}
+		}
+	}
+
 	for _, utxo := range utxos {
 		// Create bridge transaction for this UTXO
 		// EVM address validation is now done before calling this function
@@ -262,10 +298,11 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*BridgeIn
 		// We persist these in deposits.tx_bytes when scanning blocks; fetch them here.
 		var txBytes []byte
 		{
-			var dep models.Deposit
-			if err := up.conn.GetDB().Where("tx_id = ? AND vout = ?", utxo.Txid, utxo.OutIndex).First(&dep).Error; err == nil {
+			key := fmt.Sprintf("%s:%d", utxo.Txid, utxo.OutIndex)
+			if dep, exists := depositMap[key]; exists && len(dep.TxBytes) > 0 {
 				txBytes = dep.TxBytes
 			}
+			
 			if len(txBytes) == 0 {
 				// Fallback: use txid bytes if deposit record missing or tx bytes empty
 				up.logger.Warnf("Deposit raw bytes missing for %s:%d, falling back to txid bytes", utxo.Txid, utxo.OutIndex)
@@ -723,17 +760,22 @@ func (up *UtxoProcessor) generateBridgeOutFinishCalldata(request *withdrawalRequ
 
 // markUTXOsAsProcessed marks UTXOs as processed to avoid reprocessing
 func (up *UtxoProcessor) markUTXOsAsProcessed(utxos []*models.UTXO) error {
-	// Update UTXOs to mark as processed (we could add a "processed" status or use a separate table)
-	// For now, we'll update the UpdatedAt timestamp to track processing
-	for _, utxo := range utxos {
-		utxo.UpdatedAt = time.Now()
-		if err := up.conn.GetDB().Save(utxo).Error; err != nil {
-			return fmt.Errorf("failed to mark UTXO %s as processed: %w", utxo.Uid, err)
-		}
+	if len(utxos) == 0 {
+		return nil
 	}
 
-	up.logger.Debugf("Marked %d UTXOs as processed", len(utxos))
-	return nil
+	// Use a single transaction for all updates to prevent database corruption
+	return up.conn.GetDB().Transaction(func(tx *gorm.DB) error {
+		now := time.Now()
+		for _, utxo := range utxos {
+			utxo.UpdatedAt = now
+			if err := tx.Save(utxo).Error; err != nil {
+				return fmt.Errorf("failed to mark UTXO %s as processed: %w", utxo.Uid, err)
+			}
+		}
+		up.logger.Debugf("Marked %d UTXOs as processed in transaction", len(utxos))
+		return nil
+	})
 }
 
 // requestTssSignature creates a batch proposal, sends it to other nodes, and requests TSS signature
