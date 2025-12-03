@@ -115,9 +115,11 @@ type WithdrawalProposal struct {
 	UTXOs       []*models.UTXO `json:"utxos"`        // List of withdrawal UTXOs in this batch
 	TotalAmount *big.Int       `json:"total_amount"` // Total amount across all UTXOs
 	Calldata    []byte         `json:"calldata"`     // Generated bridgeOutFinish calldata for the batch
-	TaskIds     []*big.Int     `json:"task_ids"`     // Task IDs associated with this withdrawal batch
-	Proposer    string         `json:"proposer"`     // Address of the proposer node
-	SessionID   string         `json:"session_id"`   // TSS session ID for signing
+	TxBytes     []byte         `json:"tx_bytes,omitempty"`
+	TxId        string         `json:"txid,omitempty"`
+	TaskIds     []*big.Int     `json:"task_ids"`   // Task IDs associated with this withdrawal batch
+	Proposer    string         `json:"proposer"`   // Address of the proposer node
+	SessionID   string         `json:"session_id"` // TSS session ID for signing
 	TssNonceStr string         `json:"tss_nonce"`
 	TssNonce    *big.Int       `json:"-"`
 }

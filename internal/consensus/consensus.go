@@ -21,6 +21,7 @@ type ConsensusModule struct {
 	logger        *log.Entry
 	eventManager  *EventManager
 	utxoProcessor *UtxoProcessor
+	withdrawal    *WithdrawalProcessor
 	eventBus      *eventbus.Bus
 }
 
@@ -79,6 +80,14 @@ func (c *ConsensusModule) Init(cfg any, conn *models.DBConnection) error {
 		c.cfg.EventDetection.AbiPath,
 	)
 
+	// Initialize withdrawal processor (Dogecoin L1 payouts)
+	wp, err := NewWithdrawalProcessor(conn, c.utxoProcessor)
+	if err != nil {
+		c.logger.Errorf("Failed to initialize withdrawal processor: %v", err)
+		return err
+	}
+	c.withdrawal = wp
+
 	c.logger.Info("Consensus module initialized successfully")
 	return nil
 }
@@ -95,6 +104,14 @@ func (c *ConsensusModule) Run(ctx context.Context) error {
 	if err := c.utxoProcessor.Start(); err != nil {
 		c.logger.Errorf("Failed to start UTXO manager: %v", err)
 		return err
+	}
+
+	// Start withdrawal processor
+	if c.withdrawal != nil {
+		if err := c.withdrawal.Start(ctx); err != nil {
+			c.logger.Errorf("Failed to start withdrawal processor: %v", err)
+			return err
+		}
 	}
 
 	// start health check
@@ -116,6 +133,10 @@ func (c *ConsensusModule) Shutdown(ctx context.Context) error {
 
 	// Close the Ethereum client
 	CloseEthClient()
+
+	if c.withdrawal != nil {
+		c.withdrawal.Shutdown()
+	}
 
 	c.logger.Info("Consensus module shutdown complete")
 	return nil

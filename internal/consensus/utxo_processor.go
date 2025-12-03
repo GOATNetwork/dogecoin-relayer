@@ -36,6 +36,8 @@ type withdrawalRequest struct {
 	UTXO        *models.UTXO // Single UTXO with multiple outputs
 	TotalAmount *big.Int
 	TaskIds     []*big.Int // Task IDs aligned with VOUT outputs
+	TxBytes     []byte
+	TxId        string
 }
 
 // pendingBatch stores batch data while waiting for TSS signature
@@ -191,6 +193,20 @@ func (up *UtxoProcessor) SetTssClient(client *tss.SignClient) {
 // SetChainID sets the chain ID for transaction signing
 func (up *UtxoProcessor) SetChainID(chainID *big.Int) {
 	up.chainID = chainID
+}
+
+// SubmitWithdrawalRequest allows external components (e.g., withdrawal processor) to trigger a bridgeOutFinish flow directly.
+func (up *UtxoProcessor) SubmitWithdrawalRequest(req *withdrawalRequest) error {
+	if req == nil {
+		return fmt.Errorf("nil withdrawal request")
+	}
+	if len(req.TaskIds) == 0 {
+		return fmt.Errorf("withdrawal request missing task ids")
+	}
+	if req.TotalAmount == nil {
+		return fmt.Errorf("withdrawal request missing amount")
+	}
+	return up.processWithdrawalRequest(req)
 }
 
 // Start begins the UTXO monitoring process

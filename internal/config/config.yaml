@@ -36,6 +36,21 @@ doge:
   confirmations: 1
   network_type: "regtest"
 
+withdraw:
+  enabled: true
+  mode: "local"                # local | fireblocks
+  change_address: ""           # optional, default to first watch address
+  fee_rate: 1                  # reserved for future fee tuning
+  min_confirmations: 1
+  fireblocks:
+    api_key: ""
+    secret: ""
+    base_url: "https://api.fireblocks.io"
+    vault_account: ""
+    asset_id: "DOGE_TEST"
+    callback_private: ""
+    callback_public: ""
+
 scan:
   enabled: true
   interval: 60 # unit: second

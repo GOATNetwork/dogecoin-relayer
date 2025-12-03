@@ -379,10 +379,17 @@ func (up *UtxoProcessor) handleP2PWithdrawalProposal(msg *types.P2PBroadcastMess
 
 	// Create pending request entry for tracking
 	request := &withdrawalRequest{
-		ID:          big.NewInt(0),     // Will be set based on request ID
-		UTXO:        proposal.UTXOs[0], // Single UTXO from proposal
+		ID:          big.NewInt(0), // Will be set based on request ID
 		TotalAmount: proposal.TotalAmount,
 		TaskIds:     proposal.TaskIds,
+		TxBytes:     proposal.TxBytes,
+		TxId:        proposal.TxId,
+	}
+	if len(proposal.UTXOs) > 0 {
+		request.UTXO = proposal.UTXOs[0]
+		if request.TxId == "" {
+			request.TxId = proposal.UTXOs[0].Txid
+		}
 	}
 
 	derivedID, err := deriveDeterministicIDFromSession(proposal.SessionID)
@@ -393,13 +400,17 @@ func (up *UtxoProcessor) handleP2PWithdrawalProposal(msg *types.P2PBroadcastMess
 	request.ID = derivedID
 	up.logger.Infof("Handler: derived withdrawal ID %s from session %s", request.ID.String(), proposal.SessionID)
 
-	calldata, err := up.generateBridgeOutFinishCalldata(request)
-	if err != nil {
-		return fmt.Errorf("failed to regenerate withdrawal calldata: %w", err)
-	}
-
-	if len(proposal.Calldata) > 0 && !bytes.Equal(proposal.Calldata, calldata) {
-		return fmt.Errorf("withdrawal proposal calldata mismatch for session %s", proposal.SessionID)
+	calldata := proposal.Calldata
+	if len(calldata) == 0 {
+		calldata, err = up.generateBridgeOutFinishCalldata(request)
+		if err != nil {
+			return fmt.Errorf("failed to regenerate withdrawal calldata: %w", err)
+		}
+	} else {
+		// Optional integrity check: regenerate when we have the data to ensure consistency
+		if regenerated, err := up.generateBridgeOutFinishCalldata(request); err == nil && !bytes.Equal(regenerated, calldata) {
+			return fmt.Errorf("withdrawal proposal calldata mismatch for session %s", proposal.SessionID)
+		}
 	}
 
 	baseSessionID := proposal.SessionID
@@ -520,9 +531,6 @@ func (up *UtxoProcessor) validateWithdrawalProposal(proposal *WithdrawalProposal
 	if proposal.SessionID == "" {
 		return fmt.Errorf("session ID is required")
 	}
-	if len(proposal.UTXOs) == 0 {
-		return fmt.Errorf("UTXOs list cannot be empty")
-	}
 	if proposal.TotalAmount == nil || proposal.TotalAmount.Cmp(big.NewInt(0)) <= 0 {
 		return fmt.Errorf("total amount must be positive")
 	}
@@ -545,18 +553,20 @@ func (up *UtxoProcessor) validateWithdrawalProposal(proposal *WithdrawalProposal
 	}
 	proposal.TssNonce = tssNonce
 
-	// Calculate total amount from UTXOs and verify it matches proposal
-	calculatedTotal := big.NewInt(0)
-	for _, utxo := range proposal.UTXOs {
-		if utxo.Amount <= 0 {
-			return fmt.Errorf("UTXO amount must be positive")
+	// When UTXOs are provided, validate amounts; otherwise rely on calldata/tx bytes
+	if len(proposal.UTXOs) > 0 {
+		calculatedTotal := big.NewInt(0)
+		for _, utxo := range proposal.UTXOs {
+			if utxo.Amount <= 0 {
+				return fmt.Errorf("UTXO amount must be positive")
+			}
+			calculatedTotal.Add(calculatedTotal, big.NewInt(utxo.Amount))
 		}
-		calculatedTotal.Add(calculatedTotal, big.NewInt(utxo.Amount))
-	}
 
-	if calculatedTotal.Cmp(proposal.TotalAmount) != 0 {
-		return fmt.Errorf("calculated total amount (%s) does not match proposal total amount (%s)",
-			calculatedTotal.String(), proposal.TotalAmount.String())
+		if calculatedTotal.Cmp(proposal.TotalAmount) != 0 {
+			return fmt.Errorf("calculated total amount (%s) does not match proposal total amount (%s)",
+				calculatedTotal.String(), proposal.TotalAmount.String())
+		}
 	}
 
 	// TODO: Add more sophisticated validation:

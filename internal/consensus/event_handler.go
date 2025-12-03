@@ -1,12 +1,14 @@
 package consensus
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
 	"reflect"
 	"strings"
 
+	"github.com/dogecoinw/doged/btcutil"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
@@ -118,7 +120,7 @@ func (eh *EventHandler) processBridgeIn(event BlockchainEvent) error {
 	txId := fmt.Sprintf("%x", txIdBytes)
 
 	logger.Infof("Processing BridgeIn for Dogecoin txId=%s", txId)
-	
+
 	// Use repository's transaction wrapper for automatic rollback on error
 	return eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
 		var matchingDeposits []models.Deposit
@@ -137,7 +139,7 @@ func (eh *EventHandler) processBridgeIn(event BlockchainEvent) error {
 		if err := eh.eventRepo.UpdateDepositStatus(tx, dep.ID, "confirmed"); err != nil {
 			return fmt.Errorf("failed updating deposit status: %w", err)
 		}
-		
+
 		// Also set EVM fields
 		dep.EvmTxHash = event.TxHash.Hex()
 		dep.EvmBlock = event.BlockNumber
@@ -149,7 +151,7 @@ func (eh *EventHandler) processBridgeIn(event BlockchainEvent) error {
 		}).Error; err != nil {
 			return fmt.Errorf("failed updating deposit EVM fields: %w", err)
 		}
-		
+
 		logger.Infof("Updated deposit %d for txId=%s to confirmed with EVM fields", dep.ID, txIdHex)
 		return nil
 	})
@@ -173,6 +175,20 @@ func (eh *EventHandler) processBridgeOutProposed(event BlockchainEvent) error {
 		return fmt.Errorf("failed to parse BridgeOutProposed.taskId: %w", err)
 	}
 
+	// Optional fields: destination amount/address for Dogecoin withdrawal
+	var destAmountStr string
+	if rawAmt, ok := event.EventData["destAmount"]; ok {
+		if amtStr, err := toUint256String(rawAmt); err == nil {
+			destAmountStr = amtStr
+		} else {
+			logger.Warnf("Failed to parse destAmount for task %s: %v", taskId, err)
+		}
+	}
+	destDogeAddr, err := parseDestDogecoinAddress(event.EventData["destDogecoinAddress"])
+	if err != nil {
+		logger.Warnf("Failed to parse destDogecoinAddress for task %s: %v", taskId, err)
+	}
+
 	// Create withdrawal record with retry transaction
 	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
 		withdrawal := &models.Withdrawal{
@@ -181,6 +197,8 @@ func (eh *EventHandler) processBridgeOutProposed(event BlockchainEvent) error {
 			ReqBlock:    event.BlockNumber,
 			ReqLogIndex: event.LogIndex,
 			Status:      "init", // Initial status when BridgeOutProposed is detected
+			DestAmount:  destAmountStr,
+			DestAddress: destDogeAddr,
 		}
 		return eh.eventRepo.CreateOrUpdateWithdrawal(tx, withdrawal)
 	})
@@ -504,4 +522,45 @@ func readAddress(v any) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported address type: %T", v)
 	}
+}
+
+// parseDestDogecoinAddress attempts to convert the bytes20 payload emitted in BridgeOutProposed
+// into a base58 Dogecoin address (P2PKH). Returns empty string when parsing fails.
+func parseDestDogecoinAddress(raw any) (string, error) {
+	if raw == nil {
+		return "", fmt.Errorf("nil dest dogecoin address")
+	}
+
+	var payload []byte
+	switch v := raw.(type) {
+	case []byte:
+		payload = v
+	case [20]byte:
+		payload = v[:]
+	case string:
+		// allow hex string input (with or without 0x)
+		s := strings.TrimPrefix(v, "0x")
+		if len(s) != 40 {
+			return "", fmt.Errorf("unexpected string length for dest doge address: %d", len(s))
+		}
+		bs, err := hex.DecodeString(s)
+		if err != nil {
+			return "", fmt.Errorf("decode dest address hex: %w", err)
+		}
+		payload = bs
+	default:
+		return "", fmt.Errorf("unsupported dest doge address type: %T", raw)
+	}
+
+	if len(payload) != 20 {
+		return "", fmt.Errorf("dest doge address payload size mismatch: %d", len(payload))
+	}
+
+	cfg := global.GetConfig()
+	network := types.GetDogeNetwork(cfg.Doge.NetworkType)
+	addr, err := btcutil.NewAddressPubKeyHash(payload, network)
+	if err != nil {
+		return "", fmt.Errorf("build doge address: %w", err)
+	}
+	return addr.EncodeAddress(), nil
 }

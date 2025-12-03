@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/dogecoinw/doged/btcutil"
 	"github.com/dogecoinw/doged/chaincfg/chainhash"
@@ -228,4 +229,122 @@ func (c *DogeClient) HealthCheck() error {
 	timer.RecordSuccess()
 	metrics.DogeConnectionStatus.Set(1)
 	return nil
+}
+
+// CreateAndFundRawTx builds a raw transaction with the given outputs (amounts expressed as string DOGE values)
+// and lets the node pick inputs/change. Returns the funded hex string.
+func (c *DogeClient) CreateAndFundRawTx(outputs map[string]string, changeAddr string) (string, error) {
+	if len(outputs) == 0 {
+		return "", fmt.Errorf("no outputs provided")
+	}
+
+	outputJSON, err := json.Marshal(outputs)
+	if err != nil {
+		return "", fmt.Errorf("marshal outputs: %w", err)
+	}
+
+	rawCreate, err := c.client.RawRequest("createrawtransaction", []json.RawMessage{
+		json.RawMessage("[]"), // empty inputs, wallet will fund
+		json.RawMessage(outputJSON),
+	})
+	if err != nil {
+		return "", fmt.Errorf("createrawtransaction rpc: %w", err)
+	}
+
+	var unsignedHex string
+	if err := json.Unmarshal(rawCreate, &unsignedHex); err != nil {
+		return "", fmt.Errorf("unmarshal create tx: %w", err)
+	}
+
+	options := map[string]any{
+		"changeAddress": changeAddr,
+	}
+	optJSON, _ := json.Marshal(options)
+
+	rawFund, err := c.client.RawRequest("fundrawtransaction", []json.RawMessage{
+		json.RawMessage(fmt.Sprintf("%q", unsignedHex)),
+		json.RawMessage(optJSON),
+	})
+	if err != nil {
+		return "", fmt.Errorf("fundrawtransaction rpc: %w", err)
+	}
+
+	var fundResp struct {
+		Hex    string  `json:"hex"`
+		Fee    float64 `json:"fee"`
+		ChgPos int     `json:"changepos"`
+	}
+	if err := json.Unmarshal(rawFund, &fundResp); err != nil {
+		return "", fmt.Errorf("unmarshal fund tx: %w", err)
+	}
+
+	return fundResp.Hex, nil
+}
+
+// SignRawTransaction signs the provided raw tx hex using the node wallet.
+func (c *DogeClient) SignRawTransaction(rawHex string) (string, error) {
+	rawSign, err := c.client.RawRequest("signrawtransaction", []json.RawMessage{
+		json.RawMessage(fmt.Sprintf("%q", rawHex)),
+	})
+	if err != nil {
+		return "", fmt.Errorf("signrawtransaction rpc: %w", err)
+	}
+	var signResp struct {
+		Hex      string `json:"hex"`
+		Complete bool   `json:"complete"`
+	}
+	if err := json.Unmarshal(rawSign, &signResp); err != nil {
+		return "", fmt.Errorf("unmarshal sign tx: %w", err)
+	}
+	if !signResp.Complete {
+		return "", fmt.Errorf("signrawtransaction incomplete")
+	}
+	return signResp.Hex, nil
+}
+
+// SendRawTransaction broadcasts the given raw tx hex.
+func (c *DogeClient) SendRawTransaction(rawHex string) (string, error) {
+	rawSend, err := c.client.RawRequest("sendrawtransaction", []json.RawMessage{
+		json.RawMessage(fmt.Sprintf("%q", rawHex)),
+	})
+	if err != nil {
+		return "", fmt.Errorf("sendrawtransaction rpc: %w", err)
+	}
+	var txid string
+	if err := json.Unmarshal(rawSend, &txid); err != nil {
+		return "", fmt.Errorf("unmarshal send tx: %w", err)
+	}
+	return txid, nil
+}
+
+// GetRawTransactionHex fetches raw tx hex and confirmations (verbose) for the given txid.
+func (c *DogeClient) GetRawTransactionHex(txid string) (string, int64, error) {
+	rawGet, err := c.client.RawRequest("getrawtransaction", []json.RawMessage{
+		json.RawMessage(fmt.Sprintf("%q", txid)),
+		json.RawMessage("true"),
+	})
+	if err != nil {
+		return "", 0, fmt.Errorf("getrawtransaction rpc: %w", err)
+	}
+	var resp struct {
+		Hex           string  `json:"hex"`
+		Confirmations float64 `json:"confirmations"`
+	}
+	if err := json.Unmarshal(rawGet, &resp); err != nil {
+		return "", 0, fmt.Errorf("unmarshal getrawtransaction: %w", err)
+	}
+	return resp.Hex, int64(resp.Confirmations), nil
+}
+
+// DecodeRawTransaction decodes a hex-encoded tx into wire.MsgTx.
+func (c *DogeClient) DecodeRawTransaction(rawHex string) (*wire.MsgTx, error) {
+	decoded, err := hex.DecodeString(strings.TrimSpace(rawHex))
+	if err != nil {
+		return nil, fmt.Errorf("decode raw tx hex: %w", err)
+	}
+	var msg wire.MsgTx
+	if err := msg.Deserialize(bytes.NewReader(decoded)); err != nil {
+		return nil, fmt.Errorf("deserialize raw tx: %w", err)
+	}
+	return &msg, nil
 }

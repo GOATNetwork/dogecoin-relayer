@@ -232,14 +232,9 @@ func (m *DogeModule) processBlock(dogeBlock types.DogeBlockExt) {
 			m.logger.Errorf("Failed to generate P2PKH address: %v", err)
 			return
 		}
-		p2wpkhAddress, err := types.GenerateP2WPKHAddress(pubkeyBytes, network)
-		if err != nil {
-			m.logger.Errorf("Failed to generate P2WPKH address: %v", err)
-			return
-		}
 		watchAddrSet[p2pkhAddress] = struct{}{}
-		watchAddrSet[p2wpkhAddress] = struct{}{}
-		m.logger.Debugf("Using derived watch addresses - P2PKH: %s, P2WPKH: %s", p2pkhAddress, p2wpkhAddress)
+		// Dogecoin does not support segwit outputs; skip derived P2WPKH here.
+		m.logger.Debugf("Using derived watch address (P2PKH only for Doge): %s", p2pkhAddress)
 	} else {
 		// No addresses configured; continue scanning but skip ownership-based classification
 		m.logger.Debug("No watch addresses or pubkey configured; scanning without address filter")
@@ -520,24 +515,24 @@ func (m *DogeModule) handleSpendingTransaction(txid string, vins []*models.VIN, 
 }
 
 func (m *DogeModule) recordDeposit(utxo *models.UTXO, txid string, txBytes []byte) error {
-    if m.eventRepo == nil {
-        return nil
-    }
+	if m.eventRepo == nil {
+		return nil
+	}
 
-    deposit := &models.Deposit{
-        TxId:        txid,
-        Vout:        utxo.OutIndex,
-        Address:     utxo.Receiver,
-        EvmAddr:     utxo.EvmAddr,
-        Amount:      utxo.Amount,
-        TxBytes:     txBytes,
-        Status:      "pending",
-        EvmTxHash:   "",
-        EvmBlock:    0,
-        EvmLogIndex: 0,
-    }
+	deposit := &models.Deposit{
+		TxId:        txid,
+		Vout:        utxo.OutIndex,
+		Address:     utxo.Receiver,
+		EvmAddr:     utxo.EvmAddr,
+		Amount:      utxo.Amount,
+		TxBytes:     txBytes,
+		Status:      "pending",
+		EvmTxHash:   "",
+		EvmBlock:    0,
+		EvmLogIndex: 0,
+	}
 
-    return m.eventRepo.CreateOrUpdateDeposit(nil, deposit)
+	return m.eventRepo.CreateOrUpdateDeposit(nil, deposit)
 }
 
 // parseHexOrRaw parses a hex string like "0xdeadbeef" or "deadbeef" into bytes.

@@ -12,6 +12,7 @@ type Config struct {
 	Sqlite    SqliteConfig    `yaml:"sqlite"`
 	Gorm      GormConfig      `yaml:"gorm"`
 	Doge      DogeConfig      `yaml:"doge"`
+	Withdraw  WithdrawConfig  `yaml:"withdraw"`
 	P2P       P2PConfig       `yaml:"p2p"`
 	Http      HttpConfig      `yaml:"http"`
 	Scan      ScanConfig      `yaml:"scan"`
@@ -62,24 +63,24 @@ type HttpConfig struct {
 }
 
 type DogeConfig struct {
-    RpcUrl        string `yaml:"rpc_url"`
-    RpcUser       string `yaml:"rpc_user"`
-    RpcPassword   string `yaml:"rpc_password"`
-    StartHeight   int    `yaml:"start_height"`
-    Confirmations int    `yaml:"confirmations"`
-    NetworkType   string `yaml:"network_type"`
+	RpcUrl        string `yaml:"rpc_url"`
+	RpcUser       string `yaml:"rpc_user"`
+	RpcPassword   string `yaml:"rpc_password"`
+	StartHeight   int    `yaml:"start_height"`
+	Confirmations int    `yaml:"confirmations"`
+	NetworkType   string `yaml:"network_type"`
 
-    // Optional: addresses or pubkey to watch
-    // If WatchAddresses is set, relayer will match against these addresses directly.
-    // If WatchPubkeyBase64 is set, relayer will derive P2PKH/P2WPKH addresses from it.
-    // When both are empty, relayer will scan without address filtering for ownership-specific actions.
-    WatchAddresses   []string `yaml:"watch_addresses"`
-    WatchPubkeyBase64 string   `yaml:"watch_pubkey_base64"`
+	// Optional: addresses or pubkey to watch
+	// If WatchAddresses is set, relayer will match against these addresses directly.
+	// If WatchPubkeyBase64 is set, relayer will derive P2PKH/P2WPKH addresses from it.
+	// When both are empty, relayer will scan without address filtering for ownership-specific actions.
+	WatchAddresses    []string `yaml:"watch_addresses"`
+	WatchPubkeyBase64 string   `yaml:"watch_pubkey_base64"`
 
-    // Optional: deposit detection parameters
-    // Magic bytes (hex string, e.g. "0xfeedbeef" or "feedbeef") and minimum deposit amount in satoshis
-    DepositMagicBytes string `yaml:"deposit_magic_bytes"`
-    MinDepositAmount  int64  `yaml:"min_deposit_amount"`
+	// Optional: deposit detection parameters
+	// Magic bytes (hex string, e.g. "0xfeedbeef" or "feedbeef") and minimum deposit amount in satoshis
+	DepositMagicBytes string `yaml:"deposit_magic_bytes"`
+	MinDepositAmount  int64  `yaml:"min_deposit_amount"`
 }
 
 type ConsensusConfig struct {
@@ -117,6 +118,25 @@ type MetricsConfig struct {
 	CollectSystemMetrics  bool `yaml:"collect_system_metrics"`
 	SystemCollectInterval int  `yaml:"system_collect_interval"` // in seconds
 	EnableDetailedMetrics bool `yaml:"enable_detailed_metrics"`
+}
+
+type FireblocksConfig struct {
+	ApiKey       string `yaml:"api_key"`
+	Secret       string `yaml:"secret"`
+	BaseURL      string `yaml:"base_url"`
+	VaultAccount string `yaml:"vault_account"`
+	AssetId      string `yaml:"asset_id"`
+	CallbackPriv string `yaml:"callback_private"`
+	CallbackPub  string `yaml:"callback_public"`
+}
+
+type WithdrawConfig struct {
+	Enabled          bool             `yaml:"enabled"`
+	Mode             string           `yaml:"mode"` // local | fireblocks
+	ChangeAddress    string           `yaml:"change_address"`
+	FeeRate          int64            `yaml:"fee_rate"`
+	MinConfirmations int              `yaml:"min_confirmations"`
+	Fireblocks       FireblocksConfig `yaml:"fireblocks"`
 }
 
 func LoadConfig(filePath string) (*Config, error) {
