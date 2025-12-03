@@ -46,13 +46,13 @@ func NewEntryPointWithABI(address common.Address, backend bind.ContractBackend, 
 
 func (contract *Contract) GetCurrentProposer() (common.Address, error) {
 	var out []interface{}
-	err := contract.contract.Call(&bind.CallOpts{}, &out, "nextSubmitter")
+	err := contract.contract.Call(&bind.CallOpts{}, &out, "nextProposer")
 	if err != nil {
 		return common.Address{}, fmt.Errorf("failed to get current proposer: %w", err)
 	}
 
 	if len(out) == 0 {
-		return common.Address{}, fmt.Errorf("no result returned from nextSubmitter call")
+		return common.Address{}, fmt.Errorf("no result returned from nextProposer call")
 	}
 
 	proposer, ok := out[0].(common.Address)
@@ -63,10 +63,27 @@ func (contract *Contract) GetCurrentProposer() (common.Address, error) {
 	return proposer, nil
 }
 
+// GetTssSigner returns the current tssSigner address from EntryPoint
+func (contract *Contract) GetTssSigner() (common.Address, error) {
+	var out []interface{}
+	err := contract.contract.Call(&bind.CallOpts{}, &out, "tssSigner")
+	if err != nil {
+		return common.Address{}, fmt.Errorf("failed to get tssSigner: %w", err)
+	}
+	if len(out) == 0 {
+		return common.Address{}, fmt.Errorf("no result returned from tssSigner call")
+	}
+	addr, ok := out[0].(common.Address)
+	if !ok {
+		return common.Address{}, fmt.Errorf("failed to convert tssSigner to address")
+	}
+	return addr, nil
+}
+
 // GenerateBridgeInTxData generates the transaction data for the bridgeIn function call
-func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction, batchId *big.Int) ([]byte, error) {
+func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction) ([]byte, error) {
 	// Convert the bridgeTxs to the format expected by the ABI
-	// The bridgeIn function expects: bridgeIn(IDogechain.BridgeTransaction[] memory bridgeTxs, uint256 batchId)
+	// The bridgeIn function expects: bridgeIn(IDogechain.BridgeTransaction[] memory bridgeTxs)
 
 	// Create the array type for BridgeTransaction[]
 	bridgeTransactionArrayType, err := abi.NewType("tuple[]", "struct BridgeTransaction[]", []abi.ArgumentMarshaling{
@@ -100,17 +117,16 @@ func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction, 
 	// Create arguments for the bridgeIn function
 	arguments := abi.Arguments{
 		{Type: bridgeTransactionArrayType, Name: "bridgeTxs"},
-		{Type: Uint256Type, Name: "batchId"},
 	}
 
 	// Pack the arguments
-	calldata, err := arguments.Pack(bridgeTransactionStructs, batchId)
+	calldata, err := arguments.Pack(bridgeTransactionStructs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to pack bridgeIn arguments: %w", err)
 	}
 
 	// Get the function selector for bridgeIn
-	bridgeInSelector := crypto.Keccak256([]byte("bridgeIn((address,uint256,bytes)[],uint256)"))[:4]
+	bridgeInSelector := crypto.Keccak256([]byte("bridgeIn((address,uint256,bytes)[])"))[:4]
 
 	// Combine function selector with calldata
 	txData := append(bridgeInSelector, calldata...)

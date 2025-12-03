@@ -29,8 +29,8 @@ type EventConfig struct {
 	IsActive        bool           `json:"is_active"`
 }
 
-// DetectedEvent represents a processed blockchain event
-type DetectedEvent struct {
+// BlockchainEvent represents a processed blockchain event (simplified, no DB persistence)
+type BlockchainEvent struct {
 	BlockNumber     uint64                 `json:"block_number"`
 	TxHash          common.Hash            `json:"tx_hash"`
 	LogIndex        uint                   `json:"log_index"`
@@ -38,7 +38,6 @@ type DetectedEvent struct {
 	EventName       string                 `json:"event_name"`
 	EventData       map[string]interface{} `json:"event_data"`
 	Timestamp       time.Time              `json:"timestamp"`
-	DatabaseID      uint                   `json:"database_id"`
 }
 
 // EventDetector monitors blockchain events
@@ -54,7 +53,7 @@ type EventDetector struct {
 	batchSize          uint64
 	scanInterval       time.Duration
 
-	eventChannel chan DetectedEvent
+	eventChannel chan BlockchainEvent
 	mu           sync.RWMutex
 	isRunning    bool
 
@@ -79,7 +78,7 @@ func NewEventDetector(rawAbiData string, configs []EventConfig, eventRepo *model
 		confirmationBlocks: 6,               // Default 6 confirmations
 		batchSize:          1000,            // Default batch size
 		scanInterval:       5 * time.Second, // Default 5 seconds
-		eventChannel:       make(chan DetectedEvent, 1000),
+		eventChannel:       make(chan BlockchainEvent, 1000),
 		logger:             log.WithField("component", "EventDetector"),
 	}
 
@@ -129,7 +128,7 @@ func CreateRequiredEventConfigs(cfg config.EventDetectionConfig, abiFilePath str
 	contractAddresses = append(contractAddresses, common.HexToAddress(cfg.ContractBridge))
 	eventNames = append(eventNames, eventTypes.EventNameBridgeOutFinished)
 	contractAddresses = append(contractAddresses, common.HexToAddress(cfg.ContractEntryPoint))
-	eventNames = append(eventNames, eventTypes.EventNameSubmitterChosen)
+	eventNames = append(eventNames, eventTypes.EventNameProposerSelected)
 	rawAbiData, configs, err := CreateEventConfig(abiFilePath, contractAddresses, eventNames)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create event config: %w", err)
@@ -147,18 +146,25 @@ func CreateEventConfig(abiFilePath string, contractAddresses []common.Address, e
 
 	// Validate all event names exist in ABI before creating configs
 	eventSignatures := make(map[string]string)
+	filteredEventNames := make([]string, 0, len(eventNames))
 	for _, eventName := range eventNames {
 		event, exists := parsedABI.Events[eventName]
 		if !exists {
-			return "", nil, fmt.Errorf("event %s not found in ABI", eventName)
+			log.Warnf("Event %s not found in ABI, skipping subscription", eventName)
+			continue
 		}
 		eventSignatures[eventName] = generateEventSignature(event)
+		filteredEventNames = append(filteredEventNames, eventName)
+	}
+
+	if len(filteredEventNames) == 0 {
+		return "", nil, fmt.Errorf("none of the requested events exist in ABI")
 	}
 
 	// Generate configs for all combinations of addresses and events
 	var configs []EventConfig
 	for _, contractAddress := range contractAddresses {
-		for _, eventName := range eventNames {
+		for _, eventName := range filteredEventNames {
 			configs = append(configs, EventConfig{
 				ContractAddress: contractAddress,
 				EventName:       eventName,
@@ -227,7 +233,6 @@ func (ed *EventDetector) initializeScanStates() error {
 		if err != nil {
 			// If scan state doesn't exist, create it with current last scanned block
 			newState := &models.EventScanState{
-				ContractAddress:    contractAddress,
 				LastScannedBlock:   ed.lastScannedBlock,
 				ConfirmationBlocks: ed.confirmationBlocks,
 				IsActive:           true,
@@ -268,7 +273,7 @@ func (ed *EventDetector) Stop() {
 }
 
 // EventChannel returns the channel for receiving detected events
-func (ed *EventDetector) EventChannel() <-chan DetectedEvent {
+func (ed *EventDetector) EventChannel() <-chan BlockchainEvent {
 	return ed.eventChannel
 }
 
@@ -298,50 +303,35 @@ func (ed *EventDetector) scanForEvents() error {
 		return fmt.Errorf("failed to get latest block: %w", err)
 	}
 
+	if latestBlock <= ed.lastScannedBlock {
+		return nil
+	}
+
 	// Apply confirmation blocks
 	confirmedBlock := latestBlock - ed.confirmationBlocks
 	if confirmedBlock <= ed.lastScannedBlock {
-		return nil // No new blocks to scan
+		return nil
 	}
 
 	// Calculate scan range
 	fromBlock := ed.lastScannedBlock + 1
-	toBlock := fromBlock + ed.batchSize - 1
-	if toBlock > confirmedBlock {
-		toBlock = confirmedBlock
-	}
+	toBlock := min(fromBlock+ed.batchSize-1, confirmedBlock)
 
 	ed.logger.Debugf("Scanning blocks %d to %d", fromBlock, toBlock)
 
-	// Scan each contract separately for better error handling
-	contractsScanned := make(map[string]bool)
-	for _, config := range ed.configs {
-		if !config.IsActive {
-			continue
-		}
-
-		contractAddr := config.ContractAddress.Hex()
-		if contractsScanned[contractAddr] {
-			continue // Skip if already scanned this contract
-		}
-
-		if err := ed.scanContractEvents(config, fromBlock, toBlock); err != nil {
-			ed.logger.Errorf("Failed to scan events for contract %s: %v", contractAddr, err)
-			// Continue with other contracts even if one fails
-		} else {
-			contractsScanned[contractAddr] = true
-		}
+	if err := ed.scanContractEvents(ed.configs, fromBlock, toBlock); err != nil {
+		return fmt.Errorf("failed to scan events: %w", err)
 	}
 
-	// Update scan states for all successfully scanned contracts
-	for contractAddr := range contractsScanned {
-		if ed.eventRepo != nil {
-			if err := ed.eventRepo.UpdateScanState(contractAddr, toBlock); err != nil {
-				ed.logger.Errorf("Failed to update scan state for contract %s: %v", contractAddr, err)
-			}
-		} else {
-			ed.logger.Debugf("Updated scan state for contract %s to block %d", contractAddr, toBlock)
-		}
+	tx := ed.eventRepo.BeginTransaction()
+
+	if err := ed.eventRepo.UpdateScanState(tx, toBlock); err != nil {
+		return fmt.Errorf("failed to update scan state: %w", err)
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	// Update last scanned block
@@ -350,84 +340,145 @@ func (ed *EventDetector) scanForEvents() error {
 	return nil
 }
 
-// scanContractEvents scans events for a specific contract
-func (ed *EventDetector) scanContractEvents(config EventConfig, fromBlock, toBlock uint64) error {
+// scanContractEvents scans events for all contracts
+func (ed *EventDetector) scanContractEvents(configs []EventConfig, fromBlock, toBlock uint64) error {
+	filterConfigs := make([]EventConfig, 0)
+	for _, config := range configs {
+		if config.IsActive {
+			filterConfigs = append(filterConfigs, config)
+		}
+	}
+
+	if len(filterConfigs) == 0 {
+		return nil
+	}
+
 	// Parse contract ABI
 	contractABI, err := abi.JSON(strings.NewReader(ed.ABI))
 	if err != nil {
 		return fmt.Errorf("failed to parse ABI: %w", err)
 	}
 
-	// Get event from ABI
-	event, exists := contractABI.Events[config.EventName]
-	if !exists {
-		return fmt.Errorf("event %s not found in ABI", config.EventName)
+	// Prepare addresses, topics and router table
+	//    - topics[0] contains multiple event signatures (OR)
+	//    - Addresses contains multiple addresses (OR)
+	//    - Router table: addrHex -> sigHex -> config
+	addrSet := make(map[string]struct{})
+	var addresses []common.Address
+
+	sigSet := make(map[common.Hash]struct{})
+	var sigs []common.Hash
+
+	type cfgBySig map[string]EventConfig   // sigHex -> config
+	cfgRouter := make(map[string]cfgBySig) // addrHex -> (sigHex -> config)
+
+	// Additional: topic0Hash -> abi.Event, avoid looking up event name later
+	eventsBySig := make(map[common.Hash]abi.Event)
+
+	for _, c := range configs {
+		ev, ok := contractABI.Events[c.EventName]
+		if !ok {
+			ed.logger.Warnf("event %s not found in ABI, skip this config (addr=%s)", c.EventName, c.ContractAddress.Hex())
+			continue
+		}
+		sig := ev.ID
+		sigHex := sig.Hex()
+		addrHex := c.ContractAddress.Hex()
+
+		// Collect addresses (deduplication)
+		if _, seen := addrSet[addrHex]; !seen {
+			addrSet[addrHex] = struct{}{}
+			addresses = append(addresses, c.ContractAddress)
+		}
+
+		// Collect signatures (deduplication)
+		if _, seen := sigSet[sig]; !seen {
+			sigSet[sig] = struct{}{}
+			sigs = append(sigs, sig)
+			eventsBySig[sig] = ev
+		}
+
+		// Router table
+		if _, ok := cfgRouter[addrHex]; !ok {
+			cfgRouter[addrHex] = make(cfgBySig)
+		}
+		cfgRouter[addrHex][sigHex] = c
 	}
 
-	// Create filter query
+	if len(addresses) == 0 || len(sigs) == 0 {
+		// All events are filtered out (e.g. event name not in ABI)
+		ed.logger.Warnf("no active events found in ABI, skip scanning")
+		return nil
+	}
+
+	// Assemble one-time FilterQuery
 	query := ethereum.FilterQuery{
 		FromBlock: big.NewInt(int64(fromBlock)),
 		ToBlock:   big.NewInt(int64(toBlock)),
-		Addresses: []common.Address{config.ContractAddress},
-		Topics:    [][]common.Hash{{event.ID}}, // Filter by event signature
+		Addresses: addresses,
+		Topics:    [][]common.Hash{sigs}, // topic0 contains multiple event signatures (OR)
 	}
 
-	// Get logs
+	// Fetch logs (one time)
 	logs, err := ed.client.FilterLogs(ed.ctx, query)
 	if err != nil {
 		return fmt.Errorf("failed to filter logs: %w", err)
 	}
 
-	// Process each log
+	// Process logs
+	var detectedCount int
 	for _, vlog := range logs {
-		detectedEvent, err := ed.parseEvent(vlog, config, contractABI, event)
+		if len(vlog.Topics) == 0 {
+			continue // Non-standard event log (no topic0), skip
+		}
+		addrHex := vlog.Address.Hex()
+		sigHex := vlog.Topics[0].Hex()
+
+		bySig, ok := cfgRouter[addrHex]
+		if !ok {
+			// Not in our batch of addresses (theoretically impossible, but just in case)
+			continue
+		}
+		cfg, ok := bySig[sigHex]
+		if !ok {
+			// This address's event is not configured (or you put multiple events together but only want some of them)
+			continue
+		}
+
+		evABI, ok := eventsBySig[vlog.Topics[0]]
+		if !ok {
+			// Event not cached in ABI (theoretically impossible)
+			continue
+		}
+
+		detectedEvent, err := ed.parseEvent(vlog, cfg, contractABI, evABI)
 		if err != nil {
-			ed.logger.Errorf("Failed to parse event: %v", err)
+			ed.logger.Errorf("Failed to parse event (addr=%s, event=%s, tx=%s): %v",
+				addrHex, cfg.EventName, vlog.TxHash.Hex(), err)
 			continue
 		}
 
-		// Save event to database immediately upon detection
-		dbEvent := &models.DetectedEvent{
-			BlockNumber:     detectedEvent.BlockNumber,
-			TxHash:          detectedEvent.TxHash.Hex(),
-			LogIndex:        detectedEvent.LogIndex,
-			ContractAddress: detectedEvent.ContractAddress.Hex(),
-			EventName:       detectedEvent.EventName,
-			Status:          "pending",
-		}
-
-		if ed.eventRepo != nil {
-			if err := ed.eventRepo.CreateDetectedEvent(dbEvent, detectedEvent.EventData); err != nil {
-				ed.logger.Errorf("Failed to save detected event to database: %v", err)
-				// Continue processing other events even if one fails to save
-			}
-		} else {
-			ed.logger.Debugf("Event detected but not persisted (database not available): %s", detectedEvent.EventName)
-			// Continue processing other events even if database is not available
-			continue
-		}
-
-		// Attach database ID to the detected event for processing
-		detectedEvent.DatabaseID = dbEvent.ID
-
-		// Send to channel (non-blocking)
+		// Send event directly to channel (no DB persistence for general events)
 		select {
 		case ed.eventChannel <- *detectedEvent:
+			detectedCount++
 		default:
-			ed.logger.Warn("Event channel is full, dropping event (but already saved to DB)")
+			ed.logger.Warn("Event channel is full, dropping event")
 		}
 	}
 
-	if len(logs) > 0 {
-		ed.logger.Infof("Detected and saved %d events for contract %s in blocks %d-%d",
-			len(logs), config.ContractAddress.Hex(), fromBlock, toBlock)
+	if detectedCount > 0 {
+		ed.logger.Infof(
+			"Detected %d events for %d contract(s) in blocks %d-%d",
+			detectedCount, len(addresses), fromBlock, toBlock,
+		)
 	}
 
 	return nil
 }
 
-// parseEvent parses a raw log into a DetectedEvent
-func (ed *EventDetector) parseEvent(vlog types.Log, config EventConfig, contractABI abi.ABI, event abi.Event) (*DetectedEvent, error) {
+// parseEvent parses a raw log into a BlockchainEvent
+func (ed *EventDetector) parseEvent(vlog types.Log, config EventConfig, contractABI abi.ABI, event abi.Event) (*BlockchainEvent, error) {
 	// Unpack event data
 	eventData := make(map[string]interface{})
 	err := contractABI.UnpackIntoMap(eventData, config.EventName, vlog.Data)
@@ -447,7 +498,7 @@ func (ed *EventDetector) parseEvent(vlog types.Log, config EventConfig, contract
 		}
 	}
 
-	return &DetectedEvent{
+	return &BlockchainEvent{
 		BlockNumber:     vlog.BlockNumber,
 		TxHash:          vlog.TxHash,
 		LogIndex:        vlog.Index,

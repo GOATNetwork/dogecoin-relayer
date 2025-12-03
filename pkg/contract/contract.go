@@ -1,6 +1,7 @@
 package contract
 
 import (
+	"context"
 	"fmt"
 	"math/big"
 	"os"
@@ -126,4 +127,28 @@ func LoadABIAndRawDataFromFile(abiFilePath string) (abi.ABI, string, error) {
 	}
 
 	return parsedABI, string(abiData), nil
+}
+
+// GetTssNonce returns the current TSS nonce from the entry point contract.
+func (contract *Contract) GetTssNonce(ctx context.Context) (*big.Int, error) {
+	if contract == nil || contract.contract == nil {
+		return nil, fmt.Errorf("contract binding not initialized")
+	}
+
+	callOpts := &bind.CallOpts{Context: ctx}
+	var results []interface{}
+	if err := contract.contract.Call(callOpts, &results, "tssNonce"); err != nil {
+		return nil, fmt.Errorf("failed to call tssNonce: %w", err)
+	}
+
+	if len(results) == 0 {
+		return nil, fmt.Errorf("tssNonce query returned no result")
+	}
+
+	nonce, ok := results[0].(*big.Int)
+	if !ok || nonce == nil {
+		return nil, fmt.Errorf("unexpected tssNonce type %T", results[0])
+	}
+
+	return new(big.Int).Set(nonce), nil
 }

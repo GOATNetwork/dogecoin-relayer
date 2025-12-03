@@ -36,20 +36,70 @@ func (r *UTXORepository) AddUTXO(utxo *UTXO, pubkeyBytes []byte, blockHash strin
 	return r.db.Create(utxo).Error
 }
 
-func (r *UTXORepository) UpdateUTXOStatusSpentByVins(vins []*VIN, spentBlock int64) error {
-	for _, vin := range vins {
-		err := r.db.Model(&UTXO{}).
-			Where("txid = ? AND out_index = ?", vin.Txid, vin.OutIndex).
-			Updates(map[string]interface{}{
-				"status":      UTXO_STATUS_SPENT,
-				"spent_block": spentBlock,
-				"updated_at":  time.Now(),
-			}).Error
-		if err != nil {
-			return err
-		}
+// BatchUpdateUTXOs updates multiple UTXOs in a single transaction
+func (r *UTXORepository) BatchUpdateUTXOs(utxos []*UTXO) error {
+	if len(utxos) == 0 {
+		return nil
 	}
-	return nil
+
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		now := time.Now()
+		for _, utxo := range utxos {
+			utxo.UpdatedAt = now
+			if err := tx.Save(utxo).Error; err != nil {
+				return fmt.Errorf("failed to update UTXO %s: %w", utxo.Uid, err)
+			}
+		}
+		return nil
+	})
+}
+
+// GetUnprocessedDepositUTXOs retrieves deposit UTXOs that haven't been processed
+func (r *UTXORepository) GetUnprocessedDepositUTXOs(lastProcessedId uint, batchSize int) ([]*UTXO, error) {
+	var utxos []*UTXO
+	err := r.db.Where(
+		"source = ? AND status = ? AND id > ?",
+		UTXO_SOURCE_DEPOSIT,
+		UTXO_STATUS_CONFIRMED,
+		lastProcessedId,
+	).Limit(batchSize).Find(&utxos).Error
+	
+	return utxos, err
+}
+
+// GetUnprocessedWithdrawalUTXOs retrieves withdrawal UTXOs that haven't been processed
+func (r *UTXORepository) GetUnprocessedWithdrawalUTXOs(lastProcessedId uint, batchSize int) ([]*UTXO, error) {
+	var utxos []*UTXO
+	err := r.db.Where(
+		"source = ? AND status = ? AND id > ?",
+		UTXO_SOURCE_WITHDRAWAL,
+		UTXO_STATUS_CONFIRMED,
+		lastProcessedId,
+	).Limit(batchSize).Find(&utxos).Error
+	
+	return utxos, err
+}
+
+func (r *UTXORepository) UpdateUTXOStatusSpentByVins(vins []*VIN, spentBlock int64) error {
+	if len(vins) == 0 {
+		return nil
+	}
+
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		for _, vin := range vins {
+			err := tx.Model(&UTXO{}).
+				Where("txid = ? AND out_index = ?", vin.Txid, vin.OutIndex).
+				Updates(map[string]interface{}{
+					"status":      UTXO_STATUS_SPENT,
+					"spent_block": spentBlock,
+					"updated_at":  time.Now(),
+				}).Error
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // VINRepository handles VIN database operations
@@ -181,4 +231,17 @@ func (s *StateRepository) UpdateSendOrderConfirmed(txid string, confirmBlock int
 
 func (s *StateRepository) UpdateUtxoStatusSpentByVins(vins []*VIN, spentBlock int64) error {
 	return s.UTXORepo.UpdateUTXOStatusSpentByVins(vins, spentBlock)
+}
+
+// Batch operations delegated to repositories
+func (s *StateRepository) BatchUpdateUTXOs(utxos []*UTXO) error {
+	return s.UTXORepo.BatchUpdateUTXOs(utxos)
+}
+
+func (s *StateRepository) GetUnprocessedDepositUTXOs(lastProcessedId uint, batchSize int) ([]*UTXO, error) {
+	return s.UTXORepo.GetUnprocessedDepositUTXOs(lastProcessedId, batchSize)
+}
+
+func (s *StateRepository) GetUnprocessedWithdrawalUTXOs(lastProcessedId uint, batchSize int) ([]*UTXO, error) {
+	return s.UTXORepo.GetUnprocessedWithdrawalUTXOs(lastProcessedId, batchSize)
 }

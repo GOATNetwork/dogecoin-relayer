@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -15,6 +16,7 @@ import (
 	"github.com/goat-network/dogecoin-relayer/pkg/contract"
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
+	"gorm.io/gorm"
 )
 
 // pollLoop continuously polls for new UTXOs
@@ -37,14 +39,21 @@ func (up *UtxoProcessor) pollLoop() {
 
 // scanNewUTXOs checks for new deposit UTXOs and processes them
 func (up *UtxoProcessor) scanNewUTXOs() error {
+	up.cleanupStaleSessions()
+
 	// Check if this node should process UTXOs
 	isProposer, err := up.isCurrentProposer()
 	if err != nil {
+		up.logger.Errorf("Failed to check proposer status: %v", err)
 		return fmt.Errorf("failed to check proposer status: %w", err)
 	}
 
+	// Add info level logging for debugging
+	up.logger.Infof("UTXO scan: isProposer=%v, proposerSet=%v, currentProposer=%s",
+		isProposer, up.proposerSet, up.currentProposer.Hex())
+
 	if !isProposer {
-		up.logger.Debug("Not the current proposer, skipping UTXO processing")
+		up.logger.Info("Not the current proposer, skipping UTXO processing")
 		return nil
 	}
 
@@ -63,6 +72,13 @@ func (up *UtxoProcessor) scanNewUTXOs() error {
 
 // scanDepositUTXOs handles deposit UTXO processing
 func (up *UtxoProcessor) scanDepositUTXOs() error {
+	// Add safety check to prevent infinite recursion
+	defer func() {
+		if r := recover(); r != nil {
+			up.logger.Errorf("Panic in scanDepositUTXOs: %v", r)
+		}
+	}()
+
 	// Query for new unprocessed deposit UTXOs
 	utxos, err := up.getUnprocessedDepositUTXOs()
 	if err != nil {
@@ -70,15 +86,39 @@ func (up *UtxoProcessor) scanDepositUTXOs() error {
 	}
 
 	if len(utxos) == 0 {
+		up.logger.Debug("No new deposit UTXOs to process")
 		return nil // No new UTXOs to process
 	}
 
 	up.logger.Infof("Found %d new deposit UTXOs to process", len(utxos))
 
-	// Group UTXOs into batches for bridge transactions
-	batches := up.groupUTXOsIntoBatches(utxos)
+	// Filter UTXOs with valid EVM addresses before batching
+	validUTXOs := make([]*models.UTXO, 0, len(utxos))
+	for _, utxo := range utxos {
+		if utxo.EvmAddr == "" {
+			up.logger.Warnf("Skipping UTXO %s: missing EVM address", utxo.Uid)
+			// Mark as processed to avoid reprocessing
+			if err := up.markUTXOsAsProcessed([]*models.UTXO{utxo}); err != nil {
+				up.logger.Errorf("Failed to mark invalid UTXO as processed: %v", err)
+			}
+			continue
+		}
+		validUTXOs = append(validUTXOs, utxo)
+	}
 
-	for _, batch := range batches {
+	if len(validUTXOs) == 0 {
+		up.logger.Info("No valid deposit UTXOs with EVM addresses to process")
+		return nil
+	}
+
+	up.logger.Infof("Processing %d valid deposit UTXOs (filtered from %d total)", len(validUTXOs), len(utxos))
+
+	// Group UTXOs into batches for bridge transactions
+	batches := up.groupUTXOsIntoBatches(validUTXOs)
+	up.logger.Infof("Created %d batches from %d UTXOs", len(batches), len(validUTXOs))
+
+	for i, batch := range batches {
+		up.logger.Infof("Processing batch %d/%d with %d UTXOs", i+1, len(batches), len(batch.UTXOs))
 		if err := up.processDepositBatch(batch); err != nil {
 			up.logger.Errorf("Failed to process deposit batch %s: %v", batch.ID.String(), err)
 			continue
@@ -157,12 +197,16 @@ func (up *UtxoProcessor) getUnprocessedDepositUTXOs() ([]*models.UTXO, error) {
 	var utxos []*models.UTXO
 
 	// Query for deposit UTXOs that haven't been processed yet
+	// NOTE: Previously this query filtered out rows with empty evm_addr.
+	// That caused valid deposit UTXOs to be skipped when evm_addr was not
+	// populated yet during ingestion. We now fetch by source/status/id only
+	// and defer the evm address check to the batching step, where UTXOs with
+	// missing EVM address are explicitly skipped with a warning.
 	err := up.conn.GetDB().Where(
-		"source = ? AND status = ? AND id > ? AND evm_addr != ?",
+		"source = ? AND status = ? AND id > ?",
 		models.UTXO_SOURCE_DEPOSIT,
 		models.UTXO_STATUS_CONFIRMED,
 		up.lastProcessedId,
-		"", // Non-empty EVM address required for deposits
 	).Limit(up.batchSize).Find(&utxos).Error
 
 	if err != nil {
@@ -212,18 +256,64 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*BridgeIn
 		UTXOs:             make([]*models.UTXO, 0),
 	}
 
+	// Pre-fetch all deposit records in a single query to avoid per-UTXO queries
+	// This prevents database lock contention
+	depositMap := make(map[string]models.Deposit)
+	if len(utxos) > 0 {
+		var deposits []models.Deposit
+		// Build condition for batch query
+		var conditions []map[string]interface{}
+		for _, utxo := range utxos {
+			conditions = append(conditions, map[string]interface{}{
+				"tx_id": utxo.Txid,
+				"vout":  utxo.OutIndex,
+			})
+		}
+		
+		// Query all deposits in one go
+		// Note: This uses OR conditions, which is less efficient but safer than N+1 queries
+		if len(conditions) > 0 {
+			query := up.conn.GetDB()
+			for i, cond := range conditions {
+				if i == 0 {
+					query = query.Where("tx_id = ? AND vout = ?", cond["tx_id"], cond["vout"])
+				} else {
+					query = query.Or("tx_id = ? AND vout = ?", cond["tx_id"], cond["vout"])
+				}
+			}
+			query.Find(&deposits)
+			
+			// Build map for quick lookup
+			for i := range deposits {
+				key := fmt.Sprintf("%s:%d", deposits[i].TxId, deposits[i].Vout)
+				depositMap[key] = deposits[i]
+			}
+		}
+	}
+
 	for _, utxo := range utxos {
-		// Validate UTXO has required data
-		if utxo.EvmAddr == "" {
-			up.logger.Warnf("Skipping UTXO %s: missing EVM address", utxo.Uid)
-			continue
+		// Create bridge transaction for this UTXO
+		// EVM address validation is now done before calling this function
+		// IMPORTANT: txBytes must be the raw Dogecoin transaction bytes (no-witness)
+		// We persist these in deposits.tx_bytes when scanning blocks; fetch them here.
+		var txBytes []byte
+		{
+			key := fmt.Sprintf("%s:%d", utxo.Txid, utxo.OutIndex)
+			if dep, exists := depositMap[key]; exists && len(dep.TxBytes) > 0 {
+				txBytes = dep.TxBytes
+			}
+			
+			if len(txBytes) == 0 {
+				// Fallback: use txid bytes if deposit record missing or tx bytes empty
+				up.logger.Warnf("Deposit raw bytes missing for %s:%d, falling back to txid bytes", utxo.Txid, utxo.OutIndex)
+				txBytes = []byte(utxo.Txid)
+			}
 		}
 
-		// Create bridge transaction for this UTXO
 		bridgeTx := contract.BridgeTransaction{
 			DestEvmAddress: common.HexToAddress(utxo.EvmAddr),
 			Amount:         big.NewInt(utxo.Amount),
-			TxBytes:        []byte(utxo.Txid), // Store transaction ID as bytes
+			TxBytes:        txBytes,
 		}
 
 		currentBatch.TransactionParams = append(currentBatch.TransactionParams, bridgeTx)
@@ -231,7 +321,7 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*BridgeIn
 		currentBatch.UTXOs = append(currentBatch.UTXOs, utxo)
 
 		// Check if batch is full (limit to prevent large transactions)
-		if len(currentBatch.TransactionParams) >= 5 {
+		if len(currentBatch.TransactionParams) >= 1 {
 			batches = append(batches, currentBatch)
 			currentBatch = &BridgeInBatch{
 				ID:                big.NewInt(time.Now().Unix() + int64(len(batches))),
@@ -250,54 +340,231 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*BridgeIn
 	return batches
 }
 
-// processDepositBatch processes a batch of deposit bridge transactions
-func (up *UtxoProcessor) processDepositBatch(batch *BridgeInBatch) error {
-	up.logger.Infof("Processing deposit bridge batch %s with %d transactions, total amount: %s DOGE",
-		batch.ID.String(), len(batch.TransactionParams), batch.TotalAmount.String())
+// pendingBatchRetryLoop monitors pending batches and retries failed sessions
+func (up *UtxoProcessor) pendingBatchRetryLoop() {
+	interval := up.tssRequestRetryBackoff / 2
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-	// Generate bridge transaction calldata
-	calldata, err := up.generateBridgeInCalldata(batch)
+	for {
+		select {
+		case <-up.ctx.Done():
+			up.logger.Info("Pending batch retry loop stopping...")
+			return
+		case <-ticker.C:
+			if err := up.retryPendingBatches(); err != nil {
+				up.logger.Errorf("Failed to retry pending batches: %v", err)
+			}
+		}
+	}
+}
+
+// retryPendingBatches checks and retries pending batches that may have failed
+func (up *UtxoProcessor) retryPendingBatches() error {
+	isProposer, err := up.isCurrentProposer()
 	if err != nil {
-		return fmt.Errorf("failed to generate bridge calldata: %w", err)
+		return fmt.Errorf("failed to check proposer status: %w", err)
 	}
 
-	up.logger.Infof("Generated bridge calldata: %x", calldata)
+	if !isProposer {
+		return nil // Only the current proposer actively retries
+	}
 
-	// Create session ID for TSS signing
+	now := time.Now()
+	retries := 0
+
+	up.pendingBatches.Range(func(key, value interface{}) bool {
+		currentKey, ok := key.(string)
+		if !ok {
+			return true
+		}
+
+		pending, ok := value.(*pendingBatch)
+		if !ok {
+			return true
+		}
+
+		if pending.nextRetryAt.IsZero() || now.Before(pending.nextRetryAt) {
+			return true
+		}
+
+		if up.tssRequestMaxRetries > 0 && pending.nextAttempt >= up.tssRequestMaxRetries {
+			up.logger.Warnf("Max retries reached for session %s (base %s)", currentKey, pending.baseSessionID)
+			return true
+		}
+
+		var retryErr error
+		switch pending.batchType {
+		case "deposit":
+			retryErr = up.retryDepositBatch(pending)
+		case "withdrawal":
+			retryErr = up.retryWithdrawalBatch(pending)
+		default:
+			up.logger.Warnf("Unknown pending batch type %s for session %s", pending.batchType, currentKey)
+			return true
+		}
+
+		if retryErr != nil {
+			up.logger.Errorf("Failed to retry pending batch %s: %v", currentKey, retryErr)
+		} else {
+			retries++
+		}
+
+		return true
+	})
+
+	if retries > 0 {
+		up.logger.Infof("Retried %d pending batches", retries)
+	}
+
+	return nil
+}
+
+func (up *UtxoProcessor) retryDepositBatch(pending *pendingBatch) error {
+	if pending.depositBatch == nil {
+		return fmt.Errorf("nil deposit batch")
+	}
+	if pending.baseSessionID == "" {
+		return fmt.Errorf("missing base session id")
+	}
+
+	up.logger.Infof("Retrying deposit batch for base session %s (next attempt %d)", pending.baseSessionID, pending.nextAttempt+1)
+	actualSession := up.assignNewTssSession(pending)
+	up.pendingBatches.Store(pending.baseSessionID, pending)
+	if err := up.requestTssSignature(pending.calldata, actualSession); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (up *UtxoProcessor) retryWithdrawalBatch(pending *pendingBatch) error {
+	if pending.withdrawalRequest == nil {
+		return fmt.Errorf("nil withdrawal request")
+	}
+	if pending.baseSessionID == "" {
+		return fmt.Errorf("missing base session id")
+	}
+
+	up.logger.Infof("Retrying withdrawal batch for base session %s (next attempt %d)", pending.baseSessionID, pending.nextAttempt+1)
+	actualSession := up.assignNewTssSession(pending)
+	up.pendingBatches.Store(pending.baseSessionID, pending)
+	return up.requestWithdrawalTssSignature(pending.calldata, actualSession, pending.withdrawalRequest)
+}
+
+// processDepositBatch processes a batch of deposit bridge transactions
+func (up *UtxoProcessor) processDepositBatch(batch *BridgeInBatch) error {
+	// Create session ID for TSS signing based on the batch contents
 	sessionID, err := up.generateSessionID(batch)
 	if err != nil {
 		return fmt.Errorf("failed to generate session ID: %w", err)
 	}
 
+	// Derive deterministic batch ID so every node rebuilds identical calldata
+	derivedID, err := deriveDeterministicIDFromSession(sessionID)
+	if err != nil {
+		up.logger.Errorf("Failed to derive deterministic batch ID for session %s: %v", sessionID, err)
+		return fmt.Errorf("failed to derive batch ID: %w", err)
+	}
+	batch.ID = derivedID
+	up.logger.Infof("Generated session ID: %s, derived batch ID: %s", sessionID, batch.ID.String())
+
+	up.logger.Infof("Processing deposit bridge batch %s with %d transactions, total amount: %s DOGE",
+		batch.ID.String(), len(batch.TransactionParams), batch.TotalAmount.String())
+
+	// Generate bridge transaction calldata using the deterministic batch ID
+	calldata, err := up.generateBridgeInCalldata(batch)
+	if err != nil {
+		return fmt.Errorf("failed to generate bridge calldata: %w", err)
+	}
+
+	calldataPreview := calldata
+	if len(calldata) > 64 {
+		calldataPreview = calldata[:64]
+	}
+	up.logger.Infof("Generated bridge calldata (%d bytes): %x...", len(calldata), calldataPreview)
+	up.logger.Debugf("Bridge calldata (full hex): %x", calldata)
+
+	// Fetch current TSS nonce to include in signing payload
+	tssNonce, err := up.fetchTssNonce()
+	if err != nil {
+		return fmt.Errorf("failed to fetch tss nonce: %w", err)
+	}
+	up.logger.Infof("Using TSS nonce %s for batch %s", tssNonce.String(), batch.ID.String())
+
+	// Add safety check for calldata size
+	if len(calldata) > 100000 { // 100KB limit
+		return fmt.Errorf("calldata too large: %d bytes", len(calldata))
+	}
+
 	// Store the pending batch data
 	pending := &pendingBatch{
-		batchType:    "deposit",
-		depositBatch: batch,
-		calldata:     calldata,
-		utxos:        batch.UTXOs,
+		batchType:     "deposit",
+		depositBatch:  batch,
+		calldata:      calldata,
+		utxos:         batch.UTXOs,
+		baseSessionID: sessionID,
+		tssNonce:      new(big.Int).Set(tssNonce),
 	}
-	up.pendingBatches.Store(sessionID, pending)
+	actualSessionID := up.assignNewTssSession(pending)
+	up.pendingBatches.Store(pending.baseSessionID, pending)
 
-	// Request TSS signature asynchronously
-	err = up.requestTssSignature(calldata, sessionID)
-	if err != nil {
-		// Clean up the pending batch on error
-		up.pendingBatches.Delete(sessionID)
+	// Add defer to clean up on panic
+	defer func() {
+		if r := recover(); r != nil {
+			up.logger.Errorf("Panic in TSS signature request: %v", r)
+			up.pendingBatches.Delete(pending.baseSessionID)
+			up.tssSessionAliases.Delete(actualSessionID)
+		}
+	}()
+
+	// Re-enable TSS with step-by-step logging and error handling
+	up.logger.Infof("Starting TSS signature request for batch %s", batch.ID.String())
+
+	// Add step-by-step logging to isolate the exact failure point
+	up.logger.Infof("Step 1: About to call requestTssSignature")
+
+	if err := up.requestTssSignature(calldata, actualSessionID); err != nil {
+		up.logger.Errorf("Initial TSS signature request failed for session %s: %v", actualSessionID, err)
+		now := time.Now()
+		retryDelay := up.tssRequestRetryBackoff
+		if retryDelay <= 0 {
+			retryDelay = 15 * time.Second
+		}
+		pending.lastAttempt = now
+		pending.nextRetryAt = now.Add(retryDelay)
+		up.pendingBatches.Store(pending.baseSessionID, pending)
 		return fmt.Errorf("failed to request TSS signature: %w", err)
 	}
 
-	// The actual signing will be handled by the event bus
-	up.logger.Infof("TSS signature requested for deposit batch %s", batch.ID.String())
+	up.logger.Infof("TSS signature requested successfully for deposit batch %s", batch.ID.String())
 
 	return nil
 }
 
 // processWithdrawalBatch processes a batch of withdrawal bridge transactions
 func (up *UtxoProcessor) processWithdrawalRequest(request *withdrawalRequest) error {
+	// Create session ID for TSS signing before building calldata
+	sessionID, err := up.generateWithdrawalSessionID(request)
+	if err != nil {
+		return fmt.Errorf("failed to generate session ID: %w", err)
+	}
+
+	// Align withdrawal request ID with session so all nodes compute identical calldata
+	derivedID, err := deriveDeterministicIDFromSession(sessionID)
+	if err != nil {
+		up.logger.Errorf("Failed to derive deterministic withdrawal ID for session %s: %v", sessionID, err)
+		return fmt.Errorf("failed to derive withdrawal ID: %w", err)
+	}
+	request.ID = derivedID
+	up.logger.Infof("Generated withdrawal session ID: %s, derived withdrawal ID: %s", sessionID, request.ID.String())
+
 	up.logger.Infof("Processing withdrawal request %s with single UTXO %s, total amount: %s DOGE",
 		request.ID.String(), request.UTXO.Uid, request.TotalAmount.String())
 
-	// Generate bridgeOutFinish calldata for withdrawal
+	// Generate bridgeOutFinish calldata for withdrawal using the deterministic request ID
 	calldata, err := up.generateBridgeOutFinishCalldata(request)
 	if err != nil {
 		return fmt.Errorf("failed to generate bridgeOutFinish calldata: %w", err)
@@ -305,11 +572,12 @@ func (up *UtxoProcessor) processWithdrawalRequest(request *withdrawalRequest) er
 
 	up.logger.Infof("Generated bridgeOutFinish calldata: %x", calldata)
 
-	// Create session ID for TSS signing
-	sessionID, err := up.generateWithdrawalSessionID(request)
+	// Fetch current TSS nonce
+	tssNonce, err := up.fetchTssNonce()
 	if err != nil {
-		return fmt.Errorf("failed to generate session ID: %w", err)
+		return fmt.Errorf("failed to fetch tss nonce: %w", err)
 	}
+	up.logger.Infof("Using TSS nonce %s for withdrawal request %s", tssNonce.String(), request.ID.String())
 
 	// Store the pending request data
 	pending := &pendingBatch{
@@ -317,14 +585,23 @@ func (up *UtxoProcessor) processWithdrawalRequest(request *withdrawalRequest) er
 		withdrawalRequest: request,
 		calldata:          calldata,
 		utxos:             []*models.UTXO{request.UTXO}, // Convert single UTXO to slice for compatibility
+		baseSessionID:     sessionID,
+		tssNonce:          new(big.Int).Set(tssNonce),
 	}
-	up.pendingBatches.Store(sessionID, pending)
+	actualSessionID := up.assignNewTssSession(pending)
+	up.pendingBatches.Store(pending.baseSessionID, pending)
 
 	// Request TSS signature asynchronously
-	err = up.requestWithdrawalTssSignature(calldata, sessionID, request)
-	if err != nil {
-		// Clean up the pending request on error
-		up.pendingBatches.Delete(sessionID)
+	if err := up.requestWithdrawalTssSignature(calldata, actualSessionID, request); err != nil {
+		up.logger.Errorf("Initial withdrawal TSS request failed for session %s: %v", actualSessionID, err)
+		now := time.Now()
+		retryDelay := up.tssRequestRetryBackoff
+		if retryDelay <= 0 {
+			retryDelay = 15 * time.Second
+		}
+		pending.lastAttempt = now
+		pending.nextRetryAt = now.Add(retryDelay)
+		up.pendingBatches.Store(pending.baseSessionID, pending)
 		return fmt.Errorf("failed to request TSS signature: %w", err)
 	}
 
@@ -397,7 +674,7 @@ func (up *UtxoProcessor) generateWithdrawalSessionID(request *withdrawalRequest)
 	// Take the first 16 characters of the hash for a reasonably short but unique session ID
 	shortHash := hashHex[:16]
 
-	return fmt.Sprintf("withdrawal-session-%s", shortHash), nil
+	return fmt.Sprintf("session-%s", shortHash), nil
 }
 
 // generateBridgeInCalldata generates the calldata for bridge transactions
@@ -407,12 +684,39 @@ func (up *UtxoProcessor) generateBridgeInCalldata(batch *BridgeInBatch) ([]byte,
 	}
 
 	// Generate the bridge transaction calldata
-	calldata, err := up.contractBuilder.GenerateBridgeInTxData(batch.TransactionParams, batch.ID)
+	calldata, err := up.contractBuilder.GenerateBridgeInTxData(batch.TransactionParams)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate bridge transaction data: %w", err)
 	}
 
 	return calldata, nil
+}
+
+func deriveDeterministicIDFromSession(sessionID string) (*big.Int, error) {
+	result := new(big.Int)
+	if sessionID == "" {
+		return result, fmt.Errorf("empty session id")
+	}
+
+	// Try to find the last "-" and extract the suffix
+	idx := strings.LastIndex(sessionID, "-")
+	if idx == -1 || idx+1 >= len(sessionID) {
+		// If no "-" found, use the whole session ID as suffix
+		suffix := sessionID
+		if _, ok := result.SetString(suffix, 16); ok {
+			return result, nil
+		}
+	} else {
+		suffix := sessionID[idx+1:]
+		if _, ok := result.SetString(suffix, 16); ok {
+			return result, nil
+		}
+	}
+
+	// Fall back to hashing the whole session ID for deterministic behavior
+	hash := crypto.Keccak256Hash([]byte(sessionID))
+	result.SetBytes(hash.Bytes())
+	return result, nil // Return nil error since this is a valid fallback
 }
 
 // generateBridgeOutFinishCalldata generates the calldata for bridgeOutFinish function
@@ -456,32 +760,38 @@ func (up *UtxoProcessor) generateBridgeOutFinishCalldata(request *withdrawalRequ
 
 // markUTXOsAsProcessed marks UTXOs as processed to avoid reprocessing
 func (up *UtxoProcessor) markUTXOsAsProcessed(utxos []*models.UTXO) error {
-	// Update UTXOs to mark as processed (we could add a "processed" status or use a separate table)
-	// For now, we'll update the UpdatedAt timestamp to track processing
-	for _, utxo := range utxos {
-		utxo.UpdatedAt = time.Now()
-		if err := up.conn.GetDB().Save(utxo).Error; err != nil {
-			return fmt.Errorf("failed to mark UTXO %s as processed: %w", utxo.Uid, err)
-		}
+	if len(utxos) == 0 {
+		return nil
 	}
 
-	up.logger.Debugf("Marked %d UTXOs as processed", len(utxos))
-	return nil
+	// Use a single transaction for all updates to prevent database corruption
+	return up.conn.GetDB().Transaction(func(tx *gorm.DB) error {
+		now := time.Now()
+		for _, utxo := range utxos {
+			utxo.UpdatedAt = now
+			if err := tx.Save(utxo).Error; err != nil {
+				return fmt.Errorf("failed to mark UTXO %s as processed: %w", utxo.Uid, err)
+			}
+		}
+		up.logger.Debugf("Marked %d UTXOs as processed in transaction", len(utxos))
+		return nil
+	})
 }
 
 // requestTssSignature creates a batch proposal, sends it to other nodes, and requests TSS signature
 func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) error {
+	up.logger.Infof("Step 2: Entering requestTssSignature for session %s", sessionID)
+
 	if up.chainID == nil {
 		return fmt.Errorf("chain ID not set")
 	}
 
 	// Get the current batch from pending batches to create the proposal
-	pendingData, exists := up.pendingBatches.Load(sessionID)
+	up.logger.Infof("Step 3: Loading pending batch for session %s", sessionID)
+	_, pending, exists := up.loadPendingForSession(sessionID)
 	if !exists {
 		return fmt.Errorf("no pending batch found for session %s", sessionID)
 	}
-
-	pending := pendingData.(*pendingBatch)
 
 	// This function should only be called for deposit batches
 	if pending.batchType != "deposit" || pending.depositBatch == nil {
@@ -489,6 +799,7 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 	}
 
 	batch := pending.depositBatch
+	up.logger.Infof("Step 4: Batch loaded, getting proposer address")
 
 	// Get this node's Ethereum address (proposer)
 	proposerAddress, err := up.getNodeEthereumAddress()
@@ -497,7 +808,13 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 	}
 
 	// Create batch ID from session ID for consistency
-	batchID := fmt.Sprintf("batch-%s", sessionID)
+	baseSessionID := pending.baseSessionID
+	if baseSessionID == "" {
+		baseSessionID = sessionID
+	}
+
+	batchID := fmt.Sprintf("batch-%s", baseSessionID)
+	up.logger.Infof("Step 5: Creating deposit proposal for batch %s", batchID)
 
 	// Create the deposit proposal for the batch
 	proposal := NewDepositProposal(
@@ -505,10 +822,12 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 		batch.UTXOs,
 		batch.TotalAmount,
 		calldata,
+		pending.tssNonce,
 		proposerAddress.Hex(),
 		sessionID,
 	)
 
+	up.logger.Infof("Step 6: Sending proposal to P2P network")
 	// Send proposal to other P2P nodes
 	if err := up.sendProposalToP2P(proposal); err != nil {
 		up.logger.Errorf("Failed to send proposal to P2P network: %v", err)
@@ -517,35 +836,63 @@ func (up *UtxoProcessor) requestTssSignature(calldata []byte, sessionID string) 
 		up.logger.Infof("Batch proposal sent to P2P network for session %s", sessionID)
 	}
 
+	up.logger.Infof("Step 7: Creating hash and calling TSS sign")
 	// Create hash to sign for verifyAndCall function
-	// This would typically be: keccak256(abi.encode(targets, calldata, tssNonce, chainID))
-	// For simplicity, we'll use the calldata hash directly
-	hash := crypto.Keccak256(calldata)
+	if pending.tssNonce == nil {
+		return fmt.Errorf("pending batch missing tss nonce")
+	}
+
+	digest, baseHash, err := up.computeVerifyAndCallDigest(calldata, pending.tssNonce)
+	if err != nil {
+		return fmt.Errorf("failed to compute signing digest: %w", err)
+	}
+
+	// Print calldata hash for debugging
+	up.logger.Infof("verifyAndCall base hash: %x (nonce=%s)", baseHash[:], pending.tssNonce.String())
+	up.logger.Infof("Signing digest for TSS (keccak with prefix) %x", digest)
+	up.logger.Infof("Calldata length: %d bytes", len(calldata))
 
 	// Request TSS signature using the callTssSign function
-	up.callTssSign(sessionID, hash)
-	up.logger.Infof("TSS signing requested for batch %s with session ID: %s", batchID, sessionID)
+	up.callTssSign(sessionID, digest)
+	up.logger.Infof("TSS signing requested for batch %s with session %s (base session %s)", batchID, sessionID, baseSessionID)
 
 	return nil
 }
 
 // sendProposalToP2P sends the batch proposal to other P2P nodes
 func (up *UtxoProcessor) sendProposalToP2P(proposal *DepositProposal) error {
+	up.logger.Infof("Step 6.1: Getting P2P module")
 	p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
 	if !ok {
 		return fmt.Errorf("p2p module not found")
 	}
 
+	up.logger.Infof("Step 6.2: Marshaling proposal to JSON")
 	payload, err := proposal.MarshalJSON()
 	if err != nil {
 		return fmt.Errorf("failed to marshal proposal: %v", err)
 	}
 
-	return p2pModule.(p2p.P2PSender).BroadcastP2PMessage(types.P2PBroadcastMessage{
+	up.logger.Infof("Step 6.3: Proposal marshaled successfully, size: %d bytes", len(payload))
+
+	// Add size limit for P2P messages
+	if len(payload) > 50000 { // 50KB limit
+		return fmt.Errorf("P2P message too large: %d bytes", len(payload))
+	}
+
+	up.logger.Infof("Step 6.4: Broadcasting P2P message")
+	err = p2pModule.(p2p.P2PSender).BroadcastP2PMessage(types.P2PBroadcastMessage{
 		Type:      types.P2PMessageTypeDepositProposal,
 		SessionID: proposal.SessionID,
 		Payload:   payload,
 	})
+
+	if err != nil {
+		return fmt.Errorf("failed to broadcast P2P message: %w", err)
+	}
+
+	up.logger.Infof("Step 6.5: P2P message broadcast completed")
+	return nil
 }
 
 // requestWithdrawalTssSignature creates a withdrawal proposal and requests TSS signature
@@ -560,8 +907,19 @@ func (up *UtxoProcessor) requestWithdrawalTssSignature(calldata []byte, sessionI
 		return fmt.Errorf("failed to get proposer address: %w", err)
 	}
 
-	// Create request ID from session ID for consistency
-	requestID := fmt.Sprintf("withdrawal-request-%s", sessionID)
+	// Load pending to access base session ID
+	_, pending, exists := up.loadPendingForSession(sessionID)
+	if !exists {
+		return fmt.Errorf("no pending withdrawal batch found for session %s", sessionID)
+	}
+
+	baseSessionID := pending.baseSessionID
+	if baseSessionID == "" {
+		baseSessionID = sessionID
+	}
+
+	// Create request ID from base session ID for consistency
+	requestID := fmt.Sprintf("withdrawal-request-%s", baseSessionID)
 
 	// Create the withdrawal proposal for the request
 	proposal := NewWithdrawalProposal(
@@ -570,6 +928,7 @@ func (up *UtxoProcessor) requestWithdrawalTssSignature(calldata []byte, sessionI
 		request.TotalAmount,
 		calldata,
 		request.TaskIds,
+		pending.tssNonce,
 		proposerAddress.Hex(),
 		sessionID,
 	)
@@ -583,11 +942,23 @@ func (up *UtxoProcessor) requestWithdrawalTssSignature(calldata []byte, sessionI
 	}
 
 	// Create hash to sign for verifyAndCall function
-	hash := crypto.Keccak256(calldata)
+	if pending.tssNonce == nil {
+		return fmt.Errorf("pending withdrawal batch missing tss nonce")
+	}
+
+	digest, baseHash, err := up.computeVerifyAndCallDigest(calldata, pending.tssNonce)
+	if err != nil {
+		return fmt.Errorf("failed to compute withdrawal signing digest: %w", err)
+	}
+
+	// Print calldata hash for debugging
+	up.logger.Infof("Withdrawal verifyAndCall base hash: %x (nonce=%s)", baseHash[:], pending.tssNonce.String())
+	up.logger.Infof("Withdrawal signing digest: %x", digest)
+	up.logger.Infof("Withdrawal calldata length: %d bytes", len(calldata))
 
 	// Request TSS signature using the callTssSign function
-	up.callTssSign(sessionID, hash)
-	up.logger.Infof("TSS signing requested for withdrawal request %s with session ID: %s", requestID, sessionID)
+	up.callTssSign(sessionID, digest)
+	up.logger.Infof("TSS signing requested for withdrawal request %s with session %s (base session %s)", requestID, sessionID, baseSessionID)
 
 	return nil
 }

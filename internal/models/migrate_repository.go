@@ -21,13 +21,19 @@ func NewMigrateRepository(db *gorm.DB) *MigrateRepository {
 }
 
 func (r *MigrateRepository) initMigrateList() {
-	r.migrateList = make(map[uint64]func() error)
+    r.migrateList = make(map[uint64]func() error)
 
 	// Migration 1: Create basic migration log table
 	r.migrateList[1] = r.createMigrationLogTable
 
 	// Migration 2: Create event detection tables
 	r.migrateList[2] = r.createEventDetectionTables
+
+    // Migration 3: Create consensus-related tables
+    r.migrateList[3] = r.createConsensusTables
+
+    // Migration 4: Create scanner-related tables (UTXO/VIN/VOUT/SendOrder)
+    r.migrateList[4] = r.createScannerTables
 }
 
 func (r *MigrateRepository) DoMigrate() error {
@@ -47,8 +53,24 @@ func (r *MigrateRepository) createMigrationLogTable() error {
 
 func (r *MigrateRepository) createEventDetectionTables() error {
 	return r.db.AutoMigrate(
-		&DetectedEvent{},
 		&EventScanState{},
-		&EventProcessingLog{},
 	)
+}
+
+func (r *MigrateRepository) createConsensusTables() error {
+    return r.db.AutoMigrate(
+        &Deposit{},
+        &Withdrawal{},
+        &Proposers{},
+    )
+}
+
+// createScannerTables creates tables used by the Doge scanner/pipeline
+func (r *MigrateRepository) createScannerTables() error {
+    return r.db.AutoMigrate(
+        &UTXO{},
+        &VIN{},
+        &VOUT{},
+        &SendOrder{},
+    )
 }

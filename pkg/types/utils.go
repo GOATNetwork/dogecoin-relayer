@@ -1,13 +1,33 @@
 package types
 
 import (
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"os"
+	"slices"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
 )
+
+// DecodeDogecoinHash decodes a transaction or block hash from big-endian hex string to little-endian byte slice
+func DecodeDogecoinHash(hash string) ([]byte, error) {
+	data, err := hex.DecodeString(hash)
+	if err != nil {
+		return nil, err
+	}
+	txid := slices.Clone(data)
+	slices.Reverse(txid)
+	return txid, nil
+}
+
+// EncodeDogecoinHash encodes a transaction or block hash from little-endian byte slice to big-endian hex string
+func EncodeDogecoinHash(hash []byte) (string, error) {
+	txid := slices.Clone(hash)
+	slices.Reverse(txid)
+	return hex.EncodeToString(txid), nil
+}
 
 func ParseScientificNotation(input string) (*big.Int, bool) {
 	// check if contains 'e' or 'E'

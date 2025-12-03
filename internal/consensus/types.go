@@ -7,33 +7,106 @@ import (
 	"github.com/goat-network/dogecoin-relayer/internal/models"
 )
 
-// DepositProposal represents a batch proposal for processing multiple UTXOs
-type DepositProposal struct {
-	BatchID     string         `json:"batch_id"`     // Unique identifier for this batch
-	UTXOs       []*models.UTXO `json:"utxos"`        // List of UTXOs in this batch
-	TotalAmount *big.Int       `json:"total_amount"` // Total amount across all UTXOs
-	Calldata    []byte         `json:"calldata"`     // Generated calldata for the batch
-	Proposer    string         `json:"proposer"`     // Address of the proposer node
-	SessionID   string         `json:"session_id"`   // TSS session ID for signing
+// LightweightUTXO contains only essential UTXO data for P2P messages
+type LightweightUTXO struct {
+	Uid      string `json:"uid"`
+	Txid     string `json:"txid"`
+	OutIndex int    `json:"out_index"`
+	Amount   int64  `json:"amount"`
+	Receiver string `json:"receiver"`
+	EvmAddr  string `json:"evm_addr"`
 }
 
-func NewDepositProposal(batchID string, utxos []*models.UTXO, totalAmount *big.Int, calldata []byte, proposer, sessionID string) *DepositProposal {
-	return &DepositProposal{
-		BatchID:     batchID,
-		UTXOs:       utxos,
-		TotalAmount: totalAmount,
-		Calldata:    calldata,
-		Proposer:    proposer,
-		SessionID:   sessionID,
+// ToLightweight converts a full UTXO to a lightweight version for P2P
+func ToLightweightUTXO(utxo *models.UTXO) *LightweightUTXO {
+	return &LightweightUTXO{
+		Uid:      utxo.Uid,
+		Txid:     utxo.Txid,
+		OutIndex: utxo.OutIndex,
+		Amount:   utxo.Amount,
+		Receiver: utxo.Receiver,
+		EvmAddr:  utxo.EvmAddr,
 	}
 }
 
+// DepositProposal represents a batch proposal for processing multiple UTXOs
+type DepositProposal struct {
+	BatchID          string             `json:"batch_id"`          // Unique identifier for this batch
+	LightweightUTXOs []*LightweightUTXO `json:"lightweight_utxos"` // Lightweight UTXO data for P2P
+	TotalAmountStr   string             `json:"total_amount"`      // Total amount as string to avoid big.Int issues
+	Proposer         string             `json:"proposer"`          // Address of the proposer node
+	SessionID        string             `json:"session_id"`        // TSS session ID for signing
+	TssNonceStr      string             `json:"tss_nonce"`         // TSS nonce encoded as decimal string
+
+	// Keep original data for internal use (not serialized in P2P)
+	UTXOs       []*models.UTXO `json:"-"` // Original UTXOs (excluded from JSON)
+	Calldata    []byte         `json:"-"` // Calldata (excluded from JSON)
+	TotalAmount *big.Int       `json:"-"` // Original big.Int (excluded from JSON)
+	TssNonce    *big.Int       `json:"-"`
+}
+
+func NewDepositProposal(batchID string, utxos []*models.UTXO, totalAmount *big.Int, calldata []byte, tssNonce *big.Int, proposer, sessionID string) *DepositProposal {
+	// Convert full UTXOs to lightweight versions for P2P
+	lightweightUTXOs := make([]*LightweightUTXO, len(utxos))
+	for i, utxo := range utxos {
+		lightweightUTXOs[i] = ToLightweightUTXO(utxo)
+	}
+
+	return &DepositProposal{
+		BatchID:          batchID,
+		LightweightUTXOs: lightweightUTXOs,
+		TotalAmountStr:   totalAmount.String(), // Convert to string for safe JSON
+		Proposer:         proposer,
+		SessionID:        sessionID,
+		TssNonceStr:      tssNonce.String(),
+		UTXOs:            utxos,       // Keep original for internal use
+		Calldata:         calldata,    // Keep original for internal use
+		TotalAmount:      totalAmount, // Keep original for internal use
+		TssNonce:         new(big.Int).Set(tssNonce),
+	}
+}
+
+// P2PDepositProposal is a lightweight version for P2P transmission only
+type P2PDepositProposal struct {
+	BatchID          string             `json:"batch_id"`
+	LightweightUTXOs []*LightweightUTXO `json:"lightweight_utxos"`
+	TotalAmountStr   string             `json:"total_amount"`
+	Proposer         string             `json:"proposer"`
+	SessionID        string             `json:"session_id"`
+	TssNonceStr      string             `json:"tss_nonce"`
+}
+
 func (d *DepositProposal) MarshalJSON() ([]byte, error) {
-	return json.Marshal(d)
+	// Create a lightweight version for P2P transmission
+	p2pProposal := &P2PDepositProposal{
+		BatchID:          d.BatchID,
+		LightweightUTXOs: d.LightweightUTXOs,
+		TotalAmountStr:   d.TotalAmountStr,
+		Proposer:         d.Proposer,
+		SessionID:        d.SessionID,
+		TssNonceStr:      d.TssNonceStr,
+	}
+	return json.Marshal(p2pProposal)
 }
 
 func (d *DepositProposal) UnmarshalJSON(data []byte) error {
-	return json.Unmarshal(data, d)
+	// Unmarshal to lightweight P2P structure first
+	p2pProposal := &P2PDepositProposal{}
+	err := json.Unmarshal(data, p2pProposal)
+	if err != nil {
+		return err
+	}
+
+	// Copy data from P2P structure to full structure
+	d.BatchID = p2pProposal.BatchID
+	d.LightweightUTXOs = p2pProposal.LightweightUTXOs
+	d.TotalAmountStr = p2pProposal.TotalAmountStr
+	d.Proposer = p2pProposal.Proposer
+	d.SessionID = p2pProposal.SessionID
+	d.TssNonceStr = p2pProposal.TssNonceStr
+
+	// Don't set UTXOs, Calldata, TotalAmount - these will be set separately
+	return nil
 }
 
 // WithdrawalProposal represents a batch proposal for processing withdrawal UTXOs
@@ -45,9 +118,11 @@ type WithdrawalProposal struct {
 	TaskIds     []*big.Int     `json:"task_ids"`     // Task IDs associated with this withdrawal batch
 	Proposer    string         `json:"proposer"`     // Address of the proposer node
 	SessionID   string         `json:"session_id"`   // TSS session ID for signing
+	TssNonceStr string         `json:"tss_nonce"`
+	TssNonce    *big.Int       `json:"-"`
 }
 
-func NewWithdrawalProposal(batchID string, utxos []*models.UTXO, totalAmount *big.Int, calldata []byte, taskIds []*big.Int, proposer, sessionID string) *WithdrawalProposal {
+func NewWithdrawalProposal(batchID string, utxos []*models.UTXO, totalAmount *big.Int, calldata []byte, taskIds []*big.Int, tssNonce *big.Int, proposer, sessionID string) *WithdrawalProposal {
 	return &WithdrawalProposal{
 		BatchID:     batchID,
 		UTXOs:       utxos,
@@ -56,6 +131,8 @@ func NewWithdrawalProposal(batchID string, utxos []*models.UTXO, totalAmount *bi
 		TaskIds:     taskIds,
 		Proposer:    proposer,
 		SessionID:   sessionID,
+		TssNonceStr: tssNonce.String(),
+		TssNonce:    new(big.Int).Set(tssNonce),
 	}
 }
 

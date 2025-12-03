@@ -1,6 +1,9 @@
 package doge
 
 import (
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 
 	"github.com/dogecoinw/doged/btcutil"
@@ -88,9 +91,30 @@ func (c *DogeClient) GetBlockHash(height int64) (*chainhash.Hash, error) {
 
 // GetBlock returns block information
 func (c *DogeClient) GetBlock(blockHash *chainhash.Hash) (*wire.MsgBlock, error) {
+	// NOTE: doged/rpcclient.GetBlock uses an integer verbosity param (0),
+	// which Dogecoin Core rejects with code -1 (expects boolean).
+	// To ensure compatibility, explicitly call RawRequest with boolean false
+	// and decode the returned hex ourselves.
 	timer := metrics.NewTimer("doge", "get_block")
 
-	result, err := c.client.GetBlock(blockHash)
+	if blockHash == nil {
+		timer.RecordFailure()
+		metrics.DogeRPCCalls.WithLabelValues("GetBlock", "failure").Inc()
+		return nil, fmt.Errorf("nil block hash")
+	}
+
+	// Build JSON-RPC params: [hash, false]
+	hashJSON, err := json.Marshal(blockHash.String())
+	if err != nil {
+		timer.RecordFailure()
+		metrics.DogeRPCCalls.WithLabelValues("GetBlock", "failure").Inc()
+		metrics.RecordError("doge", "marshal_failed")
+		return nil, fmt.Errorf("marshal hash: %w", err)
+	}
+	// Use explicit boolean false for non-verbose (hex) response
+	verboseJSON := json.RawMessage([]byte("false"))
+
+	res, err := c.client.RawRequest("getblock", []json.RawMessage{json.RawMessage(hashJSON), verboseJSON})
 	if err != nil {
 		timer.RecordFailure()
 		metrics.DogeRPCCalls.WithLabelValues("GetBlock", "failure").Inc()
@@ -98,10 +122,35 @@ func (c *DogeClient) GetBlock(blockHash *chainhash.Hash) (*wire.MsgBlock, error)
 		return nil, err
 	}
 
+	// Unmarshal result as hex string
+	var blockHex string
+	if err := json.Unmarshal(res, &blockHex); err != nil {
+		timer.RecordFailure()
+		metrics.DogeRPCCalls.WithLabelValues("GetBlock", "failure").Inc()
+		metrics.RecordError("doge", "unmarshal_failed")
+		return nil, fmt.Errorf("unmarshal getblock result: %w", err)
+	}
+
+	// Decode hex and deserialize to wire.MsgBlock
+	serializedBlock, err := hex.DecodeString(blockHex)
+	if err != nil {
+		timer.RecordFailure()
+		metrics.DogeRPCCalls.WithLabelValues("GetBlock", "failure").Inc()
+		metrics.RecordError("doge", "hex_decode_failed")
+		return nil, fmt.Errorf("decode block hex: %w", err)
+	}
+
+	var msgBlock wire.MsgBlock
+	if err := msgBlock.Deserialize(bytes.NewReader(serializedBlock)); err != nil {
+		timer.RecordFailure()
+		metrics.DogeRPCCalls.WithLabelValues("GetBlock", "failure").Inc()
+		metrics.RecordError("doge", "deserialize_failed")
+		return nil, fmt.Errorf("deserialize block: %w", err)
+	}
+
 	timer.RecordSuccess()
 	metrics.DogeRPCCalls.WithLabelValues("GetBlock", "success").Inc()
-
-	return result, nil
+	return &msgBlock, nil
 }
 
 // GetRawTransaction returns raw transaction information

@@ -48,13 +48,16 @@ func (c *SignClient) getUrl(uri string) string {
 	if c.cfg.Url == "" {
 		return ""
 	}
+
+	// Ensure URI starts with /
 	if !strings.HasPrefix(uri, "/") {
 		uri = "/" + uri
 	}
-	if !strings.HasSuffix(c.cfg.Url, "/") {
-		c.cfg.Url += "/"
-	}
-	return c.cfg.Url + uri
+
+	// Remove trailing slash from base URL to avoid double slashes
+	baseUrl := strings.TrimSuffix(c.cfg.Url, "/")
+
+	return baseUrl + uri
 }
 
 func (c *SignClient) StartSign(ctx context.Context, sessionID string, unsignHash []byte) (*tsstypes.SignStartResponse, error) {
@@ -77,15 +80,25 @@ func (c *SignClient) StartSign(ctx context.Context, sessionID string, unsignHash
 	if url == "" {
 		return nil, fmt.Errorf("tss url is not set")
 	}
+
+	c.logger.Infof("TSS request: URL=%s, SessionID=%s, Hash=%x, HashLength=%d", url, sessionID, unsignHash, len(unsignHash))
 	resp, err := c.httpClient.Post(url, "application/json", bytes.NewBuffer(body))
 	if err != nil {
 		return nil, fmt.Errorf("http request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	c.logger.Infof("TSS response: Status=%d", resp.StatusCode)
+
+	// Read response body for debugging
+	var responseBody bytes.Buffer
+	responseBody.ReadFrom(resp.Body)
+	responseBodyStr := responseBody.String()
+	c.logger.Infof("TSS response body: %s", responseBodyStr)
+
 	var signStartResponse tsstypes.SignStartResponse
-	if err := json.NewDecoder(resp.Body).Decode(&signStartResponse); err != nil {
-		return nil, fmt.Errorf("failed to decode sign start response: %w", err)
+	if err := json.Unmarshal(responseBody.Bytes(), &signStartResponse); err != nil {
+		return nil, fmt.Errorf("failed to decode sign start response (body: %s): %w", responseBodyStr, err)
 	}
 
 	return &signStartResponse, nil
@@ -141,6 +154,13 @@ func (c *SignClient) GetEvmAddress(ctx context.Context, sessionID string) (commo
 	var addressResponse tsstypes.AddressResponse
 	if err := json.NewDecoder(resp.Body).Decode(&addressResponse); err != nil {
 		return common.Address{}, fmt.Errorf("failed to decode address response: %w", err)
+	}
+
+	// Log the returned KDD and XY for diagnostics, if provided
+	if addressResponse.KDD != nil {
+		c.logger.Infof("TSS address (derived) response: kdd=%s addr=%s", addressResponse.KDD.String(), addressResponse.Address)
+	} else {
+		c.logger.Infof("TSS address (derived) response: addr=%s", addressResponse.Address)
 	}
 
 	return common.HexToAddress(addressResponse.Address), nil

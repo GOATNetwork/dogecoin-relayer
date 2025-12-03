@@ -2,6 +2,7 @@ package eventbus
 
 import (
 	"fmt"
+	"reflect"
 	"sync"
 )
 
@@ -24,7 +25,7 @@ const (
 	EventBridgeInDetected  EventType = "consensus:bridge:in:detected"
 	EventBridgeOutProposed EventType = "consensus:bridge:out:proposed"
 	EventBridgeOutFinished EventType = "consensus:bridge:out:finished"
-	EventSubmitterChosen   EventType = "consensus:submitter:chosen"
+	EventProposerSelected  EventType = "consensus:proposer:selected"
 )
 
 // Event represents an event with a payload
@@ -68,15 +69,20 @@ func (b *Bus) Unsubscribe(eventType EventType, handler Handler) {
 	b.handlersLock.Lock()
 	defer b.handlersLock.Unlock()
 
-	handlers, ok := b.handlers[eventType]
+	hs, ok := b.handlers[eventType]
 	if !ok {
 		return
 	}
 
 	// Find and remove the handler
-	for i, h := range handlers {
-		if &h == &handler {
-			b.handlers[eventType] = append(handlers[:i], handlers[i+1:]...)
+	for i := range hs {
+		if reflect.ValueOf(hs[i]).Pointer() == reflect.ValueOf(handler).Pointer() {
+			hs = append(hs[:i], hs[i+1:]...)
+			if len(hs) == 0 {
+				delete(b.handlers, eventType)
+			} else {
+				b.handlers[eventType] = hs
+			}
 			break
 		}
 	}

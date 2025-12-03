@@ -7,6 +7,9 @@ const (
 	EventNameBridgeOutProposed = "BridgeOutProposed"
 	EventNameBridgeOutFinished = "BridgeOutFinished"
 
-	// Consensus-related events
-	EventNameSubmitterChosen = "SubmitterChosen"
+	// Consensus-related events (must match contract)
+	EventNameProposerSelected  = "ProposerSelected"
+	EventNameAddProposerReq    = "AddProposerRequested"
+	EventNameRemoveProposerReq = "RemoveProposerRequested"
+	EventNameProposerConfirmed = "ProposerConfirmed"
 )
