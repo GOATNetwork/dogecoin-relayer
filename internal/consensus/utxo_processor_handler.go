@@ -285,6 +285,7 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 		txParams[i] = contract.BridgeTransaction{
 			DestEvmAddress: common.HexToAddress(utxo.EvmAddr),
 			Amount:         big.NewInt(utxo.Amount),
+			Txout:          uint32(utxo.OutIndex),
 			TxBytes:        txBytes,
 		}
 	}

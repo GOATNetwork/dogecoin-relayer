@@ -14,6 +14,7 @@ import (
 type BridgeTransaction struct {
 	DestEvmAddress common.Address
 	Amount         *big.Int
+	Txout          uint32
 	TxBytes        []byte
 }
 
@@ -95,6 +96,7 @@ func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction) 
 	bridgeTransactionArrayType, err := abi.NewType("tuple[]", "struct BridgeTransaction[]", []abi.ArgumentMarshaling{
 		{Name: "destEvmAddress", Type: "address"},
 		{Name: "amount", Type: "uint256"},
+		{Name: "txout", Type: "uint32"},
 		{Name: "txBytes", Type: "bytes"},
 	})
 	if err != nil {
@@ -105,6 +107,7 @@ func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction) 
 	bridgeTransactionStructs := make([]struct {
 		DestEvmAddress common.Address
 		Amount         *big.Int
+		Txout          uint32
 		TxBytes        []byte
 	}, len(bridgeTxs))
 
@@ -112,10 +115,12 @@ func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction) 
 		bridgeTransactionStructs[i] = struct {
 			DestEvmAddress common.Address
 			Amount         *big.Int
+			Txout          uint32
 			TxBytes        []byte
 		}{
 			DestEvmAddress: bridgeTx.DestEvmAddress,
 			Amount:         bridgeTx.Amount,
+			Txout:          bridgeTx.Txout,
 			TxBytes:        bridgeTx.TxBytes,
 		}
 	}
@@ -132,7 +137,7 @@ func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction) 
 	}
 
 	// Get the function selector for bridgeIn
-	bridgeInSelector := crypto.Keccak256([]byte("bridgeIn((address,uint256,bytes)[])"))[:4]
+	bridgeInSelector := crypto.Keccak256([]byte("bridgeIn((address,uint256,uint32,bytes)[])"))[:4]
 
 	// Combine function selector with calldata
 	txData := append(bridgeInSelector, calldata...)

@@ -325,6 +325,7 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*BridgeIn
 		bridgeTx := contract.BridgeTransaction{
 			DestEvmAddress: common.HexToAddress(utxo.EvmAddr),
 			Amount:         big.NewInt(utxo.Amount),
+			Txout:          uint32(utxo.OutIndex),
 			TxBytes:        txBytes,
 		}
 
