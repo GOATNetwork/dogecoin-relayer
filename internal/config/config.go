@@ -63,12 +63,13 @@ type HttpConfig struct {
 }
 
 type DogeConfig struct {
-	RpcUrl        string `yaml:"rpc_url"`
-	RpcUser       string `yaml:"rpc_user"`
-	RpcPassword   string `yaml:"rpc_password"`
-	StartHeight   int    `yaml:"start_height"`
-	Confirmations int    `yaml:"confirmations"`
-	NetworkType   string `yaml:"network_type"`
+	RpcUrl        string            `yaml:"rpc_url"`
+	RpcUser       string            `yaml:"rpc_user"`
+	RpcPassword   string            `yaml:"rpc_password"`
+	RpcHeaders    map[string]string `yaml:"rpc_headers"`
+	StartHeight   int               `yaml:"start_height"`
+	Confirmations int               `yaml:"confirmations"`
+	NetworkType   string            `yaml:"network_type"`
 
 	// Optional: addresses or pubkey to watch
 	// If WatchAddresses is set, relayer will match against these addresses directly.

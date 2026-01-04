@@ -34,6 +34,16 @@ func NewDogeClient(cfg config.DogeConfig) (*DogeClient, error) {
 		HTTPPostMode: true,
 		DisableTLS:   true,
 	}
+	if len(cfg.RpcHeaders) > 0 {
+		connCfg.ExtraHeaders = make(map[string]string, len(cfg.RpcHeaders))
+		for key, value := range cfg.RpcHeaders {
+			trimmedKey := strings.TrimSpace(key)
+			if trimmedKey == "" {
+				continue
+			}
+			connCfg.ExtraHeaders[trimmedKey] = value
+		}
+	}
 
 	// Create the RPC client
 	client, err := rpcclient.New(connCfg, nil)
