@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/dogecoinw/doged/btcutil"
@@ -24,15 +25,53 @@ type DogeClient struct {
 	logger *log.Entry
 }
 
+func normalizeRPCConfig(raw string) (string, bool, error) {
+	rpcUrl := strings.TrimSpace(raw)
+	if rpcUrl == "" {
+		return "", true, fmt.Errorf("rpc_url is empty")
+	}
+
+	parsed, err := url.Parse(rpcUrl)
+	if err != nil {
+		return "", true, fmt.Errorf("parse rpc_url %q: %w", raw, err)
+	}
+
+	disableTLS := true
+	switch parsed.Scheme {
+	case "https":
+		disableTLS = false
+	case "http":
+		disableTLS = true
+	default:
+		return "", true, fmt.Errorf("rpc_url must start with http:// or https:// : %q", raw)
+	}
+
+	if parsed.Host == "" {
+		return "", disableTLS, fmt.Errorf("rpc_url missing host: %q", raw)
+	}
+
+	host := parsed.Host
+	if reqURI := parsed.RequestURI(); reqURI != "" && reqURI != "/" {
+		host += reqURI
+	}
+
+	return host, disableTLS, nil
+}
+
 // NewDogeClient creates a new Dogecoin RPC client using doged library
 func NewDogeClient(cfg config.DogeConfig) (*DogeClient, error) {
+	host, disableTLS, err := normalizeRPCConfig(cfg.RpcUrl)
+	if err != nil {
+		return nil, err
+	}
+
 	// Create RPC client configuration
 	connCfg := &rpcclient.ConnConfig{
-		Host:         cfg.RpcUrl,
+		Host:         host,
 		User:         cfg.RpcUser,
 		Pass:         cfg.RpcPassword,
 		HTTPPostMode: true,
-		DisableTLS:   true,
+		DisableTLS:   disableTLS,
 	}
 	if len(cfg.RpcHeaders) > 0 {
 		connCfg.ExtraHeaders = make(map[string]string, len(cfg.RpcHeaders))
