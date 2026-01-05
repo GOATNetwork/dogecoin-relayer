@@ -124,10 +124,11 @@ func (up *UtxoProcessor) scanDepositUTXOs() error {
 			continue
 		}
 
-		// Mark UTXOs as processed
-		if err := up.markUTXOsAsProcessed(batch.UTXOs); err != nil {
-			up.logger.Errorf("Failed to mark deposit UTXOs as processed: %v", err)
-		}
+		// NOTE: Do NOT mark UTXOs as processed here.
+		// UTXOs will be marked as processed in completeBatchWithSignature()
+		// after TSS signature is successfully received and verified.
+		// This ensures that failed TSS sessions don't leave UTXOs in limbo.
+		up.logger.Debugf("Deposit batch %s submitted for TSS signing, UTXOs will be marked processed upon completion", batch.ID.String())
 	}
 
 	return nil
@@ -155,10 +156,10 @@ func (up *UtxoProcessor) scanWithdrawalUTXOs() error {
 			continue
 		}
 
-		// Mark UTXO as processed
-		if err := up.markUTXOsAsProcessed([]*models.UTXO{utxo}); err != nil {
-			up.logger.Errorf("Failed to mark withdrawal UTXO as processed: %v", err)
-		}
+		// NOTE: Do NOT mark UTXO as processed here.
+		// UTXOs will be marked as processed in completeBatchWithSignature()
+		// after TSS signature is successfully received and verified.
+		up.logger.Debugf("Withdrawal UTXO %s submitted for TSS signing, will be marked processed upon completion", utxo.Uid)
 	}
 
 	return nil
