@@ -1,10 +1,12 @@
 package models
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // UTXORepository handles UTXO database operations
@@ -33,7 +35,19 @@ func (r *UTXORepository) AddUTXO(utxo *UTXO, pubkeyBytes []byte, blockHash strin
 
 	utxo.UpdatedAt = time.Now()
 
-	return r.db.Create(utxo).Error
+	var existing UTXO
+	err := r.db.Select("uid").Where("uid = ?", utxo.Uid).First(&existing).Error
+	if err == nil {
+		return nil
+	}
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+
+	return r.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "uid"}},
+		DoNothing: true,
+	}).Create(utxo).Error
 }
 
 // BatchUpdateUTXOs updates multiple UTXOs in a single transaction

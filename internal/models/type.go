@@ -81,7 +81,7 @@ type UTXOScanState struct {
 type UTXO struct {
 	gorm.Model `swaggerignore:"true"`
 
-	Uid           string    `gorm:"primaryKey;type:varchar(255)" json:"uid"`
+	Uid           string    `gorm:"uniqueIndex:idx_utxo_uid;type:varchar(255)" json:"uid"`
 	Txid          string    `gorm:"index;type:varchar(255)" json:"txid"`
 	PkScript      []byte    `gorm:"type:blob" json:"pk_script"`
 	OutIndex      int       `gorm:"index" json:"out_index"`

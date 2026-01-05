@@ -1,6 +1,7 @@
 package doge
 
 import (
+	"bytes"
 	"encoding/hex"
 	"testing"
 
@@ -178,4 +179,69 @@ func TestProcessDepositTransaction(t *testing.T) {
 	require.Equal(t, "pending", deposit.Status)
 	require.NotEmpty(t, deposit.TxBytes)
 
+}
+
+func TestProcessRealDepositTransaction_Block22212782(t *testing.T) {
+	module, db := newTestModule(t)
+
+	const (
+		rawTxHex            = "02000000014bf6e8f20ca6a1583ada2bc45c62c1af14ebff9fe0d708c1e6bff9b8cdd21b04020000006a473044022045d43ea26e8894f037af7ac81af468079715f079b05c7b1f429ec5f155f491d40220094b285dbb47e6a442ffee9a3ed15c3e0fa9dec35cb5772c58a39a4b5ba2ca52012103b01e34bacfceb68c5ced41a5d7a3071cc39cb872a113ce4941f0387060bac38dfdffffff030065cd1d000000001976a914fc456386689dfe8e94dfcfae8a0b953eb91d140b88ac00000000000000001a6a18475145564fbeca5a561bfbe82bd47e65cd9fb964b99b8d0dd0b7216d0b0000001976a914c296d55ebbdc981ab995e04ea058a675f9c1d52488ac00000000"
+		watchAddress        = "nsC3fq1zsBzZypN2KaawpV9B6V3CMQHwnM"
+		magicHex            = "47514556"
+		expectedEvmAddress  = "0x4fbeca5a561bfbe82bd47e65cd9fb964b99b8d0d"
+		expectedDepositAmt  = int64(500000000)
+		minDepositAmount    = int64(1_000_000)
+		expectedBlockHeight = int64(22212782)
+	)
+
+	module.cfg = config.DogeConfig{
+		NetworkType:       "testnet",
+		WatchAddresses:    []string{watchAddress},
+		DepositMagicBytes: "0x" + magicHex,
+		MinDepositAmount:  minDepositAmount,
+	}
+
+	rawBytes, err := hex.DecodeString(rawTxHex)
+	require.NoError(t, err)
+
+	var tx wire.MsgTx
+	require.NoError(t, tx.Deserialize(bytes.NewReader(rawBytes)))
+	require.Len(t, tx.TxIn, 1)
+	require.Len(t, tx.TxOut, 3)
+
+	netParams := types.GetDogeNetwork(module.cfg.NetworkType)
+	magicBytes, err := hex.DecodeString(magicHex)
+	require.NoError(t, err)
+
+	isDeposit, evmAddr, err := types.IsUtxoDogeDepositV1(&tx, []string{watchAddress}, netParams, minDepositAmount, magicBytes)
+	require.NoError(t, err)
+	require.True(t, isDeposit)
+	require.Equal(t, expectedEvmAddress, evmAddr)
+
+	block := types.DogeBlockExt{
+		BlockNumber:  expectedBlockHeight,
+		BlockHash:    chainhash.Hash{},
+		Transactions: []*wire.MsgTx{&tx},
+	}
+
+	module.processBlock(block)
+
+	var utxos []models.UTXO
+	require.NoError(t, db.Where("receiver = ?", watchAddress).Find(&utxos).Error)
+	require.Len(t, utxos, 1)
+
+	utxo := utxos[0]
+	require.Equal(t, tx.TxHash().String(), utxo.Txid)
+	require.Equal(t, expectedDepositAmt, utxo.Amount)
+	require.Equal(t, models.UTXO_SOURCE_DEPOSIT, utxo.Source)
+	require.Equal(t, expectedEvmAddress, utxo.EvmAddr)
+	require.Equal(t, expectedBlockHeight, utxo.ReceiveBlock)
+
+	var deposit models.Deposit
+	require.NoError(t, db.Where("tx_id = ? AND vout = ?", utxo.Txid, utxo.OutIndex).First(&deposit).Error)
+	require.Equal(t, expectedDepositAmt, deposit.Amount)
+	require.Equal(t, "pending", deposit.Status)
+	require.Equal(t, watchAddress, deposit.Address)
+	require.Equal(t, expectedEvmAddress, deposit.EvmAddr)
+	require.NotEmpty(t, deposit.TxBytes)
 }

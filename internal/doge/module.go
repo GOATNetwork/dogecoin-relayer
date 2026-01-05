@@ -226,7 +226,11 @@ func (m *DogeModule) initializeScanHeight() error {
 		return err
 	}
 
-	m.currentHeight = int64(state.LastScannedBlock) + 1
+	startFrom := int64(state.LastScannedBlock)
+	if int64(m.cfg.StartHeight) > startFrom {
+		startFrom = int64(m.cfg.StartHeight)
+	}
+	m.currentHeight = startFrom + 1
 	m.logger.Infof("Resuming UTXO scan from height %d (last scanned %d)", m.currentHeight, state.LastScannedBlock)
 	return nil
 }
@@ -412,6 +416,8 @@ func (m *DogeModule) analyzeTransaction(tx *wire.MsgTx, dogeBlock types.DogeBloc
 		receiver, extractErr := types.ExtractAddressFromScript(vout.PkScript, network)
 		if extractErr != nil {
 			m.logger.Debugf("Failed to extract address from script: %v", extractErr)
+			receiver = "unknown"
+		} else if receiver == "" {
 			receiver = "unknown"
 		}
 

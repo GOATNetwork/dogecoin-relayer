@@ -67,6 +67,11 @@ func (r *MigrateRepository) createConsensusTables() error {
 
 // createScannerTables creates tables used by the Doge scanner/pipeline
 func (r *MigrateRepository) createScannerTables() error {
+	if r.db.Migrator().HasTable(&UTXO{}) {
+		if err := r.db.Exec("DELETE FROM utxos WHERE id NOT IN (SELECT MIN(id) FROM utxos GROUP BY uid)").Error; err != nil {
+			return fmt.Errorf("dedupe utxos by uid: %w", err)
+		}
+	}
     return r.db.AutoMigrate(
         &UTXOScanState{},
         &UTXO{},
