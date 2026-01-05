@@ -3,6 +3,7 @@ module github.com/goat-network/dogecoin-relayer
 go 1.24.4
 
 require (
+	github.com/btcsuite/btcd v0.23.4
 	github.com/dogecoinw/doged v1.0.6
 	github.com/ethereum/go-ethereum v1.15.11
 	github.com/goatnetwork/tss v1.0.2
@@ -77,8 +78,8 @@ require (
 )
 
 require (
-	github.com/btcsuite/btcd v0.23.4 // indirect
 	github.com/btcsuite/btcd/btcutil v1.1.1 // indirect
+	github.com/btcsuite/btclog v0.0.0-20170628155309-84c8d2346e9f // indirect
 	github.com/flynn/noise v1.1.0 // indirect
 	github.com/francoispqt/gojay v1.2.13 // indirect
 	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect

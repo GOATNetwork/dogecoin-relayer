@@ -68,6 +68,15 @@ type EventScanState struct {
 	IsActive           bool      `gorm:"default:true" json:"is_active"`
 }
 
+// UTXOScanState tracks the scanning progress for Doge UTXO scanning
+type UTXOScanState struct {
+	gorm.Model `swaggerignore:"true"`
+
+	LastScannedBlock uint64    `gorm:"type:bigint;not null;default:0" json:"last_scanned_block"`
+	LastScannedAt    time.Time `gorm:"type:timestamp" json:"last_scanned_at,omitempty"`
+	IsActive         bool      `gorm:"default:true" json:"is_active"`
+}
+
 // UTXO represents an unspent transaction output
 type UTXO struct {
 	gorm.Model `swaggerignore:"true"`

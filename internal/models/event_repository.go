@@ -7,6 +7,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type EventRepository struct {
@@ -88,10 +89,12 @@ func (r *EventRepository) getDB(tx *gorm.DB) *gorm.DB {
 	return r.db
 }
 
+const eventScanStateID uint = 1
+
 // EventScanState operations
-func (r *EventRepository) GetScanState(contractAddress string) (*EventScanState, error) {
+func (r *EventRepository) GetScanState() (*EventScanState, error) {
 	var state EventScanState
-	err := r.db.Where("contract_address = ?", contractAddress).First(&state).Error
+	err := r.db.First(&state, eventScanStateID).Error
 	if err != nil {
 		return nil, err
 	}
@@ -99,22 +102,27 @@ func (r *EventRepository) GetScanState(contractAddress string) (*EventScanState,
 }
 
 func (r *EventRepository) UpdateScanState(transaction *gorm.DB, lastScannedBlock uint64) error {
-	if transaction == nil {
-		transaction = r.db
-	}
+	db := r.getDB(transaction)
 	state := &EventScanState{
 		LastScannedBlock: lastScannedBlock,
 		LastScannedAt:    time.Now(),
 		IsActive:         true,
 	}
+	state.ID = eventScanStateID
 
-	// Use Upsert (create or update)
-	return transaction.Save(state).Error
+	return db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"last_scanned_block", "last_scanned_at", "is_active"}),
+	}).Create(state).Error
 }
 
 func (r *EventRepository) CreateOrUpdateScanState(state *EventScanState) error {
+	state.ID = eventScanStateID
 	state.LastScannedAt = time.Now()
-	return r.db.Save(state).Error
+	return r.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"last_scanned_block", "last_scanned_at", "confirmation_blocks", "is_active"}),
+	}).Create(state).Error
 }
 
 // New repository operations for Deposit, Withdrawal, and Proposers

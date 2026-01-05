@@ -68,6 +68,7 @@ func (r *MigrateRepository) createConsensusTables() error {
 // createScannerTables creates tables used by the Doge scanner/pipeline
 func (r *MigrateRepository) createScannerTables() error {
     return r.db.AutoMigrate(
+        &UTXOScanState{},
         &UTXO{},
         &VIN{},
         &VOUT{},

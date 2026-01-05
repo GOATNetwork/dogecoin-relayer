@@ -2,6 +2,7 @@ package doge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
 	log "github.com/sirupsen/logrus"
+	"gorm.io/gorm"
 )
 
 type DogeModule struct {
@@ -25,6 +27,7 @@ type DogeModule struct {
 	client        *DogeClient
 	state         *models.StateRepository
 	eventRepo     *models.EventRepository
+	utxoScanRepo  *models.UTXOScanStateRepository
 	blockCh       chan *types.DogeBlockExt
 	currentHeight int64
 }
@@ -87,16 +90,20 @@ func (m *DogeModule) Init(cfg any, conn *models.DBConnection) error {
 	// Initialize event repository for deposit/withdrawal bookkeeping
 	m.eventRepo = models.NewEventRepository(conn.GetDB())
 
+	// Initialize UTXO scan state repository
+	m.utxoScanRepo = models.NewUTXOScanStateRepository(conn.GetDB())
+
 	// Initialize block channel
 	m.blockCh = make(chan *types.DogeBlockExt, 100)
-
-	// Set current height from config
-	m.currentHeight = int64(m.cfg.StartHeight)
 
 	// Set scan config from global config
 	globalCfg := global.GetConfig()
 	if globalCfg != nil {
 		m.scanCfg = globalCfg.Scan
+	}
+
+	if err := m.initializeScanHeight(); err != nil {
+		return fmt.Errorf("initialize scan height: %w", err)
 	}
 
 	return nil
@@ -157,12 +164,18 @@ func (m *DogeModule) fetchNewBlocks(ctx context.Context) error {
 		endHeight = currentBlockCount
 	}
 
+	blockCache := make(map[int64]*types.DogeBlockExt, int(endHeight-m.currentHeight+1))
+
 	// Fetch blocks in range
 	for height := m.currentHeight; height <= endHeight; height++ {
-		block, err := m.client.GetBlockByHeight(height)
-		if err != nil {
-			m.logger.Errorf("Failed to get block at height %d: %v", height, err)
-			continue
+		block, ok := blockCache[height]
+		if !ok {
+			block, err = m.client.GetBlockByHeight(height)
+			if err != nil {
+				m.logger.Errorf("Failed to get block at height %d: %v", height, err)
+				continue
+			}
+			blockCache[height] = block
 		}
 
 		// Send block to processing channel
@@ -189,9 +202,43 @@ func (m *DogeModule) blockScanLoop(ctx context.Context) {
 		case block := <-m.blockCh:
 			if block != nil {
 				m.processBlock(*block)
+				if err := m.updateUTXOScanState(block.BlockNumber); err != nil {
+					m.logger.Errorf("Failed to update UTXO scan state at height %d: %v", block.BlockNumber, err)
+				}
 			}
 		}
 	}
+}
+
+func (m *DogeModule) initializeScanHeight() error {
+	if m.utxoScanRepo == nil {
+		m.currentHeight = int64(m.cfg.StartHeight)
+		return nil
+	}
+
+	state, err := m.utxoScanRepo.GetUTXOScanState()
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			m.currentHeight = int64(m.cfg.StartHeight)
+			m.logger.Infof("UTXO scan state not found, starting from configured height %d", m.currentHeight)
+			return nil
+		}
+		return err
+	}
+
+	m.currentHeight = int64(state.LastScannedBlock) + 1
+	m.logger.Infof("Resuming UTXO scan from height %d (last scanned %d)", m.currentHeight, state.LastScannedBlock)
+	return nil
+}
+
+func (m *DogeModule) updateUTXOScanState(height int64) error {
+	if m.utxoScanRepo == nil {
+		return nil
+	}
+	if height < 0 {
+		return nil
+	}
+	return m.utxoScanRepo.UpdateUTXOScanState(uint64(height))
 }
 
 // processBlock processes a single block and extracts P2PKH transactions

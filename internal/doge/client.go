@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/btcsuite/btcd/btcjson"
+	btcrpcclient "github.com/btcsuite/btcd/rpcclient"
 	"github.com/dogecoinw/doged/btcutil"
 	"github.com/dogecoinw/doged/chaincfg/chainhash"
 	"github.com/dogecoinw/doged/rpcclient"
@@ -20,9 +22,10 @@ import (
 
 // DogeClient represents a Dogecoin RPC client using doged library
 type DogeClient struct {
-	cfg    config.DogeConfig
-	client *rpcclient.Client
-	logger *log.Entry
+	cfg       config.DogeConfig
+	client    *rpcclient.Client
+	btcClient *btcrpcclient.Client // btcsuite client for GetBlockVerboseTx
+	logger    *log.Entry
 }
 
 func normalizeRPCConfig(raw string) (string, bool, error) {
@@ -65,13 +68,19 @@ func NewDogeClient(cfg config.DogeConfig) (*DogeClient, error) {
 		return nil, err
 	}
 
-	// Create RPC client configuration
+	// Create RPC client configuration for doged client
 	connCfg := &rpcclient.ConnConfig{
 		Host:         host,
 		User:         cfg.RpcUser,
 		Pass:         cfg.RpcPassword,
 		HTTPPostMode: true,
 		DisableTLS:   disableTLS,
+	}
+	// If using header-based auth (like Tatum API) and no User/Pass is set,
+	// set a dummy Pass to prevent the client from trying cookie authentication
+	// which would fail with "stat : no such file or directory".
+	if connCfg.Pass == "" && len(cfg.RpcHeaders) > 0 {
+		connCfg.Pass = "__header_auth__"
 	}
 	if len(cfg.RpcHeaders) > 0 {
 		connCfg.ExtraHeaders = make(map[string]string, len(cfg.RpcHeaders))
@@ -84,11 +93,44 @@ func NewDogeClient(cfg config.DogeConfig) (*DogeClient, error) {
 		}
 	}
 
-	// Create the RPC client
+	// Create the doged RPC client
 	client, err := rpcclient.New(connCfg, nil)
 	if err != nil {
 		metrics.RecordError("doge", "connection_failed")
 		return nil, fmt.Errorf("failed to create RPC client: %w", err)
+	}
+
+	// Create btcsuite RPC client configuration for GetBlockVerboseTx
+	btcConnCfg := &btcrpcclient.ConnConfig{
+		Host:         host,
+		User:         cfg.RpcUser,
+		Pass:         cfg.RpcPassword,
+		HTTPPostMode: true,
+		DisableTLS:   disableTLS,
+	}
+	// If using header-based auth (like Tatum API) and no User/Pass is set,
+	// set a dummy Pass to prevent the client from trying cookie authentication
+	// which would fail with "stat : no such file or directory"
+	if btcConnCfg.Pass == "" && len(cfg.RpcHeaders) > 0 {
+		btcConnCfg.Pass = "__header_auth__"
+	}
+	if len(cfg.RpcHeaders) > 0 {
+		btcConnCfg.ExtraHeaders = make(map[string]string, len(cfg.RpcHeaders))
+		for key, value := range cfg.RpcHeaders {
+			trimmedKey := strings.TrimSpace(key)
+			if trimmedKey == "" {
+				continue
+			}
+			btcConnCfg.ExtraHeaders[trimmedKey] = value
+		}
+	}
+
+	// Create the btcsuite RPC client
+	btcClient, err := btcrpcclient.New(btcConnCfg, nil)
+	if err != nil {
+		client.Shutdown()
+		metrics.RecordError("doge", "btc_connection_failed")
+		return nil, fmt.Errorf("failed to create btcsuite RPC client: %w", err)
 	}
 
 	// Update connection status
@@ -96,9 +138,10 @@ func NewDogeClient(cfg config.DogeConfig) (*DogeClient, error) {
 	metrics.DogeConfirmations.Set(float64(cfg.Confirmations))
 
 	return &DogeClient{
-		cfg:    cfg,
-		client: client,
-		logger: log.WithField("module", "doge-client"),
+		cfg:       cfg,
+		client:    client,
+		btcClient: btcClient,
+		logger:    log.WithField("module", "doge-client"),
 	}, nil
 }
 
@@ -203,6 +246,73 @@ func (c *DogeClient) GetBlock(blockHash *chainhash.Hash) (*wire.MsgBlock, error)
 	return &msgBlock, nil
 }
 
+// GetBlockVerboseTx returns verbose block information with full transaction details using btcsuite/btcd
+// This uses getblock with verbosity=2 (integer) to get complete vin/vout information
+func (c *DogeClient) GetBlockVerboseTx(blockHashStr string) (*btcjson.GetBlockVerboseTxResult, error) {
+	timer := metrics.NewTimer("doge", "get_block_verbose_tx")
+
+	if blockHashStr == "" {
+		timer.RecordFailure()
+		metrics.DogeRPCCalls.WithLabelValues("GetBlockVerboseTx", "failure").Inc()
+		return nil, fmt.Errorf("empty block hash")
+	}
+
+	// Use RawRequest with verbosity=2 to get full transaction details
+	// btcsuite's GetBlockVerboseTx internally uses int verbosity which some nodes don't support
+	// So we use RawRequest directly with explicit verbosity=2
+	hashJSON, err := json.Marshal(blockHashStr)
+	if err != nil {
+		timer.RecordFailure()
+		metrics.DogeRPCCalls.WithLabelValues("GetBlockVerboseTx", "failure").Inc()
+		return nil, fmt.Errorf("marshal hash: %w", err)
+	}
+
+	// Use verbosity=2 (integer) to get full transaction details including vin/vout
+	verboseJSON := json.RawMessage([]byte("2"))
+
+	res, err := c.btcClient.RawRequest("getblock", []json.RawMessage{json.RawMessage(hashJSON), verboseJSON})
+	if err != nil {
+		timer.RecordFailure()
+		metrics.DogeRPCCalls.WithLabelValues("GetBlockVerboseTx", "failure").Inc()
+		metrics.RecordError("doge", "rpc_call_failed")
+		return nil, fmt.Errorf("getblock rpc: %w", err)
+	}
+
+	var result btcjson.GetBlockVerboseTxResult
+	if err := json.Unmarshal(res, &result); err != nil {
+		timer.RecordFailure()
+		metrics.DogeRPCCalls.WithLabelValues("GetBlockVerboseTx", "failure").Inc()
+		metrics.RecordError("doge", "unmarshal_failed")
+		return nil, fmt.Errorf("unmarshal getblock verbose result: %w", err)
+	}
+
+	timer.RecordSuccess()
+	metrics.DogeRPCCalls.WithLabelValues("GetBlockVerboseTx", "success").Inc()
+	return &result, nil
+}
+
+// GetBlockVerboseTxByHeight returns verbose block information with full transaction details for a given height
+func (c *DogeClient) GetBlockVerboseTxByHeight(height int64) (*btcjson.GetBlockVerboseTxResult, error) {
+	timer := metrics.NewTimer("doge", "get_block_verbose_tx_by_height")
+
+	// Get block hash first
+	blockHash, err := c.GetBlockHash(height)
+	if err != nil {
+		timer.RecordFailure()
+		return nil, fmt.Errorf("failed to get block hash for height %d: %w", height, err)
+	}
+
+	// Get verbose block with transactions
+	result, err := c.GetBlockVerboseTx(blockHash.String())
+	if err != nil {
+		timer.RecordFailure()
+		return nil, fmt.Errorf("failed to get verbose block for hash %s: %w", blockHash.String(), err)
+	}
+
+	timer.RecordSuccess()
+	return result, nil
+}
+
 // GetRawTransaction returns raw transaction information
 func (c *DogeClient) GetRawTransaction(txHash *chainhash.Hash) (*btcutil.Tx, error) {
 	timer := metrics.NewTimer("doge", "get_raw_transaction")
@@ -259,9 +369,12 @@ func (c *DogeClient) GetBlockByHeight(height int64) (*types.DogeBlockExt, error)
 func (c *DogeClient) Close() {
 	if c.client != nil {
 		c.client.Shutdown()
-		metrics.DogeConnectionStatus.Set(0)
-		c.logger.Info("Doge client connection closed")
 	}
+	if c.btcClient != nil {
+		c.btcClient.Shutdown()
+	}
+	metrics.DogeConnectionStatus.Set(0)
+	c.logger.Info("Doge client connection closed")
 }
 
 // HealthCheck performs a health check on the Dogecoin connection

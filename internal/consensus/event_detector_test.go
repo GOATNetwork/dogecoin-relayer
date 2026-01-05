@@ -353,7 +353,7 @@ func TestEventDetector_ScanForEvents_Integration(t *testing.T) {
 	t.Logf("Scan result: %v", err)
 
 	// Check that scan state was updated in database
-	scanState, err := testRepo.GetScanState(testConfigs[0].ContractAddress.Hex())
+	scanState, err := testRepo.GetScanState()
 	if err == nil {
 		t.Logf("Scan state updated: last block %d", scanState.LastScannedBlock)
 		assert.True(t, scanState.LastScannedBlock > 0)
