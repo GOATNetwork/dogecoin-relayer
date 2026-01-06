@@ -1,0 +1,28 @@
+// dogecoin.proto
+syntax = "proto3";
+
+option go_package = "github.com/goat-network/dogecoin-relayer/proto";
+
+package proto;
+
+service BitcoinLightWallet {
+  rpc NewTransaction (NewTransactionRequest) returns (NewTransactionResponse);
+  rpc QueryDepositAddress (QueryDepositAddressRequest) returns (QueryDepositAddressResponse);
+}
+
+message NewTransactionRequest {
+  string transaction_id = 1;
+  string raw_transaction = 2;
+  // evm_address is the user wallet address in goat evm
+  string evm_address = 3;
+}
+
+message NewTransactionResponse {
+  string error_message = 1;
+}
+
+message QueryDepositAddressRequest {}
+
+message QueryDepositAddressResponse {
+  string deposit_address = 1;
+}

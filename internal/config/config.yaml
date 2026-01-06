@@ -28,6 +28,10 @@ http:
   enabled: true
   port: 8080
 
+rpc:
+  enabled: true
+  port: 50051
+
 doge:
   rpc_url: "http://localhost:18443"
   rpc_user: ""
@@ -53,7 +57,7 @@ withdraw:
     callback_public: ""
 
 scan:
-  enabled: true
+  enabled: false
   interval: 60 # unit: second
   timeout: 30 # unit: second
   range: 1000

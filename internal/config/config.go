@@ -15,6 +15,7 @@ type Config struct {
 	Withdraw  WithdrawConfig  `yaml:"withdraw"`
 	P2P       P2PConfig       `yaml:"p2p"`
 	Http      HttpConfig      `yaml:"http"`
+	Rpc       RpcConfig       `yaml:"rpc"`
 	Scan      ScanConfig      `yaml:"scan"`
 	Consensus ConsensusConfig `yaml:"consensus"`
 	Tss       TssConfig       `yaml:"tss"`
@@ -58,6 +59,11 @@ type P2PConfig struct {
 }
 
 type HttpConfig struct {
+	Enabled bool `yaml:"enabled"`
+	Port    int  `yaml:"port"`
+}
+
+type RpcConfig struct {
 	Enabled bool `yaml:"enabled"`
 	Port    int  `yaml:"port"`
 }
