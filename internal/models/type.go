@@ -155,6 +155,7 @@ const (
 const (
 	UTXO_STATUS_UNCONFIRMED = "unconfirmed"
 	UTXO_STATUS_CONFIRMED   = "confirmed"
+	UTXO_STATUS_PROCESSED   = "processed"
 	UTXO_STATUS_SPENT       = "spent"
 )
 

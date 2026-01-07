@@ -254,7 +254,9 @@ func TestUtxoProcessor_GroupUTXOsIntoBatches(t *testing.T) {
 	for i, batch := range batches {
 		assert.Len(t, batch.UTXOs, 1)
 		assert.Len(t, batch.TransactionParams, 1)
-		assert.Equal(t, depositUTXOs[i].Amount, batch.TotalAmount.Int64())
+		// Convert wei (18 decimals) back to satoshis (8 decimals) for comparison
+		expectedAmountWei := new(big.Int).Mul(big.NewInt(depositUTXOs[i].Amount), big.NewInt(10000000000))
+		assert.Equal(t, 0, expectedAmountWei.Cmp(batch.TotalAmount))
 	}
 
 	// Verify transaction parameters
@@ -262,7 +264,9 @@ func TestUtxoProcessor_GroupUTXOsIntoBatches(t *testing.T) {
 		for j, tx := range batch.TransactionParams {
 			utxo := batch.UTXOs[j]
 			assert.Equal(t, common.HexToAddress(utxo.EvmAddr), tx.DestEvmAddress)
-			assert.Equal(t, big.NewInt(utxo.Amount), tx.Amount)
+			// tx.Amount is now in wei (18 decimals), convert satoshis (8 decimals) to wei for comparison
+			expectedAmountWei := new(big.Int).Mul(big.NewInt(utxo.Amount), big.NewInt(10000000000))
+			assert.Equal(t, 0, expectedAmountWei.Cmp(tx.Amount))
 			assert.Equal(t, []byte(utxo.Txid), tx.TxBytes)
 		}
 		t.Logf("Batch %d: %d transactions, total amount: %s", i+1, len(batch.TransactionParams), batch.TotalAmount.String())
@@ -288,7 +292,9 @@ func TestUtxoProcessor_CreateWithdrawalRequestFromUTXO(t *testing.T) {
 
 	require.NotNil(t, request)
 	assert.Equal(t, withdrawalUTXO, request.UTXO)
-	assert.Equal(t, int64(1000000), request.TotalAmount.Int64()) // 500k + 300k + 200k = 1M
+	// TotalAmount is now in wei (18 decimals): (500k + 300k + 200k) * 10^10 = 10^16 wei
+	expectedAmountWei := new(big.Int).Mul(big.NewInt(1000000), big.NewInt(10000000000))
+	assert.Equal(t, 0, expectedAmountWei.Cmp(request.TotalAmount))
 	assert.Len(t, request.TaskIds, 3)
 
 	// Verify task IDs

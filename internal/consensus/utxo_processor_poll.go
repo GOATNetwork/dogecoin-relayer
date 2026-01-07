@@ -79,6 +79,24 @@ func (up *UtxoProcessor) scanDepositUTXOs() error {
 		}
 	}()
 
+	// Check if there are pending batches still awaiting TSS signature
+	// to prevent TSS nonce race conditions. Only process one batch at a time.
+	// We check this BEFORE fetching new UTXOs to ensure we don't advance
+	// the lastProcessedId cursor if we're not ready to process.
+	hasPending := false
+	up.pendingBatches.Range(func(key, value interface{}) bool {
+		if pending, ok := value.(*pendingBatch); ok && pending.batchType == "deposit" {
+			hasPending = true
+			up.logger.Infof("Skipping new deposit processing: pending batch %s awaiting TSS signature", key)
+			return false // stop iteration
+		}
+		return true
+	})
+	if hasPending {
+		up.logger.Info("Waiting for pending deposit batch to complete before processing new deposits")
+		return nil
+	}
+
 	// Query for new unprocessed deposit UTXOs
 	utxos, err := up.getUnprocessedDepositUTXOs()
 	if err != nil {
@@ -113,22 +131,6 @@ func (up *UtxoProcessor) scanDepositUTXOs() error {
 
 	up.logger.Infof("Processing %d valid deposit UTXOs (filtered from %d total)", len(validUTXOs), len(utxos))
 
-	// Check if there are pending batches still awaiting TSS signature
-	// to prevent TSS nonce race conditions. Only process one batch at a time.
-	hasPending := false
-	up.pendingBatches.Range(func(key, value interface{}) bool {
-		if pending, ok := value.(*pendingBatch); ok && pending.batchType == "deposit" {
-			hasPending = true
-			up.logger.Infof("Skipping new deposit processing: pending batch %s awaiting TSS signature", key)
-			return false // stop iteration
-		}
-		return true
-	})
-	if hasPending {
-		up.logger.Info("Waiting for pending deposit batch to complete before processing new deposits")
-		return nil
-	}
-
 	// Group UTXOs into batches for bridge transactions
 	batches := up.groupUTXOsIntoBatches(validUTXOs)
 	up.logger.Infof("Created %d batches from %d UTXOs", len(batches), len(validUTXOs))
@@ -161,17 +163,6 @@ func (up *UtxoProcessor) scanDepositUTXOs() error {
 
 // scanWithdrawalUTXOs handles withdrawal UTXO processing
 func (up *UtxoProcessor) scanWithdrawalUTXOs() error {
-	utxos, err := up.getUnprocessedWithdrawalUTXOs()
-	if err != nil {
-		return fmt.Errorf("failed to get unprocessed withdrawal UTXOs: %w", err)
-	}
-
-	if len(utxos) == 0 {
-		return nil
-	}
-
-	up.logger.Infof("Found %d new withdrawal UTXOs to process", len(utxos))
-
 	// Check if there are pending withdrawal batches still awaiting TSS signature
 	hasPending := false
 	up.pendingBatches.Range(func(key, value interface{}) bool {
@@ -186,6 +177,18 @@ func (up *UtxoProcessor) scanWithdrawalUTXOs() error {
 		up.logger.Info("Waiting for pending withdrawal batch to complete before processing new withdrawals")
 		return nil
 	}
+
+	// Query for new unprocessed withdrawal UTXOs
+	utxos, err := up.getUnprocessedWithdrawalUTXOs()
+	if err != nil {
+		return fmt.Errorf("failed to get unprocessed withdrawal UTXOs: %w", err)
+	}
+
+	if len(utxos) == 0 {
+		return nil // No new withdrawal UTXOs to process
+	}
+
+	up.logger.Infof("Found %d new withdrawal UTXOs to process", len(utxos))
 
 	// Process only ONE withdrawal UTXO per poll cycle to prevent TSS nonce race conditions
 	utxo := utxos[0]
@@ -248,25 +251,16 @@ func (up *UtxoProcessor) getUnprocessedDepositUTXOs() ([]*models.UTXO, error) {
 	var utxos []*models.UTXO
 
 	// Query for deposit UTXOs that haven't been processed yet
-	// NOTE: Previously this query filtered out rows with empty evm_addr.
-	// That caused valid deposit UTXOs to be skipped when evm_addr was not
-	// populated yet during ingestion. We now fetch by source/status/id only
-	// and defer the evm address check to the batching step, where UTXOs with
-	// missing EVM address are explicitly skipped with a warning.
+	// We rely on status='confirmed' to find pending items. Items that are successfully
+	// processed will have status='processed'. This allows automatic retry of failed items.
 	err := up.conn.GetDB().Where(
-		"source = ? AND status = ? AND id > ?",
+		"source = ? AND status = ?",
 		models.UTXO_SOURCE_DEPOSIT,
 		models.UTXO_STATUS_CONFIRMED,
-		up.lastProcessedId,
-	).Limit(up.batchSize).Find(&utxos).Error
+	).Order("id ASC").Limit(up.batchSize).Find(&utxos).Error
 
 	if err != nil {
 		return nil, err
-	}
-
-	// Update last processed ID
-	if len(utxos) > 0 {
-		up.lastProcessedId = utxos[len(utxos)-1].ID
 	}
 
 	return utxos, nil
@@ -277,21 +271,14 @@ func (up *UtxoProcessor) getUnprocessedWithdrawalUTXOs() ([]*models.UTXO, error)
 	var utxos []*models.UTXO
 
 	// Query for withdrawal UTXOs that haven't been processed yet
-	// For withdrawals, we typically have one UTXO that contains multiple outputs
 	err := up.conn.GetDB().Where(
-		"source = ? AND status = ? AND id > ?",
+		"source = ? AND status = ?",
 		models.UTXO_SOURCE_WITHDRAWAL,
 		models.UTXO_STATUS_CONFIRMED,
-		up.lastProcessedId,
-	).Limit(up.batchSize).Find(&utxos).Error
+	).Order("id ASC").Limit(up.batchSize).Find(&utxos).Error
 
 	if err != nil {
 		return nil, err
-	}
-
-	// Update last processed ID
-	if len(utxos) > 0 {
-		up.lastProcessedId = utxos[len(utxos)-1].ID
 	}
 
 	return utxos, nil
@@ -361,15 +348,20 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*BridgeIn
 			}
 		}
 
+		// Convert satoshis (8 decimals) to ERC20 wei (18 decimals)
+		// Dogecoin uses 8 decimals (1 DOGE = 100,000,000 satoshis)
+		// ERC20 uses 18 decimals (1 DOGE = 100,000,000,000,000,000,000 wei)
+		// Conversion: multiply by 10^10
+		amountWei := new(big.Int).Mul(big.NewInt(utxo.Amount), big.NewInt(10000000000))
 		bridgeTx := contract.BridgeTransaction{
 			DestEvmAddress: common.HexToAddress(utxo.EvmAddr),
-			Amount:         big.NewInt(utxo.Amount),
+			Amount:         amountWei,
 			Txout:          uint32(utxo.OutIndex),
 			TxBytes:        txBytes,
 		}
 
 		currentBatch.TransactionParams = append(currentBatch.TransactionParams, bridgeTx)
-		currentBatch.TotalAmount.Add(currentBatch.TotalAmount, big.NewInt(utxo.Amount))
+		currentBatch.TotalAmount.Add(currentBatch.TotalAmount, amountWei)
 		currentBatch.UTXOs = append(currentBatch.UTXOs, utxo)
 
 		// Check if batch is full (limit to prevent large transactions)
@@ -834,6 +826,7 @@ func (up *UtxoProcessor) markUTXOsAsProcessed(utxos []*models.UTXO) error {
 		now := time.Now()
 		for _, utxo := range utxos {
 			utxo.UpdatedAt = now
+			utxo.Status = models.UTXO_STATUS_PROCESSED
 			if err := tx.Save(utxo).Error; err != nil {
 				return fmt.Errorf("failed to mark UTXO %s as processed: %w", utxo.Uid, err)
 			}
@@ -1125,10 +1118,12 @@ func (up *UtxoProcessor) createWithdrawalRequestFromUTXO(utxo *models.UTXO, vout
 		}
 
 		taskIds = append(taskIds, taskId)
-		totalAmount.Add(totalAmount, big.NewInt(vout.Amount))
+		// Convert satoshis (8 decimals) to ERC20 wei (18 decimals)
+		amountWei := new(big.Int).Mul(big.NewInt(vout.Amount), big.NewInt(10000000000))
+		totalAmount.Add(totalAmount, amountWei)
 
-		up.logger.Debugf("VOUT %d: amount=%d, receiver=%s, taskId=%s",
-			vout.OutIndex, vout.Amount, vout.Receiver, taskId.String())
+		up.logger.Debugf("VOUT %d: amount=%d satoshis -> %s wei, receiver=%s, taskId=%s",
+			vout.OutIndex, vout.Amount, amountWei.String(), vout.Receiver, taskId.String())
 	}
 
 	return &withdrawalRequest{

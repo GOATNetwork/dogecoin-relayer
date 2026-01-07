@@ -282,9 +282,11 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 		} else {
 			up.logger.Warnf("Deposit tx bytes missing for %s:%d, falling back to txid bytes", utxo.Txid, utxo.OutIndex)
 		}
+		// Convert satoshis (8 decimals) to ERC20 wei (18 decimals)
+		amountWei := new(big.Int).Mul(big.NewInt(utxo.Amount), big.NewInt(10000000000))
 		txParams[i] = contract.BridgeTransaction{
 			DestEvmAddress: common.HexToAddress(utxo.EvmAddr),
-			Amount:         big.NewInt(utxo.Amount),
+			Amount:         amountWei,
 			Txout:          uint32(utxo.OutIndex),
 			TxBytes:        txBytes,
 		}
@@ -561,7 +563,9 @@ func (up *UtxoProcessor) validateWithdrawalProposal(proposal *WithdrawalProposal
 			if utxo.Amount <= 0 {
 				return fmt.Errorf("UTXO amount must be positive")
 			}
-			calculatedTotal.Add(calculatedTotal, big.NewInt(utxo.Amount))
+			// Convert satoshis (8 decimals) to ERC20 wei (18 decimals)
+			amountWei := new(big.Int).Mul(big.NewInt(utxo.Amount), big.NewInt(10000000000))
+			calculatedTotal.Add(calculatedTotal, amountWei)
 		}
 
 		if calculatedTotal.Cmp(proposal.TotalAmount) != 0 {
