@@ -66,9 +66,10 @@ func (c *SignClient) StartSign(ctx context.Context, sessionID string, unsignHash
 		SessionID: sessionID,
 		Curve:     TssCurve,
 		CoinType:  TssCoinType,
-		Account:   c.cfg.Kdd,
+		Account:   0,
 		Index:     0,
 		SkipPath:  false,
+		KDD:       c.cfg.Kdd,
 	}
 
 	body, err := json.Marshal(req)
@@ -129,10 +130,11 @@ func (c *SignClient) GetEvmAddress(ctx context.Context, sessionID string) (commo
 	req := &tsstypes.AddressRequest{
 		Curve:     TssCurve,
 		CoinType:  TssCoinType,
-		Account:   c.cfg.Kdd,
+		Account:   0,
 		Index:     0,
 		ChainType: "evm",
 		SkipPath:  false,
+		KDD:       c.cfg.Kdd,
 	}
 
 	body, err := json.Marshal(req)

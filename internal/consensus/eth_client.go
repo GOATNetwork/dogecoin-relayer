@@ -141,6 +141,16 @@ func SendTx(ctx context.Context, privateKey *ecdsa.PrivateKey, chainID *big.Int,
 	// Set maxPriorityFeePerGas as a portion of maxFeePerGas
 	maxPriorityFeePerGas := new(big.Int).Div(maxFeePerGas, big.NewInt(10)) // 10% of max fee
 
+	// Ensure minimum gas tip cap (chain requires at least 130000)
+	minGasTipCap := big.NewInt(150000) // Set slightly above minimum
+	if maxPriorityFeePerGas.Cmp(minGasTipCap) < 0 {
+		maxPriorityFeePerGas = minGasTipCap
+	}
+	// Ensure maxFeePerGas is at least maxPriorityFeePerGas
+	if maxFeePerGas.Cmp(maxPriorityFeePerGas) < 0 {
+		maxFeePerGas = new(big.Int).Mul(maxPriorityFeePerGas, big.NewInt(2))
+	}
+
 	// Create and sign the transaction
 	signedTx, err := CreateEIP1559Tx(privateKey, chainID, nonce, gasLimit, to, maxFeePerGas, maxPriorityFeePerGas, value, data)
 	if err != nil {

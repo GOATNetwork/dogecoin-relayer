@@ -113,15 +113,36 @@ func (up *UtxoProcessor) scanDepositUTXOs() error {
 
 	up.logger.Infof("Processing %d valid deposit UTXOs (filtered from %d total)", len(validUTXOs), len(utxos))
 
+	// Check if there are pending batches still awaiting TSS signature
+	// to prevent TSS nonce race conditions. Only process one batch at a time.
+	hasPending := false
+	up.pendingBatches.Range(func(key, value interface{}) bool {
+		if pending, ok := value.(*pendingBatch); ok && pending.batchType == "deposit" {
+			hasPending = true
+			up.logger.Infof("Skipping new deposit processing: pending batch %s awaiting TSS signature", key)
+			return false // stop iteration
+		}
+		return true
+	})
+	if hasPending {
+		up.logger.Info("Waiting for pending deposit batch to complete before processing new deposits")
+		return nil
+	}
+
 	// Group UTXOs into batches for bridge transactions
 	batches := up.groupUTXOsIntoBatches(validUTXOs)
 	up.logger.Infof("Created %d batches from %d UTXOs", len(batches), len(validUTXOs))
 
-	for i, batch := range batches {
-		up.logger.Infof("Processing batch %d/%d with %d UTXOs", i+1, len(batches), len(batch.UTXOs))
+	// Process only ONE batch per poll cycle to prevent TSS nonce race conditions.
+	// Each batch requires a unique TSS nonce, and nonces are fetched from on-chain state.
+	// If we process multiple batches before the first tx is confirmed, they'll all use
+	// the same nonce and fail with "Invalid Signer".
+	if len(batches) > 0 {
+		batch := batches[0]
+		up.logger.Infof("Processing batch 1/%d with %d UTXOs (remaining batches will be processed in next poll cycles)", len(batches), len(batch.UTXOs))
 		if err := up.processDepositBatch(batch); err != nil {
 			up.logger.Errorf("Failed to process deposit batch %s: %v", batch.ID.String(), err)
-			continue
+			return err
 		}
 
 		// NOTE: Do NOT mark UTXOs as processed here.
@@ -129,6 +150,10 @@ func (up *UtxoProcessor) scanDepositUTXOs() error {
 		// after TSS signature is successfully received and verified.
 		// This ensures that failed TSS sessions don't leave UTXOs in limbo.
 		up.logger.Debugf("Deposit batch %s submitted for TSS signing, UTXOs will be marked processed upon completion", batch.ID.String())
+
+		if len(batches) > 1 {
+			up.logger.Infof("Deferring %d remaining batches to next poll cycle to avoid TSS nonce race condition", len(batches)-1)
+		}
 	}
 
 	return nil
@@ -136,30 +161,43 @@ func (up *UtxoProcessor) scanDepositUTXOs() error {
 
 // scanWithdrawalUTXOs handles withdrawal UTXO processing
 func (up *UtxoProcessor) scanWithdrawalUTXOs() error {
-	// Query for new unprocessed withdrawal UTXOs
 	utxos, err := up.getUnprocessedWithdrawalUTXOs()
 	if err != nil {
 		return fmt.Errorf("failed to get unprocessed withdrawal UTXOs: %w", err)
 	}
 
 	if len(utxos) == 0 {
-		return nil // No new withdrawal UTXOs to process
+		return nil
 	}
 
 	up.logger.Infof("Found %d new withdrawal UTXOs to process", len(utxos))
 
-	// For withdrawals, each UTXO is processed individually (not batched)
-	// because each UTXO contains multiple outputs aligned with task IDs
-	for _, utxo := range utxos {
-		if err := up.processWithdrawalUTXO(utxo); err != nil {
-			up.logger.Errorf("Failed to process withdrawal UTXO %s: %v", utxo.Uid, err)
-			continue
+	// Check if there are pending withdrawal batches still awaiting TSS signature
+	hasPending := false
+	up.pendingBatches.Range(func(key, value interface{}) bool {
+		if pending, ok := value.(*pendingBatch); ok && pending.batchType == "withdrawal" {
+			hasPending = true
+			up.logger.Infof("Skipping new withdrawal processing: pending batch %s awaiting TSS signature", key)
+			return false
 		}
+		return true
+	})
+	if hasPending {
+		up.logger.Info("Waiting for pending withdrawal batch to complete before processing new withdrawals")
+		return nil
+	}
 
-		// NOTE: Do NOT mark UTXO as processed here.
-		// UTXOs will be marked as processed in completeBatchWithSignature()
-		// after TSS signature is successfully received and verified.
-		up.logger.Debugf("Withdrawal UTXO %s submitted for TSS signing, will be marked processed upon completion", utxo.Uid)
+	// Process only ONE withdrawal UTXO per poll cycle to prevent TSS nonce race conditions
+	utxo := utxos[0]
+	if err := up.processWithdrawalUTXO(utxo); err != nil {
+		up.logger.Errorf("Failed to process withdrawal UTXO %s: %v", utxo.Uid, err)
+		return err
+	}
+
+	up.logger.Debugf("Withdrawal UTXO %s submitted for TSS signing, will be marked processed upon completion", utxo.Uid)
+
+	if len(utxos) > 1 {
+		up.logger.Infof("Deferring %d remaining withdrawal UTXOs to next poll cycle", len(utxos)-1)
 	}
 
 	return nil

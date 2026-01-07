@@ -34,6 +34,16 @@ type DogeModule struct {
 
 var _ module.Module = (*DogeModule)(nil)
 
+// DogeClientProvider exposes the initialized Dogecoin RPC client.
+type DogeClientProvider interface {
+	DogeClient() *DogeClient
+}
+
+// DogeClient returns the initialized client instance for other modules.
+func (m *DogeModule) DogeClient() *DogeClient {
+	return m.client
+}
+
 type txProcessingResult struct {
 	txid            string
 	sender          string

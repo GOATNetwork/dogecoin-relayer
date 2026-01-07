@@ -15,6 +15,7 @@ type Config struct {
 	Withdraw  WithdrawConfig  `yaml:"withdraw"`
 	P2P       P2PConfig       `yaml:"p2p"`
 	Http      HttpConfig      `yaml:"http"`
+	Grpc      GrpcConfig      `yaml:"grpc"`
 	Rpc       RpcConfig       `yaml:"rpc"`
 	Scan      ScanConfig      `yaml:"scan"`
 	Consensus ConsensusConfig `yaml:"consensus"`
@@ -68,6 +69,20 @@ type RpcConfig struct {
 	Port    int  `yaml:"port"`
 }
 
+type GrpcConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Port        int    `yaml:"port"`
+	UseTLS      bool   `yaml:"use_tls"`
+	CertFile    string `yaml:"cert_file"`
+	KeyFile     string `yaml:"key_file"`
+	MaxRecvSize int    `yaml:"max_recv_size"`
+	MaxSendSize int    `yaml:"max_send_size"`
+	MaxConnAge  int    `yaml:"max_conn_age"`
+	MaxConnIdle int    `yaml:"max_conn_idle"`
+	PingTime    int    `yaml:"ping_time"`
+	Timeout     int    `yaml:"timeout"`
+}
+
 type DogeConfig struct {
 	RpcUrl        string            `yaml:"rpc_url"`
 	RpcUser       string            `yaml:"rpc_user"`
@@ -116,7 +131,7 @@ type EventDetectionConfig struct {
 type TssConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Url     string `yaml:"url"`
-	Kdd     uint32 `yaml:"kdd"`
+	Kdd     string `yaml:"kdd"`
 	Timeout int    `yaml:"timeout"` // unit: second
 }
 
