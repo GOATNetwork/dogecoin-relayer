@@ -113,6 +113,9 @@ type ConsensusConfig struct {
 	// Event detection configuration
 	EventDetection EventDetectionConfig `yaml:"event_detection"`
 
+	// UTXO processor polling configuration
+	UtxoPollingIntervalSec int `yaml:"utxo_polling_interval_sec"`
+
 	// hex from environment variable: PROPOSER_PRIVATE_KEY
 	ProposerPrivateKey string
 }

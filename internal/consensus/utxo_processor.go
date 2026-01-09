@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
 	log "github.com/sirupsen/logrus"
+	"gorm.io/gorm"
 )
 
 // BridgeInBatch represents a batch of bridge transactions
@@ -143,15 +145,15 @@ func NewUtxoProcessor(conn *models.DBConnection, bridgeContractAddress, entryPoi
 
 	up := &UtxoProcessor{
 		conn:                   conn,
-		state:                  models.NewStateRepository(conn.GetDB()),
+		state:                  models.NewStateRepository(conn),
 		logger:                 types.InitLogEntry("utxo-processor"),
 		eventBus:               global.GetEventBus(),
 		bridgeContract:         common.HexToAddress(bridgeContractAddress),
 		entryPointContract:     common.HexToAddress(entryPointAddress),
 		abiPath:                abiPath,
-		pollInterval:           10 * time.Second, // Poll every 10 seconds
-		batchSize:              1,                // Process 1 UTXO at a time for debugging
+		batchSize:              1,
 		lastProcessedId:        0,
+		pollInterval:           10 * time.Second,
 		ctx:                    ctx,
 		cancel:                 cancel,
 		isRunning:              false,
@@ -259,6 +261,11 @@ func (up *UtxoProcessor) Start() error {
 		up.SetChainID(chainID)
 		up.logger.Infof("Chain ID set to %d", globalCfg.Consensus.ChainId)
 
+		if globalCfg.Consensus.UtxoPollingIntervalSec > 0 {
+			up.pollInterval = time.Duration(globalCfg.Consensus.UtxoPollingIntervalSec) * time.Second
+			up.logger.Infof("UTXO polling interval set to %d seconds", globalCfg.Consensus.UtxoPollingIntervalSec)
+		}
+
 		up.logger.Info("TSS client configured for UTXO processor")
 	} else {
 		up.logger.Warn("TSS is not enabled, bridge transactions will not be signed")
@@ -266,6 +273,10 @@ func (up *UtxoProcessor) Start() error {
 
 	up.isRunning = true
 	up.logger.Info("Starting UTXO manager")
+
+	if err := up.loadPendingBatchesFromDB(); err != nil {
+		up.logger.Errorf("Failed to load pending batches from database: %v", err)
+	}
 
 	up.registerP2PHandler()
 	// Subscribe to TSS signature responses
@@ -481,4 +492,153 @@ func (up *UtxoProcessor) removePendingSession(baseID string, pending *pendingBat
 	if pending.baseSessionID != "" && pending.baseSessionID != baseID {
 		up.tssSessionAliases.Delete(pending.baseSessionID)
 	}
+
+	if err := up.state.UpdatePendingBatchStatus(baseID, models.PENDING_BATCH_STATUS_COMPLETED); err != nil {
+		up.logger.Errorf("Failed to update pending batch %s status to completed: %v", baseID, err)
+	}
+}
+
+func (up *UtxoProcessor) persistPendingBatch(pending *pendingBatch) error {
+	dbBatch := up.pendingBatchToDBModel(pending)
+
+	err := up.state.WithPendingBatchTransactionRetry(func(tx *gorm.DB) error {
+		return tx.Create(dbBatch).Error
+	})
+
+	if err != nil {
+		up.logger.Errorf("Failed to persist pending batch %s to database: %v", pending.baseSessionID, err)
+		return err
+	}
+
+	up.logger.Infof("Persisted pending batch %s to database", pending.baseSessionID)
+	return nil
+}
+
+func (up *UtxoProcessor) updatePendingBatchInDB(pending *pendingBatch) error {
+	dbBatch := up.pendingBatchToDBModel(pending)
+
+	err := up.state.WithPendingBatchTransactionRetry(func(tx *gorm.DB) error {
+		return tx.Save(dbBatch).Error
+	})
+
+	if err != nil {
+		up.logger.Errorf("Failed to update pending batch %s in database: %v", pending.baseSessionID, err)
+		return err
+	}
+
+	return nil
+}
+
+func (up *UtxoProcessor) loadPendingBatchesFromDB() error {
+	dbBatches, err := up.state.GetAllPendingBatches()
+	if err != nil {
+		return fmt.Errorf("failed to load pending batches from database: %w", err)
+	}
+
+	if len(dbBatches) == 0 {
+		up.logger.Info("No pending batches found in database")
+		return nil
+	}
+
+	up.logger.Infof("Loading %d pending batches from database", len(dbBatches))
+
+	for _, dbBatch := range dbBatches {
+		pending := up.dbModelToPendingBatch(dbBatch)
+
+		if pending.baseSessionID != "" {
+			up.pendingBatches.Store(pending.baseSessionID, pending)
+			if pending.currentSessionID != "" {
+				up.tssSessionAliases.Store(pending.currentSessionID, pending.baseSessionID)
+			}
+			up.logger.Infof("Loaded pending batch %s (type=%s, attempt=%d)",
+				pending.baseSessionID, pending.batchType, pending.nextAttempt)
+		}
+	}
+
+	return nil
+}
+
+func (up *UtxoProcessor) pendingBatchToDBModel(pending *pendingBatch) *models.PendingBatch {
+	dbBatch := &models.PendingBatch{
+		BaseSessionID: pending.baseSessionID,
+		BatchType:     pending.batchType,
+		CallData:      pending.calldata,
+		NextAttempt:   pending.nextAttempt,
+		LastAttempt:   pending.lastAttempt,
+		NextRetryAt:   pending.nextRetryAt,
+		Status:        models.PENDING_BATCH_STATUS_PENDING,
+	}
+
+	if pending.tssNonce != nil {
+		dbBatch.TssNonce = pending.tssNonce.String()
+	}
+
+	if pending.batchType == "deposit" && pending.depositBatch != nil {
+		dbBatch.BatchID = pending.depositBatch.ID.String()
+		if pending.depositBatch.TotalAmount != nil {
+			dbBatch.TotalAmount = pending.depositBatch.TotalAmount.String()
+		}
+	}
+
+	if pending.batchType == "withdrawal" && pending.withdrawalRequest != nil {
+		dbBatch.WithdrawalID = pending.withdrawalRequest.ID.String()
+		if len(pending.withdrawalRequest.TaskIds) > 0 {
+			taskIdsJSON, _ := json.Marshal(pending.withdrawalRequest.TaskIds)
+			dbBatch.TaskIdsJSON = string(taskIdsJSON)
+		}
+		dbBatch.TxId = pending.withdrawalRequest.TxId
+	}
+
+	return dbBatch
+}
+
+func (up *UtxoProcessor) dbModelToPendingBatch(dbBatch *models.PendingBatch) *pendingBatch {
+	pending := &pendingBatch{
+		batchType:         dbBatch.BatchType,
+		calldata:          dbBatch.CallData,
+		baseSessionID:     dbBatch.BaseSessionID,
+		currentSessionID:  "",
+		nextAttempt:       dbBatch.NextAttempt,
+		lastAttempt:       dbBatch.LastAttempt,
+		nextRetryAt:       dbBatch.NextRetryAt,
+		depositBatch:      nil,
+		withdrawalRequest: nil,
+		utxos:             nil,
+	}
+
+	if dbBatch.TssNonce != "" {
+		if nonce, ok := new(big.Int).SetString(dbBatch.TssNonce, 10); ok {
+			pending.tssNonce = nonce
+		}
+	}
+
+	if dbBatch.BatchType == "deposit" && dbBatch.BatchID != "" {
+		if batchID, ok := new(big.Int).SetString(dbBatch.BatchID, 10); ok {
+			pending.depositBatch = &BridgeInBatch{
+				ID: batchID,
+			}
+			if dbBatch.TotalAmount != "" {
+				if amount, ok := new(big.Int).SetString(dbBatch.TotalAmount, 10); ok {
+					pending.depositBatch.TotalAmount = amount
+				}
+			}
+		}
+	}
+
+	if dbBatch.BatchType == "withdrawal" && dbBatch.WithdrawalID != "" {
+		if withdrawalID, ok := new(big.Int).SetString(dbBatch.WithdrawalID, 10); ok {
+			var taskIds []*big.Int
+			if dbBatch.TaskIdsJSON != "" {
+				json.Unmarshal([]byte(dbBatch.TaskIdsJSON), &taskIds)
+			}
+
+			pending.withdrawalRequest = &withdrawalRequest{
+				ID:      withdrawalID,
+				TaskIds: taskIds,
+				TxId:    dbBatch.TxId,
+			}
+		}
+	}
+
+	return pending
 }

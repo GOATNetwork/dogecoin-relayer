@@ -91,15 +91,9 @@ func (c *SignClient) StartSign(ctx context.Context, sessionID string, unsignHash
 
 	c.logger.Infof("TSS response: Status=%d", resp.StatusCode)
 
-	// Read response body for debugging
-	var responseBody bytes.Buffer
-	responseBody.ReadFrom(resp.Body)
-	responseBodyStr := responseBody.String()
-	c.logger.Infof("TSS response body: %s", responseBodyStr)
-
 	var signStartResponse tsstypes.SignStartResponse
-	if err := json.Unmarshal(responseBody.Bytes(), &signStartResponse); err != nil {
-		return nil, fmt.Errorf("failed to decode sign start response (body: %s): %w", responseBodyStr, err)
+	if err := json.NewDecoder(resp.Body).Decode(&signStartResponse); err != nil {
+		return nil, fmt.Errorf("failed to decode sign start response: %w", err)
 	}
 
 	return &signStartResponse, nil

@@ -168,8 +168,20 @@ func (up *UtxoProcessor) handleTssSignature(data any) {
 	} else {
 		up.logger.Errorf("TSS signing failed for session %s: %s", resp.SessionID, resp.Message)
 
-		// For timeout errors, keep the batch for retry; for other errors, remove it
+		isTransient := false
+
 		if strings.Contains(resp.Message, "timeout") || strings.Contains(resp.Message, "timed out") {
+			isTransient = true
+		}
+
+		if strings.Contains(resp.Message, "403") || strings.Contains(resp.Message, "Forbidden") {
+			isTransient = true
+		}
+		if strings.Contains(resp.Message, "503") || strings.Contains(resp.Message, "Service Unavailable") {
+			isTransient = true
+		}
+
+		if isTransient {
 			now := time.Now()
 			retryDelay := up.tssRequestRetryBackoff
 			if retryDelay <= 0 {
@@ -178,11 +190,15 @@ func (up *UtxoProcessor) handleTssSignature(data any) {
 			pending.lastAttempt = now
 			pending.nextRetryAt = now.Add(retryDelay)
 			up.pendingBatches.Store(key, pending)
-			up.logger.Infof("Keeping batch %s for retry due to timeout", resp.SessionID)
+
+			if err := up.updatePendingBatchInDB(pending); err != nil {
+				up.logger.Warnf("Failed to update pending batch %s in database after transient error (continuing anyway): %v", key, err)
+			}
+
+			up.logger.Infof("Keeping batch %s for retry due to transient error: %s", resp.SessionID, resp.Message)
 		} else {
-			// Remove from pending batches for non-timeout errors
 			up.pendingBatches.Delete(key)
-			up.logger.Infof("Removed batch %s due to non-timeout error", baseSessionID)
+			up.logger.Infof("Removed batch %s due to fatal error: %s", baseSessionID, resp.Message)
 		}
 		up.tssSessionAliases.Delete(resp.SessionID)
 
@@ -340,6 +356,10 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 	up.registerExistingTssSession(pending, proposal.SessionID)
 	up.pendingBatches.Store(key, pending)
 
+	if err := up.persistPendingBatch(pending); err != nil {
+		up.logger.Warnf("Failed to persist pending batch %s from P2P proposal to database (continuing anyway): %v", key, err)
+	}
+
 	// Create hash to sign for verifyAndCall function
 	digest, baseHash, err := up.computeVerifyAndCallDigest(calldata, pending.tssNonce)
 	if err != nil {
@@ -441,6 +461,10 @@ func (up *UtxoProcessor) handleP2PWithdrawalProposal(msg *types.P2PBroadcastMess
 	pending.tssNonce = new(big.Int).Set(proposal.TssNonce)
 	up.registerExistingTssSession(pending, proposal.SessionID)
 	up.pendingBatches.Store(key, pending)
+
+	if err := up.persistPendingBatch(pending); err != nil {
+		up.logger.Warnf("Failed to persist pending withdrawal batch %s from P2P proposal to database (continuing anyway): %v", key, err)
+	}
 
 	// Create hash to sign for verifyAndCall function
 	digest, baseHash, err := up.computeVerifyAndCallDigest(calldata, pending.tssNonce)

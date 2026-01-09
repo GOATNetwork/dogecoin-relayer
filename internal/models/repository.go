@@ -77,7 +77,7 @@ func (r *UTXORepository) GetUnprocessedDepositUTXOs(lastProcessedId uint, batchS
 		UTXO_STATUS_CONFIRMED,
 		lastProcessedId,
 	).Limit(batchSize).Find(&utxos).Error
-	
+
 	return utxos, err
 }
 
@@ -90,7 +90,7 @@ func (r *UTXORepository) GetUnprocessedWithdrawalUTXOs(lastProcessedId uint, bat
 		UTXO_STATUS_CONFIRMED,
 		lastProcessedId,
 	).Limit(batchSize).Find(&utxos).Error
-	
+
 	return utxos, err
 }
 
@@ -206,20 +206,124 @@ func (r *SendOrderRepository) UpdateSendOrderConfirmed(txid string, confirmBlock
 		}).Error
 }
 
+// PendingBatchRepository handles pending batch database operations
+type PendingBatchRepository struct {
+	db *gorm.DB
+}
+
+func NewPendingBatchRepository(db *gorm.DB) *PendingBatchRepository {
+	return &PendingBatchRepository{db: db}
+}
+
+// CreatePendingBatch creates a new pending batch
+func (r *PendingBatchRepository) CreatePendingBatch(batch *PendingBatch) error {
+	return r.db.Create(batch).Error
+}
+
+// GetPendingBatchByBaseSessionID retrieves a pending batch by base session ID
+func (r *PendingBatchRepository) GetPendingBatchByBaseSessionID(baseSessionID string) (*PendingBatch, error) {
+	var batch PendingBatch
+	err := r.db.Where("base_session_id = ? AND status = ?", baseSessionID, PENDING_BATCH_STATUS_PENDING).First(&batch).Error
+	if err != nil {
+		return nil, err
+	}
+	return &batch, nil
+}
+
+// GetAllPendingBatches retrieves all pending batches
+func (r *PendingBatchRepository) GetAllPendingBatches() ([]*PendingBatch, error) {
+	var batches []*PendingBatch
+	err := r.db.Where("status = ?", PENDING_BATCH_STATUS_PENDING).Find(&batches).Error
+	return batches, err
+}
+
+// UpdatePendingBatch updates a pending batch
+func (r *PendingBatchRepository) UpdatePendingBatch(batch *PendingBatch) error {
+	return r.db.Save(batch).Error
+}
+
+// DeletePendingBatchByBaseSessionID deletes a pending batch by base session ID
+func (r *PendingBatchRepository) DeletePendingBatchByBaseSessionID(baseSessionID string) error {
+	return r.db.Where("base_session_id = ?", baseSessionID).Delete(&PendingBatch{}).Error
+}
+
+// UpdatePendingBatchStatus updates the status of a pending batch
+func (r *PendingBatchRepository) UpdatePendingBatchStatus(baseSessionID, status string) error {
+	return r.db.Model(&PendingBatch{}).
+		Where("base_session_id = ?", baseSessionID).
+		Update("status", status).Error
+}
+
+// WithPendingBatchTransactionRetry wraps a function with transaction and retry logic
+func (r *PendingBatchRepository) WithPendingBatchTransactionRetry(fn func(tx *gorm.DB) error) error {
+	var lastErr error
+	maxRetries := 5
+	retryDelay := 50 * time.Millisecond
+
+	for i := 0; i < maxRetries; i++ {
+		if i > 0 {
+			time.Sleep(retryDelay)
+			retryDelay *= 2
+		}
+
+		err := r.db.Transaction(func(tx *gorm.DB) error {
+			return fn(tx)
+		})
+
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+
+		if !isTransientError(err) {
+			return err
+		}
+	}
+
+	return lastErr
+}
+
+// isTransientError checks if an error is a transient database error that should be retried
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return containsSubstring(errStr, "database is locked") ||
+		containsSubstring(errStr, "SQLITE_BUSY") ||
+		containsSubstring(errStr, "database is busy")
+}
+
+func containsSubstring(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) && containsSubstringHelper(s, substr))
+}
+
+func containsSubstringHelper(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
 // StateRepository combines all repositories for convenience
 type StateRepository struct {
-	UTXORepo      *UTXORepository
-	VINRepo       *VINRepository
-	VOUTRepo      *VOUTRepository
-	SendOrderRepo *SendOrderRepository
+	UTXORepo         *UTXORepository
+	VINRepo          *VINRepository
+	VOUTRepo         *VOUTRepository
+	SendOrderRepo    *SendOrderRepository
+	PendingBatchRepo *PendingBatchRepository
 }
 
 func NewStateRepository(db *gorm.DB) *StateRepository {
 	return &StateRepository{
-		UTXORepo:      NewUTXORepository(db),
-		VINRepo:       NewVINRepository(db),
-		VOUTRepo:      NewVOUTRepository(db),
-		SendOrderRepo: NewSendOrderRepository(db),
+		UTXORepo:         NewUTXORepository(db),
+		VINRepo:          NewVINRepository(db),
+		VOUTRepo:         NewVOUTRepository(db),
+		SendOrderRepo:    NewSendOrderRepository(db),
+		PendingBatchRepo: NewPendingBatchRepository(db),
 	}
 }
 
@@ -258,4 +362,32 @@ func (s *StateRepository) GetUnprocessedDepositUTXOs(lastProcessedId uint, batch
 
 func (s *StateRepository) GetUnprocessedWithdrawalUTXOs(lastProcessedId uint, batchSize int) ([]*UTXO, error) {
 	return s.UTXORepo.GetUnprocessedWithdrawalUTXOs(lastProcessedId, batchSize)
+}
+
+func (s *StateRepository) CreatePendingBatch(batch *PendingBatch) error {
+	return s.PendingBatchRepo.CreatePendingBatch(batch)
+}
+
+func (s *StateRepository) GetPendingBatchByBaseSessionID(baseSessionID string) (*PendingBatch, error) {
+	return s.PendingBatchRepo.GetPendingBatchByBaseSessionID(baseSessionID)
+}
+
+func (s *StateRepository) GetAllPendingBatches() ([]*PendingBatch, error) {
+	return s.PendingBatchRepo.GetAllPendingBatches()
+}
+
+func (s *StateRepository) UpdatePendingBatch(batch *PendingBatch) error {
+	return s.PendingBatchRepo.UpdatePendingBatch(batch)
+}
+
+func (s *StateRepository) DeletePendingBatchByBaseSessionID(baseSessionID string) error {
+	return s.PendingBatchRepo.DeletePendingBatchByBaseSessionID(baseSessionID)
+}
+
+func (s *StateRepository) UpdatePendingBatchStatus(baseSessionID, status string) error {
+	return s.PendingBatchRepo.UpdatePendingBatchStatus(baseSessionID, status)
+}
+
+func (s *StateRepository) WithPendingBatchTransactionRetry(fn func(tx *gorm.DB) error) error {
+	return s.PendingBatchRepo.WithPendingBatchTransactionRetry(fn)
 }

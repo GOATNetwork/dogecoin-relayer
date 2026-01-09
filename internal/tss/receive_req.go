@@ -1,7 +1,6 @@
 package tss
 
 import (
-	"context"
 	"strings"
 	"time"
 
@@ -23,7 +22,7 @@ func (m *TssModule) handleSignStart(data any) {
 		m.logger.Errorf("invalid data type: %T", data)
 		return
 	}
-	ssResp, err := m.signClient.StartSign(context.Background(), req.SessionID, req.UnsignHash)
+	ssResp, err := m.signClient.StartSign(m.ctx, req.SessionID, req.UnsignHash)
 	if err != nil {
 		m.logger.Errorf("failed to sign start: %v", err)
 

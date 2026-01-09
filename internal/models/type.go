@@ -173,3 +173,33 @@ const (
 	ORDER_TYPE_CONSOLIDATION = "consolidation"
 	ORDER_TYPE_SAFEBOX       = "safebox"
 )
+
+// PendingBatch represents a batch waiting for TSS signature
+type PendingBatch struct {
+	gorm.Model `swaggerignore:"true"`
+
+	BaseSessionID string    `gorm:"uniqueIndex:idx_pending_batch_base_session;type:varchar(255);not null" json:"base_session_id"`
+	BatchType     string    `gorm:"type:varchar(20);not null" json:"batch_type"` // "deposit" or "withdrawal"
+	CallData      []byte    `gorm:"type:blob" json:"calldata"`
+	TssNonce      string    `gorm:"type:varchar(80)" json:"tss_nonce"`
+	NextAttempt   int       `gorm:"type:int;default:0" json:"next_attempt"`
+	LastAttempt   time.Time `gorm:"type:timestamp" json:"last_attempt"`
+	NextRetryAt   time.Time `gorm:"type:timestamp" json:"next_retry_at"`
+	Status        string    `gorm:"type:varchar(20);default:'pending'" json:"status"` // "pending", "completed", "failed"
+
+	// Deposit-specific fields (nullable)
+	BatchID     string `gorm:"type:varchar(80)" json:"batch_id,omitempty"`
+	TotalAmount string `gorm:"type:varchar(80)" json:"total_amount,omitempty"`
+
+	// Withdrawal-specific fields (nullable)
+	WithdrawalID string `gorm:"type:varchar(255)" json:"withdrawal_id,omitempty"`
+	TaskIdsJSON  string `gorm:"type:text" json:"task_ids_json,omitempty"`
+	TxId         string `gorm:"type:varchar(66)" json:"txid,omitempty"`
+}
+
+// Constants for pending batch status
+const (
+	PENDING_BATCH_STATUS_PENDING   = "pending"
+	PENDING_BATCH_STATUS_COMPLETED = "completed"
+	PENDING_BATCH_STATUS_FAILED    = "failed"
+)

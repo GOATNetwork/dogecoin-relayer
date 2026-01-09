@@ -478,6 +478,11 @@ func (up *UtxoProcessor) retryDepositBatch(pending *pendingBatch) error {
 	up.logger.Infof("Retrying deposit batch for base session %s (next attempt %d)", pending.baseSessionID, pending.nextAttempt+1)
 	actualSession := up.assignNewTssSession(pending)
 	up.pendingBatches.Store(pending.baseSessionID, pending)
+
+	if err := up.updatePendingBatchInDB(pending); err != nil {
+		up.logger.Warnf("Failed to update pending batch %s in database (continuing anyway): %v", pending.baseSessionID, err)
+	}
+
 	if err := up.requestTssSignature(pending.calldata, actualSession); err != nil {
 		return err
 	}
@@ -495,6 +500,11 @@ func (up *UtxoProcessor) retryWithdrawalBatch(pending *pendingBatch) error {
 	up.logger.Infof("Retrying withdrawal batch for base session %s (next attempt %d)", pending.baseSessionID, pending.nextAttempt+1)
 	actualSession := up.assignNewTssSession(pending)
 	up.pendingBatches.Store(pending.baseSessionID, pending)
+
+	if err := up.updatePendingBatchInDB(pending); err != nil {
+		up.logger.Warnf("Failed to update pending withdrawal batch %s in database (continuing anyway): %v", pending.baseSessionID, err)
+	}
+
 	return up.requestWithdrawalTssSignature(pending.calldata, actualSession, pending.withdrawalRequest)
 }
 
@@ -554,6 +564,10 @@ func (up *UtxoProcessor) processDepositBatch(batch *BridgeInBatch) error {
 	}
 	actualSessionID := up.assignNewTssSession(pending)
 	up.pendingBatches.Store(pending.baseSessionID, pending)
+
+	if err := up.persistPendingBatch(pending); err != nil {
+		up.logger.Warnf("Failed to persist pending batch %s to database (continuing anyway): %v", pending.baseSessionID, err)
+	}
 
 	// Add defer to clean up on panic
 	defer func() {
@@ -642,6 +656,10 @@ func (up *UtxoProcessor) processWithdrawalRequest(request *withdrawalRequest) er
 	}
 	actualSessionID := up.assignNewTssSession(pending)
 	up.pendingBatches.Store(pending.baseSessionID, pending)
+
+	if err := up.persistPendingBatch(pending); err != nil {
+		up.logger.Warnf("Failed to persist pending withdrawal batch %s to database (continuing anyway): %v", pending.baseSessionID, err)
+	}
 
 	// Request TSS signature asynchronously
 	if err := up.requestWithdrawalTssSignature(calldata, actualSessionID, request); err != nil {
