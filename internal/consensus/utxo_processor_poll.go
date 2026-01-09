@@ -342,9 +342,9 @@ func (up *UtxoProcessor) groupUTXOsIntoBatches(utxos []*models.UTXO) []*BridgeIn
 			}
 
 			if len(txBytes) == 0 {
-				// Fallback: use txid bytes if deposit record missing or tx bytes empty
-				up.logger.Warnf("Deposit raw bytes missing for %s:%d, falling back to txid bytes", utxo.Txid, utxo.OutIndex)
-				txBytes = []byte(utxo.Txid)
+				// CRITICAL: Do not fallback to txid bytes - the bridge contract requires raw tx bytes for verification
+				up.logger.Errorf("Deposit raw bytes missing for %s:%d - skipping this UTXO", utxo.Txid, utxo.OutIndex)
+				continue
 			}
 		}
 

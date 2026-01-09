@@ -152,19 +152,22 @@ func (up *UtxoProcessor) handleTssSignature(data any) {
 		}
 
 		up.logger.Infof("TSS signature successful for session %s", resp.SessionID)
-		// Remove from pending batches on success
-		up.pendingBatches.Delete(key)
-		up.tssSessionAliases.Delete(resp.SessionID)
+		up.logger.Infof("TSS signature successful for session %s", resp.SessionID)
 
 		up.logger.Debugf("verifyAndCall target: %s", up.bridgeContract.Hex())
 		up.logger.Debugf("verifyAndCall calldata: %x", pending.calldata)
 		up.logger.Debugf("verifyAndCall digest: %x", resp.RawSig)
 
-		// Continue with transaction submission
+		// Only delete from pending batches AFTER successful transaction submission
 		err = up.completeBatchWithSignature(pending, resp.RawSig)
 		if err != nil {
 			up.logger.Errorf("Failed to complete batch with signature: %v", err)
+			return
 		}
+
+		// Remove from pending batches on success
+		up.pendingBatches.Delete(key)
+		up.tssSessionAliases.Delete(resp.SessionID)
 	} else {
 		up.logger.Errorf("TSS signing failed for session %s: %s", resp.SessionID, resp.Message)
 
@@ -296,7 +299,8 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 		if err := up.conn.GetDB().Where("tx_id = ? AND vout = ?", utxo.Txid, utxo.OutIndex).First(&dep).Error; err == nil && len(dep.TxBytes) > 0 {
 			txBytes = dep.TxBytes
 		} else {
-			up.logger.Warnf("Deposit tx bytes missing for %s:%d, falling back to txid bytes", utxo.Txid, utxo.OutIndex)
+			up.logger.Warnf("Deposit tx bytes missing for %s:%d - cannot process without raw transaction bytes", utxo.Txid, utxo.OutIndex)
+			return fmt.Errorf("deposit tx bytes missing for %s:%d", utxo.Txid, utxo.OutIndex)
 		}
 		// Convert satoshis (8 decimals) to ERC20 wei (18 decimals)
 		amountWei := new(big.Int).Mul(big.NewInt(utxo.Amount), big.NewInt(10000000000))

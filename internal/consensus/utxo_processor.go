@@ -145,7 +145,7 @@ func NewUtxoProcessor(conn *models.DBConnection, bridgeContractAddress, entryPoi
 
 	up := &UtxoProcessor{
 		conn:                   conn,
-		state:                  models.NewStateRepository(conn),
+		state:                  models.NewStateRepository(conn.GetDB()),
 		logger:                 types.InitLogEntry("utxo-processor"),
 		eventBus:               global.GetEventBus(),
 		bridgeContract:         common.HexToAddress(bridgeContractAddress),
