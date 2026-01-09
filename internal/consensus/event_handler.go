@@ -121,8 +121,8 @@ func (eh *EventHandler) processBridgeIn(event BlockchainEvent) error {
 
 	logger.Infof("Processing BridgeIn for Dogecoin txId=%s", txId)
 
-	// Use repository's transaction wrapper for automatic rollback on error
-	return eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+	// Use repository's transaction wrapper with automatic retry on database lock errors
+	return eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
 		var matchingDeposits []models.Deposit
 		if err := tx.Where("tx_id = ?", txId).Find(&matchingDeposits).Error; err != nil {
 			return fmt.Errorf("query deposits by tx_id failed: %w", err)
@@ -139,6 +139,13 @@ func (eh *EventHandler) processBridgeIn(event BlockchainEvent) error {
 		if err := eh.eventRepo.UpdateDepositStatus(tx, dep.ID, "confirmed"); err != nil {
 			return fmt.Errorf("failed updating deposit status: %w", err)
 		}
+
+		if err := tx.Model(&models.UTXO{}).
+			Where("txid = ? AND out_index = ?", dep.TxId, dep.Vout).
+			Update("status", models.UTXO_STATUS_PROCESSED).Error; err != nil {
+			return fmt.Errorf("failed updating UTXO status: %w", err)
+		}
+		logger.Infof("Updated UTXO %s:%d status to processed", dep.TxId, dep.Vout)
 
 		// Also set EVM fields
 		dep.EvmTxHash = event.TxHash.Hex()
@@ -231,8 +238,8 @@ func (eh *EventHandler) processBridgeOutFinished(event BlockchainEvent) error {
 		return fmt.Errorf("failed to parse BridgeOutFinished.taskIds: %w", err)
 	}
 
-	// Update withdrawal to final state using transaction wrapper
-	err = eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+	// Update withdrawal to final state using transaction wrapper with retry on lock errors
+	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
 		for _, taskId := range taskIds {
 			if err := eh.eventRepo.SetWithdrawalFinishInfo(tx, taskId,
 				event.TxHash.Hex(), event.BlockNumber, event.LogIndex); err != nil {
@@ -333,7 +340,7 @@ func (eh *EventHandler) processAddProposerRequested(event BlockchainEvent) error
 	// Save pending state with serialized event data
 	payload, _ := json.Marshal(event.EventData)
 
-	err = eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
 		proposer := &models.Proposers{
 			Address:      proposerAddr,
 			Status:       "pending",
@@ -359,7 +366,7 @@ func (eh *EventHandler) processRemoveProposerRequested(event BlockchainEvent) er
 
 	payload, _ := json.Marshal(event.EventData)
 
-	err = eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
 		// keep status pending, store pending event, set exit block when confirmed later
 		proposer := &models.Proposers{
 			Address:      proposerAddr,
@@ -384,7 +391,7 @@ func (eh *EventHandler) processProposerConfirmed(event BlockchainEvent) error {
 	}
 
 	var finalStatus string
-	err = eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
 		rec, err := eh.eventRepo.GetProposer(tx, proposerAddr)
 		if err != nil {
 			return fmt.Errorf("failed to load proposer %s: %w", proposerAddr, err)

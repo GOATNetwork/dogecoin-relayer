@@ -610,19 +610,37 @@ func (up *UtxoProcessor) completeBatchWithSignature(pending *pendingBatch, signa
 	// Send the calldata to the bridge contract
 	txHash, err := up.sendCalldataToBridge(pending.calldata, signature)
 	if err != nil {
+		// Check if the error is "Tx output already processed" - this means the deposit
+		// was already processed on-chain (likely by another node or a previous attempt).
+		// We just log and return nil - the EventHandler will update status when BridgeIn event is received.
+		if strings.Contains(err.Error(), "Tx output already processed") {
+			up.logger.Warnf("Tx output already processed on-chain for batch %s, EventHandler will update status via BridgeIn event", batchID)
+			return nil
+		}
 		return fmt.Errorf("failed to send calldata to bridge: %w", err)
 	}
 
 	up.logger.Infof("Bridge transaction sent successfully. TxHash: %s", txHash.Hex())
-
-	// Mark UTXOs as processed
-	err = up.markUTXOsAsProcessed(pending.utxos)
-	if err != nil {
-		up.logger.Errorf("Failed to mark UTXOs as processed: %v", err)
-		return err
-	}
+	// Status updates (UTXO and Deposit) will be handled by EventHandler when BridgeIn event is received
 
 	return nil
+}
+
+// updateDepositsToConfirmed updates the Deposit records status to 'confirmed' after successful on-chain processing
+func (up *UtxoProcessor) updateDepositsToConfirmed(utxos []*models.UTXO, evmTxHash string) {
+	for _, utxo := range utxos {
+		result := up.conn.GetDB().Model(&models.Deposit{}).
+			Where("tx_id = ? AND vout = ?", utxo.Txid, utxo.OutIndex).
+			Updates(map[string]interface{}{
+				"status":      "confirmed",
+				"evm_tx_hash": evmTxHash,
+			})
+		if result.Error != nil {
+			up.logger.Errorf("Failed to update deposit status for %s:%d: %v", utxo.Txid, utxo.OutIndex, result.Error)
+		} else if result.RowsAffected > 0 {
+			up.logger.Infof("Updated deposit %s:%d status to 'confirmed' with evm_tx_hash=%s", utxo.Txid, utxo.OutIndex, evmTxHash)
+		}
+	}
 }
 
 // sendCalldataToBridge sends the signed calldata to the bridge contract using the node's private key
