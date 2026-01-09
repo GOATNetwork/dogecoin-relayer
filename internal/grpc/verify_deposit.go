@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -11,10 +12,14 @@ import (
 
 	"github.com/dogecoinw/doged/chaincfg"
 	"github.com/dogecoinw/doged/wire"
+	"github.com/goat-network/dogecoin-relayer/internal/consensus"
 	"github.com/goat-network/dogecoin-relayer/internal/doge"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
+	"github.com/goat-network/dogecoin-relayer/internal/p2p"
 	"github.com/goat-network/dogecoin-relayer/pkg/global"
+	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
+	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -184,6 +189,59 @@ func (v *depositVerifier) saveDeposit(ctx context.Context, txid string, result *
 	}
 
 	v.logger.Infof("Saved deposit: txid=%s, vout=%d, amount=%d, evmAddr=%s", txid, result.OutIndex, result.Amount, result.EvmAddr)
+
+	// Broadcast deposit notification to other nodes via P2P
+	if err := v.broadcastDepositNotification(deposit); err != nil {
+		v.logger.Warnf("Failed to broadcast deposit notification: %v", err)
+		// Don't return error - local save was successful
+	}
+
+	return nil
+}
+
+// broadcastDepositNotification broadcasts a deposit notification to other nodes via P2P
+func (v *depositVerifier) broadcastDepositNotification(deposit *models.Deposit) error {
+	// Get the P2P module
+	p2pMod, ok := module.GetModule("p2p")
+	if !ok {
+		return fmt.Errorf("P2P module not found")
+	}
+
+	p2pSender, ok := p2pMod.(p2p.P2PSender)
+	if !ok {
+		return fmt.Errorf("P2P module does not implement P2PSender interface")
+	}
+
+	// Create a DepositNotification with the deposit data
+	sessionID := uuid.New().String()
+	notification := consensus.NewDepositNotification(
+		deposit.TxId,
+		deposit.Vout,
+		deposit.EvmAddr,
+		deposit.Amount,
+		deposit.TxBytes,
+		deposit.Address,
+		sessionID,
+	)
+
+	// Marshal the notification
+	payload, err := json.Marshal(notification)
+	if err != nil {
+		return fmt.Errorf("failed to marshal deposit notification: %w", err)
+	}
+
+	// Broadcast via P2P
+	msg := types.P2PBroadcastMessage{
+		Type:      types.P2PMessageTypeDepositNotification,
+		SessionID: sessionID,
+		Payload:   payload,
+	}
+
+	if err := p2pSender.BroadcastP2PMessage(msg); err != nil {
+		return fmt.Errorf("failed to broadcast P2P message: %w", err)
+	}
+
+	v.logger.Infof("Broadcasted deposit notification: txid=%s, vout=%d, sessionID=%s", deposit.TxId, deposit.Vout, sessionID)
 	return nil
 }
 

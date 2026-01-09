@@ -3,6 +3,7 @@ package consensus
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"sort"
@@ -944,7 +945,7 @@ func (up *UtxoProcessor) sendProposalToP2P(proposal *DepositProposal) error {
 	}
 
 	up.logger.Infof("Step 6.2: Marshaling proposal to JSON")
-	payload, err := proposal.MarshalJSON()
+	payload, err := json.Marshal(proposal)
 	if err != nil {
 		return fmt.Errorf("failed to marshal proposal: %v", err)
 	}
@@ -1053,7 +1054,7 @@ func (up *UtxoProcessor) sendWithdrawalProposalToP2P(proposal *WithdrawalProposa
 		return fmt.Errorf("p2p module not found")
 	}
 
-	payload, err := proposal.MarshalJSON()
+	payload, err := json.Marshal(proposal)
 	if err != nil {
 		return fmt.Errorf("failed to marshal withdrawal proposal: %v", err)
 	}

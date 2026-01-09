@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"strconv"
@@ -258,7 +259,7 @@ func stripRetrySuffix(sessionID string) (string, bool) {
 
 func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage) error {
 	proposal := &DepositProposal{}
-	err := proposal.UnmarshalJSON(msg.Payload)
+	err := json.Unmarshal(msg.Payload, proposal)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal proposal: %v", err)
 	}
@@ -392,7 +393,7 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 
 func (up *UtxoProcessor) handleP2PWithdrawalProposal(msg *types.P2PBroadcastMessage) error {
 	proposal := &WithdrawalProposal{}
-	err := proposal.UnmarshalJSON(msg.Payload)
+	err := json.Unmarshal(msg.Payload, proposal)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal withdrawal proposal: %v", err)
 	}
@@ -523,7 +524,9 @@ func (up *UtxoProcessor) validateDepositProposal(proposal *DepositProposal) erro
 		if lightUTXO.Amount <= 0 {
 			return fmt.Errorf("UTXO amount must be positive")
 		}
-		calculatedTotal.Add(calculatedTotal, big.NewInt(lightUTXO.Amount))
+		// Convert satoshis (8 decimals) to ERC20 wei (18 decimals)
+		amountWei := new(big.Int).Mul(big.NewInt(lightUTXO.Amount), big.NewInt(10000000000))
+		calculatedTotal.Add(calculatedTotal, amountWei)
 	}
 
 	if calculatedTotal.Cmp(totalAmount) != 0 {

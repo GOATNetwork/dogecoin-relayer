@@ -12,6 +12,8 @@ const (
 	P2PMessageTypeBridgeOut P2PMessageType = "bridge-out"
 	// P2PMessageTypeDepositProposal is for deposit proposal messages
 	P2PMessageTypeDepositProposal P2PMessageType = "deposit-proposal"
+	// P2PMessageTypeDepositNotification is for new deposit notification from gRPC
+	P2PMessageTypeDepositNotification P2PMessageType = "deposit-notification"
 )
 
 // P2PBroadcastMessage is the message for broadcast to all peers
