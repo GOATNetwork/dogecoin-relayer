@@ -195,6 +195,7 @@ type PendingBatch struct {
 	WithdrawalID string `gorm:"type:varchar(255)" json:"withdrawal_id,omitempty"`
 	TaskIdsJSON  string `gorm:"type:text" json:"task_ids_json,omitempty"`
 	TxId         string `gorm:"type:varchar(66)" json:"txid,omitempty"`
+	UtxosJSON    string `gorm:"type:text" json:"utxos_json,omitempty"`
 }
 
 // Constants for pending batch status

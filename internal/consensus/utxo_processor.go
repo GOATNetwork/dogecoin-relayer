@@ -22,6 +22,7 @@ import (
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
 	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // BridgeInBatch represents a batch of bridge transactions
@@ -502,7 +503,26 @@ func (up *UtxoProcessor) persistPendingBatch(pending *pendingBatch) error {
 	dbBatch := up.pendingBatchToDBModel(pending)
 
 	err := up.state.WithPendingBatchTransactionRetry(func(tx *gorm.DB) error {
-		return tx.Create(dbBatch).Error
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "base_session_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"batch_type",
+				"call_data",
+				"tss_nonce",
+				"next_attempt",
+				"last_attempt",
+				"next_retry_at",
+				"batch_id",
+				"total_amount",
+				"withdrawal_id",
+				"task_ids_json",
+				"tx_id",
+				"updated_at",
+			}),
+			Where: clause.Where{Exprs: []clause.Expression{
+				clause.Expr{SQL: "status = ?", Vars: []interface{}{models.PENDING_BATCH_STATUS_PENDING}},
+			}},
+		}).Create(dbBatch).Error
 	})
 
 	if err != nil {
@@ -518,7 +538,26 @@ func (up *UtxoProcessor) updatePendingBatchInDB(pending *pendingBatch) error {
 	dbBatch := up.pendingBatchToDBModel(pending)
 
 	err := up.state.WithPendingBatchTransactionRetry(func(tx *gorm.DB) error {
-		return tx.Save(dbBatch).Error
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "base_session_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"batch_type",
+				"call_data",
+				"tss_nonce",
+				"next_attempt",
+				"last_attempt",
+				"next_retry_at",
+				"batch_id",
+				"total_amount",
+				"withdrawal_id",
+				"task_ids_json",
+				"tx_id",
+				"updated_at",
+			}),
+			Where: clause.Where{Exprs: []clause.Expression{
+				clause.Expr{SQL: "status = ?", Vars: []interface{}{models.PENDING_BATCH_STATUS_PENDING}},
+			}},
+		}).Create(dbBatch).Error
 	})
 
 	if err != nil {
@@ -573,6 +612,11 @@ func (up *UtxoProcessor) pendingBatchToDBModel(pending *pendingBatch) *models.Pe
 		dbBatch.TssNonce = pending.tssNonce.String()
 	}
 
+	if pending.utxos != nil {
+		utxosJSON, _ := json.Marshal(pending.utxos)
+		dbBatch.UtxosJSON = string(utxosJSON)
+	}
+
 	if pending.batchType == "deposit" && pending.depositBatch != nil {
 		dbBatch.BatchID = pending.depositBatch.ID.String()
 		if pending.depositBatch.TotalAmount != nil {
@@ -612,10 +656,18 @@ func (up *UtxoProcessor) dbModelToPendingBatch(dbBatch *models.PendingBatch) *pe
 		}
 	}
 
+	if dbBatch.UtxosJSON != "" {
+		var utxos []*models.UTXO
+		if err := json.Unmarshal([]byte(dbBatch.UtxosJSON), &utxos); err == nil {
+			pending.utxos = utxos
+		}
+	}
+
 	if dbBatch.BatchType == "deposit" && dbBatch.BatchID != "" {
 		if batchID, ok := new(big.Int).SetString(dbBatch.BatchID, 10); ok {
 			pending.depositBatch = &BridgeInBatch{
-				ID: batchID,
+				ID:    batchID,
+				UTXOs: pending.utxos,
 			}
 			if dbBatch.TotalAmount != "" {
 				if amount, ok := new(big.Int).SetString(dbBatch.TotalAmount, 10); ok {
@@ -636,6 +688,9 @@ func (up *UtxoProcessor) dbModelToPendingBatch(dbBatch *models.PendingBatch) *pe
 				ID:      withdrawalID,
 				TaskIds: taskIds,
 				TxId:    dbBatch.TxId,
+			}
+			if len(pending.utxos) > 0 {
+				pending.withdrawalRequest.UTXO = pending.utxos[0]
 			}
 		}
 	}

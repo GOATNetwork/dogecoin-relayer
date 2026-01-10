@@ -217,10 +217,28 @@ func NewPendingBatchRepository(db *gorm.DB) *PendingBatchRepository {
 
 // CreatePendingBatch creates a new pending batch
 func (r *PendingBatchRepository) CreatePendingBatch(batch *PendingBatch) error {
-	return r.db.Create(batch).Error
+	return r.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "base_session_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"batch_type",
+			"call_data",
+			"tss_nonce",
+			"next_attempt",
+			"last_attempt",
+			"next_retry_at",
+			"batch_id",
+			"total_amount",
+			"withdrawal_id",
+			"task_ids_json",
+			"tx_id",
+			"updated_at",
+		}),
+		Where: clause.Where{Exprs: []clause.Expression{
+			clause.Expr{SQL: "status = ?", Vars: []interface{}{PENDING_BATCH_STATUS_PENDING}},
+		}},
+	}).Create(batch).Error
 }
 
-// GetPendingBatchByBaseSessionID retrieves a pending batch by base session ID
 func (r *PendingBatchRepository) GetPendingBatchByBaseSessionID(baseSessionID string) (*PendingBatch, error) {
 	var batch PendingBatch
 	err := r.db.Where("base_session_id = ? AND status = ?", baseSessionID, PENDING_BATCH_STATUS_PENDING).First(&batch).Error
@@ -230,16 +248,33 @@ func (r *PendingBatchRepository) GetPendingBatchByBaseSessionID(baseSessionID st
 	return &batch, nil
 }
 
-// GetAllPendingBatches retrieves all pending batches
 func (r *PendingBatchRepository) GetAllPendingBatches() ([]*PendingBatch, error) {
 	var batches []*PendingBatch
 	err := r.db.Where("status = ?", PENDING_BATCH_STATUS_PENDING).Find(&batches).Error
 	return batches, err
 }
 
-// UpdatePendingBatch updates a pending batch
 func (r *PendingBatchRepository) UpdatePendingBatch(batch *PendingBatch) error {
-	return r.db.Save(batch).Error
+	return r.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "base_session_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"batch_type",
+			"call_data",
+			"tss_nonce",
+			"next_attempt",
+			"last_attempt",
+			"next_retry_at",
+			"batch_id",
+			"total_amount",
+			"withdrawal_id",
+			"task_ids_json",
+			"tx_id",
+			"updated_at",
+		}),
+		Where: clause.Where{Exprs: []clause.Expression{
+			clause.Expr{SQL: "status = ?", Vars: []interface{}{PENDING_BATCH_STATUS_PENDING}},
+		}},
+	}).Create(batch).Error
 }
 
 // DeletePendingBatchByBaseSessionID deletes a pending batch by base session ID
