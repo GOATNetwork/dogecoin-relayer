@@ -41,8 +41,10 @@ type Withdrawal struct {
 	DestAddress    string `gorm:"type:varchar(100)" json:"dest_address"`
 	DestAmount     string `gorm:"type:varchar(80)" json:"dest_amount"`
 	TxId           string `gorm:"type:varchar(66)" json:"txid"`
+	ExternalId     string `gorm:"type:varchar(255)" json:"external_id"`
 	Vout           int    `gorm:"type:int" json:"vout"`
 	TxBytes        []byte `gorm:"type:blob" json:"tx_bytes"`
+	UnsignedTx     []byte `gorm:"type:blob" json:"unsigned_tx"`
 	FinishTxHash   string `gorm:"type:varchar(66)" json:"finish_tx_hash"`
 	FinishBlock    uint64 `gorm:"type:bigint" json:"finish_block"`
 	FinishLogIndex uint   `gorm:"type:int" json:"finish_log_index"`

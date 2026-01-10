@@ -516,6 +516,18 @@ func (m *DogeModule) handleDepositUTXOs(tx *wire.MsgTx, dogeBlock types.DogeBloc
 		if result.isDeposit {
 			if err := m.recordDeposit(utxo, result.txid, noWitnessTx); err != nil {
 				m.logger.Errorf("Record deposit for %s:%d failed: %v", utxo.Txid, utxo.OutIndex, err)
+			} else if utxo.EvmAddr == "" {
+				m.logger.Warnf("Deposit %s:%d recorded with empty EVM address, marking as skipped. Transaction may lack OP_RETURN or magic bytes mismatch.", utxo.Txid, utxo.OutIndex)
+				// Mark deposit as skipped in the event database
+				if dep, err := m.eventRepo.GetDeposit(nil, utxo.Txid, utxo.OutIndex); err == nil {
+					if err := m.eventRepo.UpdateDepositStatus(nil, dep.ID, "skipped"); err != nil {
+						m.logger.Errorf("Failed to mark deposit %s:%d as skipped: %v", utxo.Txid, utxo.OutIndex, err)
+					}
+				}
+				// Also mark UTXO as processed to prevent processor from picking it up again
+				if err := m.conn.GetDB().Model(&models.UTXO{}).Where("txid = ? AND out_index = ?", utxo.Txid, utxo.OutIndex).Update("status", models.UTXO_STATUS_PROCESSED).Error; err != nil {
+					m.logger.Errorf("Failed to mark UTXO %s:%d as processed: %v", utxo.Txid, utxo.OutIndex, err)
+				}
 			}
 		}
 	}

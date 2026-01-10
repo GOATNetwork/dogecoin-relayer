@@ -40,6 +40,7 @@ func (r *MigrateRepository) initMigrateList() {
 
 	// Migration 6: Add utxos_json to pending_batches
 	r.migrateList[6] = r.addUtxosJsonColumn
+	r.migrateList[7] = r.addWithdrawalFireblocksColumns
 }
 
 func (r *MigrateRepository) DoMigrate() error {
@@ -93,4 +94,8 @@ func (r *MigrateRepository) createPendingBatchTables() error {
 
 func (r *MigrateRepository) addUtxosJsonColumn() error {
 	return r.db.AutoMigrate(&PendingBatch{})
+}
+
+func (r *MigrateRepository) addWithdrawalFireblocksColumns() error {
+	return r.db.AutoMigrate(&Withdrawal{})
 }

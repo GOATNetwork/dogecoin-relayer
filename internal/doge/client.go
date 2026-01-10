@@ -19,9 +19,9 @@ import (
 
 // DogeClient represents a Dogecoin RPC client using doged library
 type DogeClient struct {
-	cfg       config.DogeConfig
-	client    *rpcclient.Client
-	logger    *log.Entry
+	cfg    config.DogeConfig
+	client *rpcclient.Client
+	logger *log.Entry
 }
 
 func normalizeRPCConfig(raw string) (string, bool, error) {
@@ -101,9 +101,9 @@ func NewDogeClient(cfg config.DogeConfig) (*DogeClient, error) {
 	metrics.DogeConfirmations.Set(float64(cfg.Confirmations))
 
 	return &DogeClient{
-		cfg:       cfg,
-		client:    client,
-		logger:    log.WithField("module", "doge-client"),
+		cfg:    cfg,
+		client: client,
+		logger: log.WithField("module", "doge-client"),
 	}, nil
 }
 
@@ -210,9 +210,14 @@ func (c *DogeClient) Close() {
 	c.logger.Info("Doge client connection closed")
 }
 
-// CreateAndFundRawTx builds a raw transaction with the given outputs (amounts expressed as string DOGE values)
+type TransactionInput struct {
+	Txid string `json:"txid"`
+	Vout int    `json:"vout"`
+}
+
+// CreateAndFundRawTx builds a raw transaction with the given outputs (amounts expressed as numeric DOGE values)
 // and lets the node pick inputs/change. Returns the funded hex string.
-func (c *DogeClient) CreateAndFundRawTx(outputs map[string]string, changeAddr string) (string, error) {
+func (c *DogeClient) CreateAndFundRawTx(outputs map[string]json.RawMessage, changeAddr string) (string, error) {
 	if len(outputs) == 0 {
 		return "", fmt.Errorf("no outputs provided")
 	}
@@ -260,7 +265,33 @@ func (c *DogeClient) CreateAndFundRawTx(outputs map[string]string, changeAddr st
 	return fundResp.Hex, nil
 }
 
-// SignRawTransaction signs the provided raw tx hex using the node wallet.
+func (c *DogeClient) CreateRawTransaction(inputs []TransactionInput, outputs map[string]json.RawMessage) (string, error) {
+	if len(outputs) == 0 {
+		return "", fmt.Errorf("no outputs provided")
+	}
+	inputJSON, err := json.Marshal(inputs)
+	if err != nil {
+		return "", fmt.Errorf("marshal inputs: %w", err)
+	}
+	outputJSON, err := json.Marshal(outputs)
+	if err != nil {
+		return "", fmt.Errorf("marshal outputs: %w", err)
+	}
+	rawCreate, err := c.client.RawRequest("createrawtransaction", []json.RawMessage{
+		json.RawMessage(inputJSON),
+		json.RawMessage(outputJSON),
+	})
+	if err != nil {
+		return "", fmt.Errorf("createrawtransaction rpc: %w", err)
+	}
+	var unsignedHex string
+	if err := json.Unmarshal(rawCreate, &unsignedHex); err != nil {
+		return "", fmt.Errorf("unmarshal create tx: %w", err)
+	}
+	return unsignedHex, nil
+}
+
+// SignRawTransaction signs a raw transaction using the node wallet.
 func (c *DogeClient) SignRawTransaction(rawHex string) (string, error) {
 	rawSign, err := c.client.RawRequest("signrawtransaction", []json.RawMessage{
 		json.RawMessage(fmt.Sprintf("%q", rawHex)),
