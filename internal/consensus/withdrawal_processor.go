@@ -23,9 +23,11 @@ import (
 	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/internal/doge"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
+	"github.com/goat-network/dogecoin-relayer/internal/p2p"
 	"github.com/goat-network/dogecoin-relayer/internal/wallet"
 	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
 	"github.com/goat-network/dogecoin-relayer/pkg/global"
+	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
 	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
@@ -354,7 +356,16 @@ func (wp *WithdrawalProcessor) Start(ctx context.Context) error {
 		return nil
 	}
 	wp.ctx, wp.cancel = context.WithCancel(ctx)
+	if err := wallet.CleanProcessingSendOrders(wp.conn.GetDB()); err != nil {
+		wp.logger.Warnf("Failed to clean processing send orders: %v", err)
+	}
+	if !wp.fireblocksMode {
+		if err := wp.resetFireblocksWithdrawals(); err != nil {
+			wp.logger.Warnf("Failed to reset fireblocks withdrawals: %v", err)
+		}
+	}
 	wp.eventBus.Subscribe(eventbus.EventBridgeOutProposed, wp.handleBridgeOutProposed)
+	wp.registerP2PHandler()
 	go wp.loop()
 	wp.logger.Infof("Withdrawal processor started (change=%s, confirmations=%d)", wp.changeAddr, wp.requiredConfs)
 	return nil
@@ -380,6 +391,9 @@ func (wp *WithdrawalProcessor) loop() {
 			wp.logger.Info("Withdrawal processor stopped")
 			return
 		case <-ticker.C:
+			if err := wp.processRetryWithdrawals(); err != nil {
+				wp.logger.Errorf("processRetryWithdrawals error: %v", err)
+			}
 			if err := wp.processPendingWithdrawals(); err != nil {
 				wp.logger.Errorf("processPendingWithdrawals error: %v", err)
 			}
@@ -390,6 +404,9 @@ func (wp *WithdrawalProcessor) loop() {
 			}
 			if err := wp.processBroadcastedWithdrawals(); err != nil {
 				wp.logger.Errorf("processBroadcastedWithdrawals error: %v", err)
+			}
+			if err := wp.processStatusSync(); err != nil {
+				wp.logger.Errorf("processStatusSync error: %v", err)
 			}
 		}
 	}
@@ -414,13 +431,21 @@ func (wp *WithdrawalProcessor) processPendingWithdrawals() error {
 		return nil
 	}
 
-	pending, err := wp.eventRepo.ListWithdrawalsByStatus(nil, "init", 20)
-	if err != nil {
-		return fmt.Errorf("list pending withdrawals: %w", err)
+	statuses := []string{
+		models.WITHDRAW_STATUS_CREATE,
+		models.WITHDRAW_STATUS_AGGREGATING,
+		models.WITHDRAW_STATUS_INIT,
 	}
-	for i := range pending {
-		if err := wp.broadcastWithdrawal(&pending[i]); err != nil {
-			wp.logger.Errorf("broadcast withdrawal %s failed: %v", pending[i].ReqTaskId, err)
+	for _, status := range statuses {
+		list, err := wp.eventRepo.ListWithdrawalsByStatus(nil, status, 20)
+		if err != nil {
+			return fmt.Errorf("list %s withdrawals: %w", status, err)
+		}
+		for i := range list {
+			if err := wp.broadcastWithdrawal(&list[i]); err != nil {
+				wp.logger.Errorf("broadcast withdrawal %s failed: %v", list[i].ReqTaskId, err)
+				wp.markWithdrawalRetry(&list[i])
+			}
 		}
 	}
 	return nil
@@ -433,8 +458,14 @@ func (wp *WithdrawalProcessor) processSigningWithdrawals() error {
 	if wp.fireblocksClient == nil {
 		return fmt.Errorf("fireblocks client not initialized")
 	}
-	signing, err := wp.eventRepo.ListWithdrawalsByStatus(nil, "signing", 20)
-	if err != nil {
+
+	var signing []models.Withdrawal
+	if err := wp.conn.GetDB().
+		Where("status = ?", models.WITHDRAW_STATUS_PENDING).
+		Where("external_id != ''").
+		Where("tx_id = '' OR tx_id IS NULL").
+		Limit(20).
+		Find(&signing).Error; err != nil {
 		return fmt.Errorf("list signing withdrawals: %w", err)
 	}
 	for index := range signing {
@@ -454,18 +485,271 @@ func (wp *WithdrawalProcessor) processBroadcastedWithdrawals() error {
 		return nil
 	}
 
-	broadcasted, err := wp.eventRepo.ListWithdrawalsByStatus(nil, "broadcasted", 50)
-	if err != nil {
-		return fmt.Errorf("list broadcasted withdrawals: %w", err)
+	var pending []models.Withdrawal
+	if err := wp.conn.GetDB().
+		Where("status = ?", models.WITHDRAW_STATUS_PENDING).
+		Where("tx_id != ''").
+		Limit(50).
+		Find(&pending).Error; err != nil {
+		return fmt.Errorf("list pending withdrawals: %w", err)
 	}
 
-	for i := range broadcasted {
-		w := &broadcasted[i]
+	for i := range pending {
+		w := &pending[i]
 		if err := wp.checkAndSubmit(w); err != nil {
 			wp.logger.Errorf("checkAndSubmit withdrawal %s failed: %v", w.ReqTaskId, err)
 		}
 	}
 	return nil
+}
+
+func (wp *WithdrawalProcessor) processRetryWithdrawals() error {
+	isProposer, err := wp.utxoProcessor.isCurrentProposer()
+	if err != nil {
+		return err
+	}
+	if !isProposer {
+		return nil
+	}
+
+	retryDelay := wp.pollInterval * 2
+	if retryDelay < 2*time.Minute {
+		retryDelay = 2 * time.Minute
+	}
+
+	var pending []models.Withdrawal
+	if err := wp.conn.GetDB().
+		Where("status = ?", models.WITHDRAW_STATUS_PENDING).
+		Where("tx_id = '' OR tx_id IS NULL").
+		Limit(20).
+		Find(&pending).Error; err != nil {
+		return fmt.Errorf("list pending withdrawals: %w", err)
+	}
+
+	for i := range pending {
+		w := &pending[i]
+		if time.Since(w.UpdatedAt) < retryDelay {
+			continue
+		}
+		if err := wallet.CloseSendOrdersForWithdrawal(wp.conn.GetDB(), w.ReqTaskId); err != nil {
+			return fmt.Errorf("close send orders for %s: %w", w.ReqTaskId, err)
+		}
+		w.Status = models.WITHDRAW_STATUS_INIT
+		w.ExternalId = ""
+		w.UnsignedTx = nil
+		w.TxId = ""
+		w.TxBytes = nil
+		if err := wp.eventRepo.CreateOrUpdateWithdrawal(nil, w); err != nil {
+			wp.logger.Warnf("Failed to reset withdrawal %s to init: %v", w.ReqTaskId, err)
+			continue
+		}
+		wp.broadcastWithdrawalStatus(w)
+	}
+
+	return nil
+}
+
+func (wp *WithdrawalProcessor) processStatusSync() error {
+	isProposer, err := wp.utxoProcessor.isCurrentProposer()
+	if err != nil {
+		return err
+	}
+	if !isProposer {
+		return nil
+	}
+
+	var recent []models.Withdrawal
+	if err := wp.conn.GetDB().Order("updated_at desc").Limit(20).Find(&recent).Error; err != nil {
+		return fmt.Errorf("load recent withdrawals: %w", err)
+	}
+	for i := range recent {
+		wp.broadcastWithdrawalStatus(&recent[i])
+	}
+	return nil
+}
+
+func (wp *WithdrawalProcessor) resetFireblocksWithdrawals() error {
+	var withdrawals []models.Withdrawal
+	if err := wp.conn.GetDB().
+		Where("status = ?", models.WITHDRAW_STATUS_PENDING).
+		Where("external_id != ''").
+		Where("tx_id = '' OR tx_id IS NULL").
+		Find(&withdrawals).Error; err != nil {
+		return fmt.Errorf("load pending fireblocks withdrawals: %w", err)
+	}
+	for i := range withdrawals {
+		w := &withdrawals[i]
+		if err := wallet.CloseSendOrdersForWithdrawal(wp.conn.GetDB(), w.ReqTaskId); err != nil {
+			return fmt.Errorf("close send orders for %s: %w", w.ReqTaskId, err)
+		}
+		w.Status = models.WITHDRAW_STATUS_INIT
+		w.ExternalId = ""
+		w.UnsignedTx = nil
+		w.TxId = ""
+		w.TxBytes = nil
+		if err := wp.eventRepo.CreateOrUpdateWithdrawal(nil, w); err != nil {
+			return fmt.Errorf("reset withdrawal %s: %w", w.ReqTaskId, err)
+		}
+		wp.broadcastWithdrawalStatus(w)
+	}
+	return nil
+}
+
+func (wp *WithdrawalProcessor) markWithdrawalRetry(w *models.Withdrawal) {
+	if err := wallet.CloseSendOrdersForWithdrawal(wp.conn.GetDB(), w.ReqTaskId); err != nil {
+		wp.logger.Warnf("Failed to close send orders for %s: %v", w.ReqTaskId, err)
+	}
+	w.Status = models.WITHDRAW_STATUS_INIT
+	w.ExternalId = ""
+	w.UnsignedTx = nil
+	w.TxId = ""
+	w.TxBytes = nil
+	if err := wp.eventRepo.CreateOrUpdateWithdrawal(nil, w); err != nil {
+		wp.logger.Warnf("Failed to reset withdrawal %s to init: %v", w.ReqTaskId, err)
+		return
+	}
+	wp.broadcastWithdrawalStatus(w)
+}
+
+func (wp *WithdrawalProcessor) registerP2PHandler() {
+	go func() {
+		time.Sleep(30 * time.Second)
+		maxRetries := 30
+		for i := 0; i < maxRetries; i++ {
+			p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
+			if !ok {
+				wp.logger.Debugf("P2P module not found, retrying in 2 seconds... (%d/%d)", i+1, maxRetries)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			network := p2pModule.(*p2p.P2PModule).GetNetwork()
+			if network == nil {
+				wp.logger.Debugf("P2P network not initialized, retrying in 2 seconds... (%d/%d)", i+1, maxRetries)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			err := p2pModule.(p2p.P2PSender).RegisterP2PHandler(types.P2PMessageTypeWithdrawalStatus, func(msg *types.P2PBroadcastMessage) error {
+				return wp.handleWithdrawalStatusMessage(msg)
+			})
+			if err != nil {
+				wp.logger.Errorf("Failed to register withdrawal status handler: %v", err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			return
+		}
+		wp.logger.Errorf("Failed to register withdrawal status handler after %d retries", maxRetries)
+	}()
+}
+
+func (wp *WithdrawalProcessor) broadcastWithdrawalStatus(w *models.Withdrawal) {
+	p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
+	if !ok {
+		return
+	}
+	payload := types.WithdrawalStatusPayload{
+		ReqTaskId:      w.ReqTaskId,
+		Status:         w.Status,
+		ReqTxHash:      w.ReqTxHash,
+		ReqBlock:       w.ReqBlock,
+		ReqLogIndex:    w.ReqLogIndex,
+		DestAddress:    w.DestAddress,
+		DestAmount:     w.DestAmount,
+		TxId:           w.TxId,
+		ExternalId:     w.ExternalId,
+		Vout:           w.Vout,
+		TxBytes:        w.TxBytes,
+		UnsignedTx:     w.UnsignedTx,
+		FinishTxHash:   w.FinishTxHash,
+		FinishBlock:    w.FinishBlock,
+		FinishLogIndex: w.FinishLogIndex,
+		UpdatedAt:      time.Now().Unix(),
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		wp.logger.Warnf("Failed to marshal withdrawal status payload: %v", err)
+		return
+	}
+	msg := types.P2PBroadcastMessage{
+		Type:      types.P2PMessageTypeWithdrawalStatus,
+		SessionID: w.ReqTaskId,
+		Payload:   payloadBytes,
+	}
+	if err := p2pModule.(p2p.P2PSender).BroadcastP2PMessage(msg); err != nil {
+		wp.logger.Warnf("Failed to broadcast withdrawal status %s: %v", w.ReqTaskId, err)
+	}
+}
+
+func (wp *WithdrawalProcessor) handleWithdrawalStatusMessage(msg *types.P2PBroadcastMessage) error {
+	var payload types.WithdrawalStatusPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return fmt.Errorf("unmarshal withdrawal status payload: %w", err)
+	}
+	if payload.ReqTaskId == "" {
+		return fmt.Errorf("withdrawal status payload missing req_task_id")
+	}
+	current, err := wp.eventRepo.GetWithdrawalByTask(nil, payload.ReqTaskId)
+	if err == nil && !shouldApplyWithdrawalUpdate(current, &payload) {
+		return nil
+	}
+
+	w := &models.Withdrawal{
+		ReqTaskId:      payload.ReqTaskId,
+		ReqTxHash:      payload.ReqTxHash,
+		ReqBlock:       payload.ReqBlock,
+		ReqLogIndex:    payload.ReqLogIndex,
+		Status:         payload.Status,
+		DestAddress:    payload.DestAddress,
+		DestAmount:     payload.DestAmount,
+		TxId:           payload.TxId,
+		ExternalId:     payload.ExternalId,
+		Vout:           payload.Vout,
+		TxBytes:        payload.TxBytes,
+		UnsignedTx:     payload.UnsignedTx,
+		FinishTxHash:   payload.FinishTxHash,
+		FinishBlock:    payload.FinishBlock,
+		FinishLogIndex: payload.FinishLogIndex,
+	}
+	if err := wp.eventRepo.CreateOrUpdateWithdrawal(nil, w); err != nil {
+		return fmt.Errorf("update withdrawal from p2p: %w", err)
+	}
+	return nil
+}
+
+func shouldApplyWithdrawalUpdate(current *models.Withdrawal, payload *types.WithdrawalStatusPayload) bool {
+	if current == nil {
+		return true
+	}
+	currentStatus := normalizeWithdrawalStatus(current.Status)
+	incomingStatus := normalizeWithdrawalStatus(payload.Status)
+	currentRank := withdrawalStatusRank(currentStatus)
+	incomingRank := withdrawalStatusRank(incomingStatus)
+	if incomingRank < currentRank {
+		return false
+	}
+	if incomingRank == currentRank {
+		return true
+	}
+	return true
+}
+
+func normalizeWithdrawalStatus(status string) string {
+	return strings.ToLower(strings.TrimSpace(status))
+}
+
+func withdrawalStatusRank(status string) int {
+	switch status {
+	case models.WITHDRAW_STATUS_CREATE, models.WITHDRAW_STATUS_AGGREGATING:
+		return 10
+	case models.WITHDRAW_STATUS_INIT, models.WITHDRAW_STATUS_PENDING:
+		return 20
+	case models.WITHDRAW_STATUS_CONFIRMED:
+		return 30
+	case models.WITHDRAW_STATUS_PROCESSED:
+		return 40
+	default:
+		return 0
+	}
 }
 
 func (wp *WithdrawalProcessor) broadcastWithdrawal(w *models.Withdrawal) error {
@@ -491,13 +775,59 @@ func (wp *WithdrawalProcessor) broadcastWithdrawal(w *models.Withdrawal) error {
 	wp.logger.Infof("Withdrawal %s: converting amount wei=%s -> sat=%s",
 		w.ReqTaskId, amountWei.String(), amountSat.String())
 
-	var utxos []*models.UTXO
-	if err := wp.conn.GetDB().Where("receiver = ? AND status = ?", wp.changeAddr, models.UTXO_STATUS_CONFIRMED).Order("amount asc").Find(&utxos).Error; err != nil {
-		return fmt.Errorf("load confirmed utxos: %w", err)
+	aggregating := &models.Withdrawal{
+		ReqTaskId:   w.ReqTaskId,
+		ReqTxHash:   w.ReqTxHash,
+		ReqBlock:    w.ReqBlock,
+		ReqLogIndex: w.ReqLogIndex,
+		Status:      models.WITHDRAW_STATUS_AGGREGATING,
+		DestAddress: w.DestAddress,
+		DestAmount:  w.DestAmount,
+		TxId:        w.TxId,
+		ExternalId:  w.ExternalId,
+		Vout:        w.Vout,
+		TxBytes:     w.TxBytes,
+		UnsignedTx:  w.UnsignedTx,
+	}
+	if err := wp.eventRepo.CreateOrUpdateWithdrawal(nil, aggregating); err != nil {
+		return fmt.Errorf("update withdrawal %s to aggregating: %w", w.ReqTaskId, err)
+	}
+	wp.broadcastWithdrawalStatus(aggregating)
+
+	if err := wallet.CloseSendOrdersForWithdrawal(wp.conn.GetDB(), w.ReqTaskId); err != nil {
+		return fmt.Errorf("cleanup send orders for withdrawal %s: %w", w.ReqTaskId, err)
 	}
 
-	if len(utxos) == 0 {
-		return fmt.Errorf("no confirmed utxos available for withdrawal")
+	var utxos []*models.UTXO
+	addresses := []string{wp.changeAddr}
+	if cfg := global.GetConfig(); cfg != nil {
+		for _, addr := range cfg.Doge.WatchAddresses {
+			if addr != "" && addr != wp.changeAddr {
+				addresses = append(addresses, addr)
+			}
+		}
+	}
+	var spendableCount int64
+	if err := wp.conn.GetDB().Raw(
+		"SELECT COUNT(*) FROM utxos WHERE receiver = ? AND (status = ? OR status = ?)",
+		wp.changeAddr,
+		models.UTXO_STATUS_CONFIRMED,
+		models.UTXO_STATUS_PROCESSED,
+	).Scan(&spendableCount).Error; err != nil {
+		return fmt.Errorf("count spendable utxos: %w", err)
+	}
+	wp.logger.Infof("Spendable UTXO count for %s: %d", wp.changeAddr, spendableCount)
+	if spendableCount == 0 {
+		return fmt.Errorf("no spendable utxos available for withdrawal")
+	}
+
+	if err := wp.conn.GetDB().Raw(
+		"SELECT * FROM utxos WHERE receiver = ? AND (status = ? OR status = ?) ORDER BY amount asc",
+		wp.changeAddr,
+		models.UTXO_STATUS_CONFIRMED,
+		models.UTXO_STATUS_PROCESSED,
+	).Scan(&utxos).Error; err != nil {
+		return fmt.Errorf("load spendable utxos: %w", err)
 	}
 
 	wp.logger.Debugf("Found %d confirmed UTXOs for withdrawal %s", len(utxos), w.ReqTaskId)
@@ -567,6 +897,25 @@ func (wp *WithdrawalProcessor) broadcastWithdrawal(w *models.Withdrawal) error {
 
 	wp.logger.Infof("Created send order %s for withdrawal %s", sendOrder.OrderId, w.ReqTaskId)
 
+	initialized := &models.Withdrawal{
+		ReqTaskId:   w.ReqTaskId,
+		ReqTxHash:   w.ReqTxHash,
+		ReqBlock:    w.ReqBlock,
+		ReqLogIndex: w.ReqLogIndex,
+		Status:      models.WITHDRAW_STATUS_INIT,
+		DestAddress: w.DestAddress,
+		DestAmount:  w.DestAmount,
+		TxId:        w.TxId,
+		ExternalId:  w.ExternalId,
+		Vout:        w.Vout,
+		TxBytes:     w.TxBytes,
+		UnsignedTx:  w.UnsignedTx,
+	}
+	if err := wp.eventRepo.CreateOrUpdateWithdrawal(nil, initialized); err != nil {
+		return fmt.Errorf("update withdrawal %s to init: %w", w.ReqTaskId, err)
+	}
+	wp.broadcastWithdrawalStatus(initialized)
+
 	if wp.fireblocksMode {
 		return wp.handleFireblocksSigning(w, tx, selectedUTXOs, sendOrder, vins, vouts)
 	}
@@ -614,7 +963,7 @@ func (wp *WithdrawalProcessor) handleLocalSigning(w *models.Withdrawal, tx *wire
 		ReqTxHash:   w.ReqTxHash,
 		ReqBlock:    w.ReqBlock,
 		ReqLogIndex: w.ReqLogIndex,
-		Status:      "broadcasted",
+		Status:      models.WITHDRAW_STATUS_PENDING,
 		DestAddress: w.DestAddress,
 		DestAmount:  w.DestAmount,
 		TxId:        txid,
@@ -624,11 +973,14 @@ func (wp *WithdrawalProcessor) handleLocalSigning(w *models.Withdrawal, tx *wire
 	if err := wp.eventRepo.CreateOrUpdateWithdrawal(nil, updated); err != nil {
 		return fmt.Errorf("update withdrawal after broadcast: %w", err)
 	}
+	wp.broadcastWithdrawalStatus(updated)
 
 	voutIndex := wp.findVoutIndex(tx, w.DestAddress)
 	updated.Vout = voutIndex
 	if err := wp.eventRepo.CreateOrUpdateWithdrawal(nil, updated); err != nil {
 		wp.logger.Warnf("Failed to update withdrawal vout index: %v", err)
+	} else {
+		wp.broadcastWithdrawalStatus(updated)
 	}
 
 	wp.logger.Infof("Broadcasted Dogecoin withdrawal tx %s for task %s (amount=%s)", txid, w.ReqTaskId, w.DestAmount)
@@ -681,7 +1033,7 @@ func (wp *WithdrawalProcessor) handleFireblocksSigning(w *models.Withdrawal, tx 
 		ReqTxHash:   w.ReqTxHash,
 		ReqBlock:    w.ReqBlock,
 		ReqLogIndex: w.ReqLogIndex,
-		Status:      "signing",
+		Status:      models.WITHDRAW_STATUS_PENDING,
 		DestAddress: w.DestAddress,
 		DestAmount:  w.DestAmount,
 		ExternalId:  externalId,
@@ -691,6 +1043,7 @@ func (wp *WithdrawalProcessor) handleFireblocksSigning(w *models.Withdrawal, tx 
 	if err := wp.eventRepo.CreateOrUpdateWithdrawal(nil, updated); err != nil {
 		return fmt.Errorf("update withdrawal after fireblocks request: %w", err)
 	}
+	wp.broadcastWithdrawalStatus(updated)
 
 	wp.logger.Infof("Submitted Fireblocks signing request %s for withdrawal %s", externalId, w.ReqTaskId)
 	return nil
@@ -720,7 +1073,12 @@ func (wp *WithdrawalProcessor) finishFireblocksWithdrawal(w *models.Withdrawal) 
 		return fmt.Errorf("query fireblocks transaction: %w", err)
 	}
 
+	wp.logger.Infof("Fireblocks tx %s status=%s subStatus=%s txHash=%s", w.ExternalId, details.Status, details.SubStatus, details.TxHash)
 	status := strings.ToUpper(details.Status)
+	if status == "BLOCKED" && strings.ToUpper(details.SubStatus) == "BLOCKED_BY_POLICY" {
+		wp.logger.Warnf("Fireblocks tx %s blocked by policy for withdrawal %s (status=%s, subStatus=%s)", w.ExternalId, w.ReqTaskId, details.Status, details.SubStatus)
+		return nil
+	}
 	if status == "COMPLETED" {
 		if len(w.UnsignedTx) == 0 {
 			return fmt.Errorf("withdrawal %s missing unsigned tx data", w.ReqTaskId)
@@ -766,7 +1124,7 @@ func (wp *WithdrawalProcessor) finishFireblocksWithdrawal(w *models.Withdrawal) 
 			ReqTxHash:   w.ReqTxHash,
 			ReqBlock:    w.ReqBlock,
 			ReqLogIndex: w.ReqLogIndex,
-			Status:      "broadcasted",
+			Status:      models.WITHDRAW_STATUS_PENDING,
 			DestAddress: w.DestAddress,
 			DestAmount:  w.DestAmount,
 			TxId:        txid,
@@ -778,13 +1136,30 @@ func (wp *WithdrawalProcessor) finishFireblocksWithdrawal(w *models.Withdrawal) 
 		if err := wp.eventRepo.CreateOrUpdateWithdrawal(nil, updated); err != nil {
 			return fmt.Errorf("update withdrawal after broadcast: %w", err)
 		}
+		wp.broadcastWithdrawalStatus(updated)
 		wp.logger.Infof("Broadcasted Fireblocks-signed tx %s for withdrawal %s", txid, w.ReqTaskId)
 		return nil
 	}
 
 	if isFireblocksFailureStatus(status) {
-		if err := wp.eventRepo.UpdateWithdrawalStatusByTask(nil, w.ReqTaskId, "failed"); err != nil {
-			wp.logger.Warnf("Failed to update withdrawal %s status to failed: %v", w.ReqTaskId, err)
+		wp.logger.Warnf("Fireblocks tx %s failed for withdrawal %s (status=%s, subStatus=%s)", w.ExternalId, w.ReqTaskId, details.Status, details.SubStatus)
+		updated := &models.Withdrawal{
+			ReqTaskId:   w.ReqTaskId,
+			ReqTxHash:   w.ReqTxHash,
+			ReqBlock:    w.ReqBlock,
+			ReqLogIndex: w.ReqLogIndex,
+			Status:      models.WITHDRAW_STATUS_INIT,
+			DestAddress: w.DestAddress,
+			DestAmount:  w.DestAmount,
+			ExternalId:  "",
+			UnsignedTx:  nil,
+			TxId:        "",
+			TxBytes:     nil,
+		}
+		if err := wp.eventRepo.CreateOrUpdateWithdrawal(nil, updated); err != nil {
+			wp.logger.Warnf("Failed to reset withdrawal %s status to init: %v", w.ReqTaskId, err)
+		} else {
+			wp.broadcastWithdrawalStatus(updated)
 		}
 		return nil
 	}
@@ -836,8 +1211,27 @@ func (wp *WithdrawalProcessor) checkAndSubmit(w *models.Withdrawal) error {
 		return fmt.Errorf("submit withdrawal request: %w", err)
 	}
 
-	if err := wp.eventRepo.UpdateWithdrawalStatusByTask(nil, w.ReqTaskId, "pending_finish"); err != nil {
-		wp.logger.Warnf("Failed to update withdrawal %s status to pending_finish: %v", w.ReqTaskId, err)
+	updated := &models.Withdrawal{
+		ReqTaskId:      w.ReqTaskId,
+		ReqTxHash:      w.ReqTxHash,
+		ReqBlock:       w.ReqBlock,
+		ReqLogIndex:    w.ReqLogIndex,
+		Status:         models.WITHDRAW_STATUS_CONFIRMED,
+		DestAddress:    w.DestAddress,
+		DestAmount:     w.DestAmount,
+		TxId:           w.TxId,
+		ExternalId:     w.ExternalId,
+		Vout:           w.Vout,
+		TxBytes:        w.TxBytes,
+		UnsignedTx:     w.UnsignedTx,
+		FinishTxHash:   w.FinishTxHash,
+		FinishBlock:    w.FinishBlock,
+		FinishLogIndex: w.FinishLogIndex,
+	}
+	if err := wp.eventRepo.CreateOrUpdateWithdrawal(nil, updated); err != nil {
+		wp.logger.Warnf("Failed to update withdrawal %s status to confirmed: %v", w.ReqTaskId, err)
+	} else {
+		wp.broadcastWithdrawalStatus(updated)
 	}
 	return nil
 }

@@ -176,6 +176,15 @@ const (
 	ORDER_TYPE_SAFEBOX       = "safebox"
 )
 
+const (
+	WITHDRAW_STATUS_CREATE      = "create"
+	WITHDRAW_STATUS_AGGREGATING = "aggregating"
+	WITHDRAW_STATUS_INIT        = "init"
+	WITHDRAW_STATUS_PENDING     = "pending"
+	WITHDRAW_STATUS_CONFIRMED   = "confirmed"
+	WITHDRAW_STATUS_PROCESSED   = "processed"
+)
+
 // PendingBatch represents a batch waiting for TSS signature
 type PendingBatch struct {
 	gorm.Model `swaggerignore:"true"`

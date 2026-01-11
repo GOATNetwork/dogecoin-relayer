@@ -65,6 +65,18 @@ func createTestDepositUTXO(txid string, amount int64, evmAddr string) *models.UT
 	}
 }
 
+func createTestDepositFromUTXO(utxo *models.UTXO) *models.Deposit {
+	return &models.Deposit{
+		TxId:    utxo.Txid,
+		Vout:    utxo.OutIndex,
+		Address: utxo.Receiver,
+		EvmAddr: utxo.EvmAddr,
+		Amount:  utxo.Amount,
+		TxBytes: []byte(utxo.Txid),
+		Status:  "confirmed",
+	}
+}
+
 // createTestWithdrawalUTXO creates a test withdrawal UTXO
 func createTestWithdrawalUTXO(txid string, amount int64) *models.UTXO {
 	return &models.UTXO{
@@ -108,6 +120,13 @@ func insertTestUTXOs(t *testing.T, db *gorm.DB, utxos []*models.UTXO) {
 	for _, utxo := range utxos {
 		err := db.Create(utxo).Error
 		require.NoError(t, err, "Failed to insert test UTXO")
+	}
+}
+
+func insertTestDeposits(t *testing.T, db *gorm.DB, deposits []*models.Deposit) {
+	for _, deposit := range deposits {
+		err := db.Create(deposit).Error
+		require.NoError(t, err, "Failed to insert test deposit")
 	}
 }
 
@@ -245,6 +264,12 @@ func TestUtxoProcessor_GroupUTXOsIntoBatches(t *testing.T) {
 		createTestDepositUTXO("tx5", 5000000, "0x5555555555555555555555555555555555555555"),
 		createTestDepositUTXO("tx6", 6000000, "0x6666666666666666666666666666666666666666"),
 	}
+
+	var deposits []*models.Deposit
+	for _, utxo := range depositUTXOs {
+		deposits = append(deposits, createTestDepositFromUTXO(utxo))
+	}
+	insertTestDeposits(t, conn.GetDB(), deposits)
 
 	// Test grouping UTXOs into batches
 	batches := processor.groupUTXOsIntoBatches(depositUTXOs)
@@ -474,6 +499,11 @@ func TestUtxoProcessor_DatabaseIntegration(t *testing.T) {
 		createTestDepositUTXO("deposit3", 3000000, "0x3333333333333333333333333333333333333333"),
 	}
 	insertTestUTXOs(t, conn.GetDB(), depositUTXOs)
+	var deposits []*models.Deposit
+	for _, utxo := range depositUTXOs {
+		deposits = append(deposits, createTestDepositFromUTXO(utxo))
+	}
+	insertTestDeposits(t, conn.GetDB(), deposits)
 	processor.batchSize = len(depositUTXOs)
 
 	// Create and insert test withdrawal UTXO and VOUTs

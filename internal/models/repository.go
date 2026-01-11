@@ -197,13 +197,46 @@ func (r *SendOrderRepository) GetSendOrderByTxIdOrExternalId(txid string) (*Send
 }
 
 func (r *SendOrderRepository) UpdateSendOrderConfirmed(txid string, confirmBlock int64) error {
-	return r.db.Model(&SendOrder{}).
-		Where("txid = ?", txid).
-		Updates(map[string]interface{}{
-			"status":        "confirmed",
-			"confirm_block": confirmBlock,
-			"updated_at":    time.Now(),
-		}).Error
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		var orders []SendOrder
+		if err := tx.Where("txid = ?", txid).Find(&orders).Error; err != nil {
+			return err
+		}
+		if len(orders) == 0 {
+			return nil
+		}
+		now := time.Now()
+		if err := tx.Model(&SendOrder{}).
+			Where("txid = ?", txid).
+			Updates(map[string]interface{}{
+				"status":        "confirmed",
+				"confirm_block": confirmBlock,
+				"updated_at":    now,
+			}).Error; err != nil {
+			return err
+		}
+		orderIds := make([]string, 0, len(orders))
+		for _, order := range orders {
+			orderIds = append(orderIds, order.OrderId)
+		}
+		if err := tx.Model(&VIN{}).
+			Where("order_id IN ?", orderIds).
+			Updates(map[string]interface{}{
+				"status":     "confirmed",
+				"updated_at": now,
+			}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&VOUT{}).
+			Where("order_id IN ?", orderIds).
+			Updates(map[string]interface{}{
+				"status":     "confirmed",
+				"updated_at": now,
+			}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 // PendingBatchRepository handles pending batch database operations

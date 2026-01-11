@@ -54,7 +54,16 @@ func CreateSendOrder(tx *wire.MsgTx, orderType string, selectedUtxos []*UTXOAdap
 		}
 
 		withdrawId := ""
-		if i < len(selectedWithdrawals) {
+		if len(addresses) > 0 {
+			receiver := addresses[0].EncodeAddress()
+			for _, withdrawal := range selectedWithdrawals {
+				if withdrawal != nil && withdrawal.DestAddress == receiver {
+					withdrawId = withdrawal.ReqTaskId
+					break
+				}
+			}
+		}
+		if withdrawId == "" && i < len(selectedWithdrawals) {
 			withdrawId = selectedWithdrawals[i].ReqTaskId
 		}
 
@@ -137,14 +146,104 @@ func UpdateSendOrderPending(txid, externalId string, db *gorm.DB, vins []*models
 	})
 }
 
+func CloseSendOrdersForWithdrawal(db *gorm.DB, withdrawId string) error {
+	if withdrawId == "" {
+		return nil
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		var orderIds []string
+		if err := tx.Model(&models.VOUT{}).
+			Distinct("order_id").
+			Where("withdraw_id = ?", withdrawId).
+			Pluck("order_id", &orderIds).Error; err != nil {
+			return err
+		}
+		if len(orderIds) == 0 {
+			return nil
+		}
+		now := time.Now()
+		if err := tx.Model(&models.SendOrder{}).
+			Where("order_id IN ? AND status IN ?", orderIds, []string{"aggregating", "init", "pending"}).
+			Updates(map[string]interface{}{
+				"status":     "closed",
+				"updated_at": now,
+			}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&models.VIN{}).
+			Where("order_id IN ?", orderIds).
+			Updates(map[string]interface{}{
+				"status":     "closed",
+				"updated_at": now,
+			}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&models.VOUT{}).
+			Where("order_id IN ?", orderIds).
+			Updates(map[string]interface{}{
+				"status":     "closed",
+				"updated_at": now,
+			}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func CleanProcessingSendOrders(db *gorm.DB) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		var orders []models.SendOrder
+		if err := tx.Where("status = ?", "aggregating").Find(&orders).Error; err != nil {
+			return err
+		}
+		if len(orders) == 0 {
+			return nil
+		}
+		orderIds := make([]string, 0, len(orders))
+		for _, order := range orders {
+			orderIds = append(orderIds, order.OrderId)
+		}
+		now := time.Now()
+		if err := tx.Model(&models.SendOrder{}).
+			Where("order_id IN ?", orderIds).
+			Updates(map[string]interface{}{
+				"status":     "closed",
+				"updated_at": now,
+			}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&models.VIN{}).
+			Where("order_id IN ?", orderIds).
+			Updates(map[string]interface{}{
+				"status":     "closed",
+				"updated_at": now,
+			}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&models.VOUT{}).
+			Where("order_id IN ?", orderIds).
+			Updates(map[string]interface{}{
+				"status":     "closed",
+				"updated_at": now,
+			}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 func generateOrderID() string {
 	return fmt.Sprintf("order_%d", time.Now().UnixNano())
 }
 
 func ToUTXOAdapter(utxo *models.UTXO) *UTXOAdapter {
+	receiverType := utxo.ReceiverType
+	if receiverType == "" {
+		receiverType = WALLET_TYPE_P2PKH
+	}
 	return &UTXOAdapter{
 		UTXO:         utxo,
-		ReceiverType: utxo.ReceiverType,
+		ReceiverType: receiverType,
 		SubScript:    utxo.PkScript,
 	}
 }

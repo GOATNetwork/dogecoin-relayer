@@ -7,12 +7,15 @@ import (
 	"math/big"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/dogecoinw/doged/btcutil"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
+	"github.com/goat-network/dogecoin-relayer/internal/p2p"
 	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
 	"github.com/goat-network/dogecoin-relayer/pkg/global"
+	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
 	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
@@ -196,17 +199,17 @@ func (eh *EventHandler) processBridgeOutProposed(event BlockchainEvent) error {
 		logger.Warnf("Failed to parse destDogecoinAddress for task %s: %v", taskId, err)
 	}
 
-	// Create withdrawal record with retry transaction
+	withdrawal := &models.Withdrawal{
+		ReqTaskId:   taskId,
+		ReqTxHash:   event.TxHash.Hex(),
+		ReqBlock:    event.BlockNumber,
+		ReqLogIndex: event.LogIndex,
+		Status:      models.WITHDRAW_STATUS_CREATE,
+		DestAmount:  destAmountStr,
+		DestAddress: destDogeAddr,
+	}
+
 	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
-		withdrawal := &models.Withdrawal{
-			ReqTaskId:   taskId,
-			ReqTxHash:   event.TxHash.Hex(),
-			ReqBlock:    event.BlockNumber,
-			ReqLogIndex: event.LogIndex,
-			Status:      "init", // Initial status when BridgeOutProposed is detected
-			DestAmount:  destAmountStr,
-			DestAddress: destDogeAddr,
-		}
 		return eh.eventRepo.CreateOrUpdateWithdrawal(tx, withdrawal)
 	})
 
@@ -215,6 +218,7 @@ func (eh *EventHandler) processBridgeOutProposed(event BlockchainEvent) error {
 	}
 
 	logger.Infof("Created/updated withdrawal record for taskId=%s", taskId)
+	eh.broadcastWithdrawalStatus(withdrawal)
 
 	// Publish to event bus for other modules (like UTXO processor)
 	eh.eventBus.Publish(eventbus.EventBridgeOutProposed, event)
@@ -250,10 +254,10 @@ func (eh *EventHandler) processBridgeOutFinished(event BlockchainEvent) error {
 			if err != nil {
 				return fmt.Errorf("failed to get withdrawal (taskId=%s): %w", taskId, err)
 			}
-			if err := eh.eventRepo.UpdateWithdrawalStatus(tx, withdrawal.ID, "confirmed"); err != nil {
+			if err := eh.eventRepo.UpdateWithdrawalStatus(tx, withdrawal.ID, models.WITHDRAW_STATUS_PROCESSED); err != nil {
 				return fmt.Errorf("failed to update withdrawal status (taskId=%s): %w", taskId, err)
 			}
-			logger.Infof("Updated withdrawal %s to confirmed state", taskId)
+			logger.Infof("Updated withdrawal %s to processed state", taskId)
 		}
 		return nil
 	})
@@ -261,7 +265,15 @@ func (eh *EventHandler) processBridgeOutFinished(event BlockchainEvent) error {
 		return err
 	}
 
-	// Publish to event bus
+	for _, taskId := range taskIds {
+		withdrawal, err := eh.eventRepo.GetWithdrawalByTask(nil, taskId)
+		if err != nil {
+			logger.Warnf("Failed to load withdrawal %s for status sync: %v", taskId, err)
+			continue
+		}
+		eh.broadcastWithdrawalStatus(withdrawal)
+	}
+
 	eh.eventBus.Publish(eventbus.EventBridgeOutFinished, event)
 	return nil
 }
@@ -570,4 +582,42 @@ func parseDestDogecoinAddress(raw any) (string, error) {
 		return "", fmt.Errorf("build doge address: %w", err)
 	}
 	return addr.EncodeAddress(), nil
+}
+
+func (eh *EventHandler) broadcastWithdrawalStatus(w *models.Withdrawal) {
+	p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
+	if !ok {
+		return
+	}
+	payload := types.WithdrawalStatusPayload{
+		ReqTaskId:      w.ReqTaskId,
+		Status:         w.Status,
+		ReqTxHash:      w.ReqTxHash,
+		ReqBlock:       w.ReqBlock,
+		ReqLogIndex:    w.ReqLogIndex,
+		DestAddress:    w.DestAddress,
+		DestAmount:     w.DestAmount,
+		TxId:           w.TxId,
+		ExternalId:     w.ExternalId,
+		Vout:           w.Vout,
+		TxBytes:        w.TxBytes,
+		UnsignedTx:     w.UnsignedTx,
+		FinishTxHash:   w.FinishTxHash,
+		FinishBlock:    w.FinishBlock,
+		FinishLogIndex: w.FinishLogIndex,
+		UpdatedAt:      time.Now().Unix(),
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		eh.logger.Warnf("Failed to marshal withdrawal status payload: %v", err)
+		return
+	}
+	msg := types.P2PBroadcastMessage{
+		Type:      types.P2PMessageTypeWithdrawalStatus,
+		SessionID: w.ReqTaskId,
+		Payload:   payloadBytes,
+	}
+	if err := p2pModule.(p2p.P2PSender).BroadcastP2PMessage(msg); err != nil {
+		eh.logger.Warnf("Failed to broadcast withdrawal status %s: %v", w.ReqTaskId, err)
+	}
 }
