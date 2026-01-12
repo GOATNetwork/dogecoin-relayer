@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/goat-network/dogecoin-relayer/internal/config"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/pkg/global"
 	"github.com/golang-jwt/jwt/v5"
@@ -48,13 +47,7 @@ type FireblocksWebhookEvent struct {
 func (m *HttpModule) handleFireblocksCosignerTxSign(w http.ResponseWriter, r *http.Request) {
 	logger := log.WithField("handler", "fireblocks_cosigner")
 
-	// Read request body
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		logger.Errorf("Failed to read request body: %v", err)
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
-		return
-	}
+	// Close request body when done
 	defer r.Body.Close()
 
 	// Parse JWT token from Authorization header
@@ -156,7 +149,8 @@ func (m *HttpModule) handleFireblocksCosignerTxSign(w http.ResponseWriter, r *ht
 		txHash := parts[1]
 
 		// Query database for SendOrder
-		sendOrder, err := m.conn.GetStateRepo().GetSendOrderByTxIdOrExternalId(txHash)
+		stateRepo := models.NewStateRepository(m.conn.GetDB())
+		sendOrder, err := stateRepo.GetSendOrderByTxIdOrExternalId(txHash)
 		if err != nil {
 			logger.Errorf("Database error when checking send order: %v", err)
 			action = "RETRY"
