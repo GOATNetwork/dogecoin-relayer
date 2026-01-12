@@ -293,23 +293,31 @@ func (c *DogeClient) CreateRawTransaction(inputs []TransactionInput, outputs map
 
 // SignRawTransaction signs a raw transaction using the node wallet.
 func (c *DogeClient) SignRawTransaction(rawHex string) (string, error) {
-	rawSign, err := c.client.RawRequest("signrawtransaction", []json.RawMessage{
-		json.RawMessage(fmt.Sprintf("%q", rawHex)),
-	})
+	// Decode the hex string into a wire.MsgTx
+	decoded, err := hex.DecodeString(strings.TrimSpace(rawHex))
 	if err != nil {
-		return "", fmt.Errorf("signrawtransaction rpc: %w", err)
+		return "", fmt.Errorf("decode raw tx hex: %w", err)
 	}
-	var signResp struct {
-		Hex      string `json:"hex"`
-		Complete bool   `json:"complete"`
+	var tx wire.MsgTx
+	if err := tx.Deserialize(bytes.NewReader(decoded)); err != nil {
+		return "", fmt.Errorf("deserialize raw tx: %w", err)
 	}
-	if err := json.Unmarshal(rawSign, &signResp); err != nil {
-		return "", fmt.Errorf("unmarshal sign tx: %w", err)
+
+	// Sign using the library's built-in method
+	signedTx, complete, err := c.client.SignRawTransactionWithWallet(&tx)
+	if err != nil {
+		return "", fmt.Errorf("sign raw transaction with wallet: %w", err)
 	}
-	if !signResp.Complete {
-		return "", fmt.Errorf("signrawtransaction incomplete")
+	if !complete {
+		return "", fmt.Errorf("transaction signing incomplete")
 	}
-	return signResp.Hex, nil
+
+	// Serialize back to hex
+	var buf bytes.Buffer
+	if err := signedTx.Serialize(&buf); err != nil {
+		return "", fmt.Errorf("serialize signed tx: %w", err)
+	}
+	return hex.EncodeToString(buf.Bytes()), nil
 }
 
 // SendRawTransaction broadcasts the given raw tx hex.
