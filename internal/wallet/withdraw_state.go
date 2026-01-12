@@ -190,8 +190,12 @@ func CloseSendOrdersForWithdrawal(db *gorm.DB, withdrawId string) error {
 	})
 }
 
-func CleanProcessingSendOrders(db *gorm.DB) error {
-	return db.Transaction(func(tx *gorm.DB) error {
+// CleanProcessingSendOrders cleans up "aggregating" status send orders and their associated UTXOs on startup.
+// This handles cases where the service crashed or restarted while processing withdrawals.
+// It returns the count of reset UTXOs for logging purposes.
+func CleanProcessingSendOrders(db *gorm.DB) (int64, error) {
+	var resetCount int64
+	err := db.Transaction(func(tx *gorm.DB) error {
 		var orders []models.SendOrder
 		if err := tx.Where("status = ?", "aggregating").Find(&orders).Error; err != nil {
 			return err
@@ -203,6 +207,24 @@ func CleanProcessingSendOrders(db *gorm.DB) error {
 		for _, order := range orders {
 			orderIds = append(orderIds, order.OrderId)
 		}
+
+		// First, get all VINs associated with these orders to reset their corresponding UTXOs
+		var vins []models.VIN
+		if err := tx.Where("order_id IN ?", orderIds).Find(&vins).Error; err != nil {
+			return err
+		}
+
+		// Reset UTXOs that are in PENDING status and associated with these orders
+		for _, vin := range vins {
+			result := tx.Model(&models.UTXO{}).
+				Where("txid = ? AND out_index = ? AND status = ?", vin.Txid, vin.OutIndex, models.UTXO_STATUS_PENDING).
+				Update("status", models.UTXO_STATUS_PROCESSED)
+			if result.Error != nil {
+				return result.Error
+			}
+			resetCount += result.RowsAffected
+		}
+
 		now := time.Now()
 		if err := tx.Model(&models.SendOrder{}).
 			Where("order_id IN ?", orderIds).
@@ -230,6 +252,7 @@ func CleanProcessingSendOrders(db *gorm.DB) error {
 		}
 		return nil
 	})
+	return resetCount, err
 }
 
 func generateOrderID() string {

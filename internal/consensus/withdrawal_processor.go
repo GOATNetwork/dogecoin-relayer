@@ -356,8 +356,11 @@ func (wp *WithdrawalProcessor) Start(ctx context.Context) error {
 		return nil
 	}
 	wp.ctx, wp.cancel = context.WithCancel(ctx)
-	if err := wallet.CleanProcessingSendOrders(wp.conn.GetDB()); err != nil {
+	// Clean up aggregating send orders and their associated PENDING UTXOs
+	if resetCount, err := wallet.CleanProcessingSendOrders(wp.conn.GetDB()); err != nil {
 		wp.logger.Warnf("Failed to clean processing send orders: %v", err)
+	} else if resetCount > 0 {
+		wp.logger.Infof("Cleaned up processing send orders, reset %d pending UTXOs on startup", resetCount)
 	}
 	if !wp.fireblocksMode {
 		if err := wp.resetFireblocksWithdrawals(); err != nil {
@@ -945,11 +948,12 @@ func (wp *WithdrawalProcessor) handleLocalSigning(w *models.Withdrawal, tx *wire
 			return err
 		}
 
+		// Mark UTXOs as pending (not spent yet - will be marked as spent by blockchain confirmation in doge/module.go)
 		for _, vin := range vins {
 			if err := db.Model(&models.UTXO{}).
 				Where("txid = ? AND out_index = ?", vin.Txid, vin.OutIndex).
-				Update("status", models.UTXO_STATUS_SPENT).Error; err != nil {
-				return fmt.Errorf("update utxo status to spent: %w", err)
+				Update("status", models.UTXO_STATUS_PENDING).Error; err != nil {
+				return fmt.Errorf("update utxo status to pending: %w", err)
 			}
 		}
 
@@ -1011,11 +1015,12 @@ func (wp *WithdrawalProcessor) handleFireblocksSigning(w *models.Withdrawal, tx 
 			return err
 		}
 
+		// Mark UTXOs as pending (not spent yet - will be marked as spent after broadcast to Dogecoin network)
 		for _, vin := range vins {
 			if err := db.Model(&models.UTXO{}).
 				Where("txid = ? AND out_index = ?", vin.Txid, vin.OutIndex).
-				Update("status", models.UTXO_STATUS_SPENT).Error; err != nil {
-				return fmt.Errorf("update utxo status to spent: %w", err)
+				Update("status", models.UTXO_STATUS_PENDING).Error; err != nil {
+				return fmt.Errorf("update utxo status to pending: %w", err)
 			}
 		}
 
@@ -1091,6 +1096,8 @@ func (wp *WithdrawalProcessor) finishFireblocksWithdrawal(w *models.Withdrawal) 
 
 		tx, err := wallet.DeserializeTransactionFromBytes(w.UnsignedTx)
 		if err != nil {
+			// Reset UTXOs on permanent failure - can't deserialize means bad data
+			wp.resetPendingUTXOsForWithdrawal(w)
 			return fmt.Errorf("deserialize unsigned tx: %w", err)
 		}
 
@@ -1106,18 +1113,33 @@ func (wp *WithdrawalProcessor) finishFireblocksWithdrawal(w *models.Withdrawal) 
 		}
 
 		if err := wallet.ApplyFireblocksSignaturesToTx(tx, utxoAdapters, details.SignedMessages, dogeNet); err != nil {
+			// Reset UTXOs on signature application failure
+			wp.resetPendingUTXOsForWithdrawal(w)
 			return fmt.Errorf("apply fireblocks signatures: %w", err)
 		}
 
 		signedHex, signedBytes, err := serializeTx(tx)
 		if err != nil {
+			// Reset UTXOs on serialization failure
+			wp.resetPendingUTXOsForWithdrawal(w)
 			return fmt.Errorf("serialize signed tx: %w", err)
 		}
 
 		txid, err := wp.dogeClient.SendRawTransaction(signedHex)
 		if err != nil {
+			// Reset UTXOs from pending back to processed on broadcast failure
+			for _, txIn := range tx.TxIn {
+				if resetErr := wp.conn.GetDB().Model(&models.UTXO{}).
+					Where("txid = ? AND out_index = ? AND status = ?", txIn.PreviousOutPoint.Hash.String(), txIn.PreviousOutPoint.Index, models.UTXO_STATUS_PENDING).
+					Update("status", models.UTXO_STATUS_PROCESSED).Error; resetErr != nil {
+					wp.logger.Warnf("Failed to reset UTXO %s:%d to processed: %v", txIn.PreviousOutPoint.Hash.String(), txIn.PreviousOutPoint.Index, resetErr)
+				}
+			}
 			return fmt.Errorf("send raw tx: %w", err)
 		}
+
+		// Note: UTXOs remain in PENDING status until blockchain confirms the transaction
+		// The doge/module.go handleSpendingTransaction() will mark them as SPENT when confirmed
 
 		voutIndex := wp.findVoutIndex(tx, w.DestAddress)
 		updated := &models.Withdrawal{
@@ -1144,6 +1166,10 @@ func (wp *WithdrawalProcessor) finishFireblocksWithdrawal(w *models.Withdrawal) 
 
 	if isFireblocksFailureStatus(status) {
 		wp.logger.Warnf("Fireblocks tx %s failed for withdrawal %s (status=%s, subStatus=%s)", w.ExternalId, w.ReqTaskId, details.Status, details.SubStatus)
+
+		// Reset UTXOs from pending back to processed before resetting withdrawal
+		wp.resetPendingUTXOsForWithdrawal(w)
+
 		updated := &models.Withdrawal{
 			ReqTaskId:   w.ReqTaskId,
 			ReqTxHash:   w.ReqTxHash,
@@ -1166,6 +1192,26 @@ func (wp *WithdrawalProcessor) finishFireblocksWithdrawal(w *models.Withdrawal) 
 	}
 
 	return nil
+}
+
+// resetPendingUTXOsForWithdrawal resets UTXOs associated with a withdrawal from pending back to processed
+func (wp *WithdrawalProcessor) resetPendingUTXOsForWithdrawal(w *models.Withdrawal) {
+	if len(w.UnsignedTx) == 0 {
+		return
+	}
+	tx, err := wallet.DeserializeTransactionFromBytes(w.UnsignedTx)
+	if err != nil {
+		wp.logger.Warnf("Failed to deserialize unsigned tx for UTXO reset: %v", err)
+		return
+	}
+	for _, txIn := range tx.TxIn {
+		if err := wp.conn.GetDB().Model(&models.UTXO{}).
+			Where("txid = ? AND out_index = ? AND status = ?", txIn.PreviousOutPoint.Hash.String(), txIn.PreviousOutPoint.Index, models.UTXO_STATUS_PENDING).
+			Update("status", models.UTXO_STATUS_PROCESSED).Error; err != nil {
+			wp.logger.Warnf("Failed to reset UTXO %s:%d to processed: %v", txIn.PreviousOutPoint.Hash.String(), txIn.PreviousOutPoint.Index, err)
+		}
+	}
+	wp.logger.Infof("Reset pending UTXOs for withdrawal %s", w.ReqTaskId)
 }
 
 func (wp *WithdrawalProcessor) checkAndSubmit(w *models.Withdrawal) error {

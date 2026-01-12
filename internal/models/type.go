@@ -158,7 +158,8 @@ const (
 	UTXO_STATUS_UNCONFIRMED = "unconfirmed"
 	UTXO_STATUS_CONFIRMED   = "confirmed"
 	UTXO_STATUS_PROCESSED   = "processed"
-	UTXO_STATUS_SPENT       = "spent"
+	UTXO_STATUS_PENDING     = "pending" // Selected for withdrawal, waiting for signature/broadcast
+	UTXO_STATUS_SPENT       = "spent"   // Transaction broadcasted to Dogecoin network
 )
 
 // Constants for wallet types

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -63,15 +64,16 @@ type Message struct {
 // Network struct remains largely the same
 
 type Network struct {
-	config   config.P2PConfig
-	logger   *log.Entry
-	host     host.Host
-	eventBus *eventbus.Bus
-	handlers map[types.P2PMessageType]func(*types.P2PBroadcastMessage) error
-	ps       *pubsub.PubSub
-	topic    *pubsub.Topic
-	ctx      context.Context
-	cancel   context.CancelFunc
+	config      config.P2PConfig
+	logger      *log.Entry
+	host        host.Host
+	eventBus    *eventbus.Bus
+	handlers    map[types.P2PMessageType]func(*types.P2PBroadcastMessage) error
+	handlersMu  sync.RWMutex
+	ps          *pubsub.PubSub
+	topic       *pubsub.Topic
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 func StringToPeerID(peerIDStr string) (peer.ID, error) {
@@ -329,7 +331,9 @@ func (n *Network) handlePubSubMessages() {
 			n.logger.Infof("💓 Received heartbeat from %s: %s", libp2pMsg.From, string(libp2pMsg.Payload))
 		}
 
+		n.handlersMu.RLock()
 		handler, exists := n.handlers[libp2pMsg.Type]
+		n.handlersMu.RUnlock()
 		if exists {
 			if err := handler(&types.P2PBroadcastMessage{
 				Type:      libp2pMsg.Type,
@@ -403,6 +407,8 @@ func (n *Network) GetEventBus() *eventbus.Bus {
 
 // RegisterHandler registers a handler for a specific message type
 func (n *Network) RegisterHandler(msgType types.P2PMessageType, handler func(*types.P2PBroadcastMessage) error) error {
+	n.handlersMu.Lock()
+	defer n.handlersMu.Unlock()
 	if _, ok := n.handlers[msgType]; ok {
 		return fmt.Errorf("handler already registered for message type: %s", msgType)
 	}
@@ -424,7 +430,10 @@ func (n *Network) SendMessage(to *peer.ID, msgType types.P2PMessageType, session
 
 	if *to == n.host.ID() {
 		go func() {
-			if handler, ok := n.handlers[msgType]; ok {
+			n.handlersMu.RLock()
+			handler, ok := n.handlers[msgType]
+			n.handlersMu.RUnlock()
+			if ok {
 				if err := handler(&types.P2PBroadcastMessage{
 					Type:      msg.Type,
 					SessionID: msg.SessionID,
@@ -552,7 +561,9 @@ func (n *Network) handleStream(s network.Stream) {
 		return
 	}
 
+	n.handlersMu.RLock()
 	handler, exists := n.handlers[msg.Type]
+	n.handlersMu.RUnlock()
 	if exists {
 		if err := handler(&types.P2PBroadcastMessage{
 			Type:      msg.Type,
