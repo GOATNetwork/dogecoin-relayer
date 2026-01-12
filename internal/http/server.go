@@ -37,6 +37,14 @@ func (m *HttpModule) registerHandlers(mux *http.ServeMux) {
 	// Add status endpoint
 	mux.HandleFunc("/status", m.statusHandler)
 
+	// Add Fireblocks cosigner callback endpoint
+	mux.HandleFunc("/api/fireblocks/cosigner/v2/tx_sign_request", m.handleFireblocksCosignerTxSign)
+	m.logger.Info("Fireblocks cosigner callback endpoint enabled at /api/fireblocks/cosigner/v2/tx_sign_request")
+
+	// Add Fireblocks webhook endpoint
+	mux.HandleFunc("/api/fireblocks/webhook", m.handleFireblocksWebhook)
+	m.logger.Info("Fireblocks webhook endpoint enabled at /api/fireblocks/webhook")
+
 	// Add root endpoint
 	mux.HandleFunc("/", m.rootHandler)
 }
@@ -125,6 +133,8 @@ func (m *HttpModule) rootHandler(w http.ResponseWriter, r *http.Request) {
 			<li><a href="/health">Health Check</a></li>
 			<li><a href="/status">Status</a></li>
 			%s
+			<li>POST /api/fireblocks/cosigner/v2/tx_sign_request - Fireblocks Cosigner Callback</li>
+			<li>POST /api/fireblocks/webhook - Fireblocks Webhook</li>
 		</ul>
 	</body>
 	</html>

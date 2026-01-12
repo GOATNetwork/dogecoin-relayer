@@ -1000,7 +1000,8 @@ func (wp *WithdrawalProcessor) handleFireblocksSigning(w *models.Withdrawal, tx 
 		messages[i] = hex.EncodeToString(msg)
 	}
 
-	externalId, err := wp.fireblocksClient.postRawSigningRequest(messages, "withdrawal:"+w.ReqTaskId)
+	// Use SendOrder txid in note for cosigner callback validation
+	externalId, err := wp.fireblocksClient.postRawSigningRequest(messages, "withdrawal:"+sendOrder.Txid)
 	if err != nil {
 		return fmt.Errorf("fireblocks signing request: %w", err)
 	}
