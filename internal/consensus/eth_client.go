@@ -112,7 +112,7 @@ func SendTx(ctx context.Context, privateKey *ecdsa.PrivateKey, chainID *big.Int,
 	}
 
 	// Estimate gas limit
-	gasLimit, err := globalClient.EstimateGas(ctx, ethereum.CallMsg{
+	estimatedGas, err := globalClient.EstimateGas(ctx, ethereum.CallMsg{
 		From:  fromAddr,
 		To:    to,
 		Value: value,
@@ -123,6 +123,10 @@ func SendTx(ctx context.Context, privateKey *ecdsa.PrivateKey, chainID *big.Int,
 		metrics.RecordError("consensus", "gas_estimation_failed")
 		return nil, fmt.Errorf("failed to estimate gas: %w", err)
 	}
+	// Add 30% buffer to estimated gas to prevent out-of-gas errors
+	// Gas estimation can be inaccurate for complex contract calls
+	gasLimit := estimatedGas + (estimatedGas * 30 / 100)
+	log.Debugf("Gas estimation: estimated=%d, with buffer=%d (30%%)", estimatedGas, gasLimit)
 
 	// Get suggested gas price and calculate EIP-1559 fees
 	gasPrice, err := globalClient.SuggestGasPrice(ctx)

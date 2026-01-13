@@ -3,7 +3,6 @@ package http
 import (
 	"crypto/rsa"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -11,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/pkg/global"
@@ -19,23 +17,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// Fireblocks cosigner callback request structure
-type FireblocksCosignerRequest struct {
-	TxId        string `json:"txId"`
-	Operation   string `json:"operation"` // e.g., "RAW"
-	SourceType  string `json:"sourceType"`
-	SourceId    string `json:"sourceId"`
-	RequestedBy string `json:"requestedBy"`
-	Note        string `json:"note"` // Format: "ORDER_TYPE:txHash"
-}
-
-// Fireblocks cosigner callback response structure
-type FireblocksCosignerResponse struct {
-	Action          string `json:"action"`          // APPROVE | REJECT | IGNORE | RETRY
-	RejectionReason string `json:"rejectionReason"` // Required when action is REJECT
-}
-
-// Fireblocks webhook event structure
+// FireblocksWebhookEvent represents a Fireblocks webhook event
 type FireblocksWebhookEvent struct {
 	Type      string          `json:"type"`
 	TenantId  string          `json:"tenantId"`
@@ -44,180 +26,149 @@ type FireblocksWebhookEvent struct {
 }
 
 // handleFireblocksCosignerTxSign handles Fireblocks cosigner callback for transaction signing
+// JWT format follows Fireblocks API specification:
+// - Request: Body is JWT string, claims contain requestId, txId, note
+// - Response: JWT string with claims action, requestId, rejectionReason
 func (m *HttpModule) handleFireblocksCosignerTxSign(w http.ResponseWriter, r *http.Request) {
 	logger := log.WithField("handler", "fireblocks_cosigner")
 
-	// Close request body when done
-	defer r.Body.Close()
-
-	// Parse JWT token from Authorization header
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		logger.Error("Missing Authorization header")
-		http.Error(w, "Missing Authorization header", http.StatusUnauthorized)
-		return
-	}
-
-	// Extract token from "Bearer <token>" format
-	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
-	if tokenString == authHeader {
-		logger.Error("Invalid Authorization header format")
-		http.Error(w, "Invalid Authorization header format", http.StatusUnauthorized)
-		return
-	}
-
-	// Verify JWT signature using callback public key
+	// Get config
 	cfg := global.GetConfig()
-	callbackPubKey := cfg.Withdraw.Fireblocks.CallbackPub
-	if callbackPubKey == "" {
-		logger.Error("Fireblocks callback public key not configured")
+	if cfg.Withdraw.Fireblocks.CallbackPub == "" || cfg.Withdraw.Fireblocks.CallbackPriv == "" {
+		logger.Error("Fireblocks callback RSA keys not configured")
 		http.Error(w, "Server configuration error", http.StatusInternalServerError)
 		return
 	}
 
-	rsaPubKey, err := parseRSAPublicKeyFromPEM(callbackPubKey)
+	// Parse RSA public key for verifying incoming JWT
+	rsaPubKey, err := parseRSAPublicKeyFromPEM(cfg.Withdraw.Fireblocks.CallbackPub)
 	if err != nil {
 		logger.Errorf("Failed to parse callback public key: %v", err)
 		http.Error(w, "Server configuration error", http.StatusInternalServerError)
 		return
 	}
 
-	// Parse and verify JWT
-	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
-		return rsaPubKey, nil
-	})
-	if err != nil {
-		logger.Errorf("JWT verification failed: %v", err)
-		http.Error(w, "Invalid JWT token", http.StatusUnauthorized)
-		return
-	}
-
-	if !token.Valid {
-		logger.Error("Invalid JWT token")
-		http.Error(w, "Invalid JWT token", http.StatusUnauthorized)
-		return
-	}
-
-	// Extract body from JWT claims
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		logger.Error("Failed to extract JWT claims")
-		http.Error(w, "Invalid JWT claims", http.StatusBadRequest)
-		return
-	}
-
-	bodyStr, ok := claims["body"].(string)
-	if !ok {
-		logger.Error("Missing 'body' field in JWT claims")
-		http.Error(w, "Invalid JWT claims", http.StatusBadRequest)
-		return
-	}
-
-	// Decode base64-encoded body
-	decodedBody, err := base64.StdEncoding.DecodeString(bodyStr)
-	if err != nil {
-		logger.Errorf("Failed to decode base64 body: %v", err)
-		http.Error(w, "Invalid body encoding", http.StatusBadRequest)
-		return
-	}
-
-	// Parse cosigner request
-	var req FireblocksCosignerRequest
-	if err := json.Unmarshal(decodedBody, &req); err != nil {
-		logger.Errorf("Failed to parse cosigner request: %v", err)
-		http.Error(w, "Invalid request format", http.StatusBadRequest)
-		return
-	}
-
-	logger.Infof("Received cosigner callback for tx %s, operation=%s, note=%s", req.TxId, req.Operation, req.Note)
-
-	// Default: approve the transaction
-	action := "APPROVE"
-	rejectionReason := ""
-
-	// Validate SendOrder exists in database
-	// Extract txHash from note (format: "ORDER_TYPE:txHash")
-	parts := strings.Split(req.Note, ":")
-	if len(parts) != 2 {
-		logger.Warnf("Invalid note format: %s", req.Note)
-		action = "RETRY"
-		rejectionReason = "invalid note format"
-	} else {
-		txHash := parts[1]
-
-		// Query database for SendOrder
-		stateRepo := models.NewStateRepository(m.conn.GetDB())
-		sendOrder, err := stateRepo.GetSendOrderByTxIdOrExternalId(txHash)
-		if err != nil {
-			logger.Errorf("Database error when checking send order: %v", err)
-			action = "RETRY"
-			rejectionReason = "database error"
-		} else if sendOrder == nil {
-			logger.Warnf("SendOrder not found for txHash: %s", txHash)
-			action = "REJECT"
-			rejectionReason = "send order not found"
-		} else if sendOrder.Status != "aggregating" && sendOrder.Status != "pending" {
-			logger.Warnf("SendOrder status not expected: %s (current status: %s)", txHash, sendOrder.Status)
-			action = "REJECT"
-			rejectionReason = fmt.Sprintf("send order status not expected, current status: %s", sendOrder.Status)
-		} else {
-			logger.Infof("SendOrder validation passed for txHash: %s (status: %s)", txHash, sendOrder.Status)
-		}
-	}
-
-	// Build response
-	resp := FireblocksCosignerResponse{
-		Action:          action,
-		RejectionReason: rejectionReason,
-	}
-
-	// Sign response with callback private key
-	callbackPrivKey := cfg.Withdraw.Fireblocks.CallbackPriv
-	if callbackPrivKey == "" {
-		logger.Error("Fireblocks callback private key not configured")
-		http.Error(w, "Server configuration error", http.StatusInternalServerError)
-		return
-	}
-
-	rsaPrivKey, err := parseRSAPrivateKeyFromPEM(callbackPrivKey)
+	// Parse RSA private key for signing response
+	rsaPrivKey, err := parseRSAPrivateKeyFromPEM(cfg.Withdraw.Fireblocks.CallbackPriv)
 	if err != nil {
 		logger.Errorf("Failed to parse callback private key: %v", err)
 		http.Error(w, "Server configuration error", http.StatusInternalServerError)
 		return
 	}
 
-	// Marshal response to JSON
-	respJSON, err := json.Marshal(resp)
+	// Read body - the entire body IS the JWT token (not Authorization header)
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		logger.Errorf("Failed to marshal response: %v", err)
-		http.Error(w, "Failed to create response", http.StatusInternalServerError)
+		logger.Errorf("Failed to read request body: %v", err)
+		http.Error(w, "Failed to read request", http.StatusInternalServerError)
+		return
+	}
+	defer r.Body.Close()
+
+	rawBody := string(bodyBytes)
+
+	// Parse and verify JWT from body
+	token, err := jwt.Parse(rawBody, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, jwt.ErrInvalidKey
+		}
+		return rsaPubKey, nil
+	})
+	if err != nil {
+		logger.Errorf("JWT parsing failed: %v", err)
+		http.Error(w, "Invalid JWT token", http.StatusUnauthorized)
 		return
 	}
 
-	// Create JWT token with response
-	now := time.Now()
+	if !token.Valid {
+		logger.Error("JWT token not valid")
+		http.Error(w, "Invalid JWT token", http.StatusUnauthorized)
+		return
+	}
+
+	// Extract claims - Fireblocks sends requestId, txId, note directly in claims
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		logger.Error("Failed to extract JWT claims")
+		http.Error(w, "Invalid JWT claims", http.StatusUnauthorized)
+		return
+	}
+
+	// Extract required fields from claims
+	requestId, _ := claims["requestId"].(string)
+	txId, _ := claims["txId"].(string)
+	note, _ := claims["note"].(string)
+
+	logger.Infof("Cosigner callback received: requestId=%s, txId=%s, note=%s", requestId, txId, note)
+
+	// Default: approve the transaction
+	action := "APPROVE"
+	rejectionReason := ""
+
+	// Validate send_order exists in database (synced via P2P from proposer)
+	// Note format: "withdrawal:txHash" or "consolidation:txHash"
+	parts := strings.Split(note, ":")
+	if len(parts) < 2 {
+		logger.Warnf("Invalid note format: %s", note)
+		action = "RETRY"
+		rejectionReason = "invalid note format"
+	} else {
+		orderType := parts[0]
+		txHash := parts[1]
+
+		if orderType != "withdrawal" && orderType != "consolidation" {
+			logger.Warnf("Unsupported order type: %s", orderType)
+			action = "REJECT"
+			rejectionReason = "unsupported order type"
+		} else {
+			// Find send_order by txHash (synced via P2P from proposer)
+			stateRepo := models.NewStateRepository(m.conn.GetDB())
+			sendOrder, err := stateRepo.GetSendOrderByTxIdOrExternalId(txHash)
+			if err != nil {
+				logger.Errorf("Database error when checking send_order for txHash %s: %v", txHash, err)
+				action = "RETRY"
+				rejectionReason = "database error"
+			} else if sendOrder == nil {
+				logger.Warnf("SendOrder not found for txHash: %s, may not be synced yet via P2P", txHash)
+				action = "RETRY"
+				rejectionReason = "send_order not found, waiting for P2P sync"
+			} else {
+				logger.Infof("Found send_order for txHash %s: orderId=%s, status=%s", txHash, sendOrder.OrderId, sendOrder.Status)
+
+				// Check send_order status - only allow init or pending status
+				if sendOrder.Status != models.ORDER_STATUS_INIT &&
+					sendOrder.Status != models.ORDER_STATUS_PENDING &&
+					sendOrder.Status != models.ORDER_STATUS_AGGREGATING {
+					logger.Warnf("Send order status not expected: %s", sendOrder.Status)
+					action = "REJECT"
+					rejectionReason = fmt.Sprintf("send order status not expected: %s", sendOrder.Status)
+				} else {
+					logger.Infof("Send order %s validated, approving signing", sendOrder.OrderId)
+				}
+			}
+		}
+	}
+
+	// Build response JWT with action, requestId, rejectionReason
 	responseToken := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
-		"body": base64.StdEncoding.EncodeToString(respJSON),
-		"iat":  now.Unix(),
-		"exp":  now.Add(55 * time.Second).Unix(),
+		"action":          action,
+		"requestId":       requestId,
+		"rejectionReason": rejectionReason,
 	})
 
-	signedToken, err := responseToken.SignedString(rsaPrivKey)
+	signedResponse, err := responseToken.SignedString(rsaPrivKey)
 	if err != nil {
 		logger.Errorf("Failed to sign JWT response: %v", err)
 		http.Error(w, "Failed to sign response", http.StatusInternalServerError)
 		return
 	}
 
-	logger.Infof("Cosigner callback response: action=%s, reason=%s", action, rejectionReason)
+	logger.Infof("Cosigner callback response: action=%s, requestId=%s, reason=%s", action, requestId, rejectionReason)
 
-	// Return signed JWT as response
+	// Return signed JWT as plain text
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(signedToken))
+	w.Write([]byte(signedResponse))
 }
 
 // handleFireblocksWebhook handles Fireblocks webhook events

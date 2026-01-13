@@ -143,12 +143,15 @@ func (eh *EventHandler) processBridgeIn(event BlockchainEvent) error {
 			return fmt.Errorf("failed updating deposit status: %w", err)
 		}
 
+		// Only update to processed if not already in a higher state (pending/spent)
 		if err := tx.Model(&models.UTXO{}).
-			Where("txid = ? AND out_index = ?", dep.TxId, dep.Vout).
+			Where("txid = ? AND out_index = ? AND status NOT IN (?, ?)",
+				dep.TxId, dep.Vout,
+				models.UTXO_STATUS_PENDING, models.UTXO_STATUS_SPENT).
 			Update("status", models.UTXO_STATUS_PROCESSED).Error; err != nil {
 			return fmt.Errorf("failed updating UTXO status: %w", err)
 		}
-		logger.Infof("Updated UTXO %s:%d status to processed", dep.TxId, dep.Vout)
+		logger.Infof("Updated UTXO %s:%d status to processed (if not already pending/spent)", dep.TxId, dep.Vout)
 
 		// Also set EVM fields
 		dep.EvmTxHash = event.TxHash.Hex()
@@ -207,6 +210,25 @@ func (eh *EventHandler) processBridgeOutProposed(event BlockchainEvent) error {
 		Status:      models.WITHDRAW_STATUS_CREATE,
 		DestAmount:  destAmountStr,
 		DestAddress: destDogeAddr,
+	}
+
+	// Check if withdrawal already exists and is in progress
+	// Don't overwrite withdrawals that have already started processing
+	existing, findErr := eh.eventRepo.GetWithdrawalByTask(nil, taskId)
+	if findErr == nil && existing != nil {
+		// Withdrawal exists - check if it's already being processed
+		status := existing.Status
+		if status == models.WITHDRAW_STATUS_INIT ||
+			status == models.WITHDRAW_STATUS_PENDING ||
+			status == models.WITHDRAW_STATUS_CONFIRMED ||
+			status == models.WITHDRAW_STATUS_PROCESSED {
+			// Don't overwrite - withdrawal is already in progress
+			logger.Infof("Withdrawal taskId=%s already exists with status=%s, skipping update", taskId, status)
+			eh.eventBus.Publish(eventbus.EventBridgeOutProposed, event)
+			return nil
+		}
+		// Only update if status is CREATE or AGGREGATING (early stages)
+		logger.Infof("Updating existing withdrawal taskId=%s (status=%s)", taskId, status)
 	}
 
 	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {

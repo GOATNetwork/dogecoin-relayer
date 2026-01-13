@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"sort"
@@ -834,7 +835,9 @@ func (up *UtxoProcessor) generateBridgeOutFinishCalldata(request *withdrawalRequ
 	return calldata, nil
 }
 
-// markUTXOsAsProcessed marks UTXOs as processed to avoid reprocessing
+// markUTXOsAsProcessed marks UTXOs as processed to avoid reprocessing.
+// It respects status hierarchy - will not downgrade UTXOs that are already
+// in pending or spent state.
 func (up *UtxoProcessor) markUTXOsAsProcessed(utxos []*models.UTXO) error {
 	if len(utxos) == 0 {
 		return nil
@@ -843,14 +846,34 @@ func (up *UtxoProcessor) markUTXOsAsProcessed(utxos []*models.UTXO) error {
 	// Use a single transaction for all updates to prevent database corruption
 	return up.conn.GetDB().Transaction(func(tx *gorm.DB) error {
 		now := time.Now()
+		updatedCount := 0
 		for _, utxo := range utxos {
+			// Check current status in database before updating
+			var existing models.UTXO
+			if err := tx.Where("uid = ?", utxo.Uid).First(&existing).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					// UTXO not found, skip
+					up.logger.Warnf("UTXO %s not found in database, skipping", utxo.Uid)
+					continue
+				}
+				return fmt.Errorf("failed to check existing UTXO %s: %w", utxo.Uid, err)
+			}
+
+			// Only update if current status allows transition to processed
+			// Status hierarchy: unconfirmed(0) < confirmed(10) < processed(20) < pending(30) < spent(100)
+			if existing.Status == models.UTXO_STATUS_PENDING || existing.Status == models.UTXO_STATUS_SPENT {
+				up.logger.Debugf("UTXO %s already in %s state, skipping mark as processed", utxo.Uid, existing.Status)
+				continue
+			}
+
 			utxo.UpdatedAt = now
 			utxo.Status = models.UTXO_STATUS_PROCESSED
 			if err := tx.Save(utxo).Error; err != nil {
 				return fmt.Errorf("failed to mark UTXO %s as processed: %w", utxo.Uid, err)
 			}
+			updatedCount++
 		}
-		up.logger.Debugf("Marked %d UTXOs as processed in transaction", len(utxos))
+		up.logger.Debugf("Marked %d/%d UTXOs as processed in transaction", updatedCount, len(utxos))
 		return nil
 	})
 }

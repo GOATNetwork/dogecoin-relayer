@@ -186,6 +186,16 @@ const (
 	WITHDRAW_STATUS_PROCESSED   = "processed"
 )
 
+// Constants for send order status
+const (
+	ORDER_STATUS_AGGREGATING = "aggregating"
+	ORDER_STATUS_INIT        = "init"
+	ORDER_STATUS_PENDING     = "pending"
+	ORDER_STATUS_CONFIRMED   = "confirmed"
+	ORDER_STATUS_PROCESSED   = "processed"
+	ORDER_STATUS_CLOSED      = "closed"
+)
+
 // PendingBatch represents a batch waiting for TSS signature
 type PendingBatch struct {
 	gorm.Model `swaggerignore:"true"`

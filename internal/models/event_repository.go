@@ -153,6 +153,12 @@ func (r *EventRepository) createOrUpdateDepositImpl(db *gorm.DB, deposit *Deposi
 		return err
 	}
 
+	// Don't overwrite a deposit that is already confirmed
+	// This prevents re-scanning from resetting a completed deposit
+	if existing.Status == "confirmed" {
+		return nil
+	}
+
 	// Update mutable fields
 	updates := map[string]any{
 		"address":       deposit.Address,

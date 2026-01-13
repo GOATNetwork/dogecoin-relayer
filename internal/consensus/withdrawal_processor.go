@@ -12,11 +12,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dogecoinw/doged/wire"
@@ -50,6 +52,11 @@ type WithdrawalProcessor struct {
 	withdrawEnable   bool
 	fireblocksMode   bool
 	fireblocksClient *fireblocksClient
+
+	// Concurrency protection
+	processingMu       sync.Mutex            // Protects withdrawal processing operations
+	processingMap      map[string]time.Time  // Tracks withdrawals currently being processed (reqTaskId -> startTime)
+	utxoSelectionMu    sync.Mutex            // Protects UTXO selection to prevent double-spend
 }
 
 type fireblocksClient struct {
@@ -168,6 +175,7 @@ func NewWithdrawalProcessor(conn *models.DBConnection, up *UtxoProcessor) (*With
 		withdrawEnable:   withdrawEnable,
 		fireblocksMode:   fireblocksMode,
 		fireblocksClient: fireblocksClient,
+		processingMap:    make(map[string]time.Time),
 	}, nil
 }
 
@@ -388,6 +396,8 @@ func (wp *WithdrawalProcessor) loop() {
 	ticker := time.NewTicker(wp.pollInterval)
 	defer ticker.Stop()
 
+	wp.logger.Infof("Withdrawal processor loop started with interval %s", wp.pollInterval)
+
 	for {
 		select {
 		case <-wp.ctx.Done():
@@ -434,6 +444,13 @@ func (wp *WithdrawalProcessor) processPendingWithdrawals() error {
 		return nil
 	}
 
+	// Use mutex to prevent concurrent processing
+	wp.processingMu.Lock()
+	defer wp.processingMu.Unlock()
+
+	// Clean up stale processing entries (older than 5 minutes)
+	wp.cleanupStaleProcessing()
+
 	statuses := []string{
 		models.WITHDRAW_STATUS_CREATE,
 		models.WITHDRAW_STATUS_AGGREGATING,
@@ -445,13 +462,35 @@ func (wp *WithdrawalProcessor) processPendingWithdrawals() error {
 			return fmt.Errorf("list %s withdrawals: %w", status, err)
 		}
 		for i := range list {
+			reqTaskId := list[i].ReqTaskId
+			// Skip if already being processed
+			if _, isProcessing := wp.processingMap[reqTaskId]; isProcessing {
+				wp.logger.Debugf("Withdrawal %s is already being processed, skipping", reqTaskId)
+				continue
+			}
+			// Mark as being processed
+			wp.processingMap[reqTaskId] = time.Now()
 			if err := wp.broadcastWithdrawal(&list[i]); err != nil {
-				wp.logger.Errorf("broadcast withdrawal %s failed: %v", list[i].ReqTaskId, err)
+				wp.logger.Errorf("broadcast withdrawal %s failed: %v", reqTaskId, err)
 				wp.markWithdrawalRetry(&list[i])
 			}
+			// Remove from processing map after completion
+			delete(wp.processingMap, reqTaskId)
 		}
 	}
 	return nil
+}
+
+// cleanupStaleProcessing removes entries that have been processing for too long
+func (wp *WithdrawalProcessor) cleanupStaleProcessing() {
+	staleThreshold := 5 * time.Minute
+	now := time.Now()
+	for reqTaskId, startTime := range wp.processingMap {
+		if now.Sub(startTime) > staleThreshold {
+			wp.logger.Warnf("Cleaning up stale processing entry for withdrawal %s (started at %v)", reqTaskId, startTime)
+			delete(wp.processingMap, reqTaskId)
+		}
+	}
 }
 
 func (wp *WithdrawalProcessor) processSigningWithdrawals() error {
@@ -482,6 +521,7 @@ func (wp *WithdrawalProcessor) processSigningWithdrawals() error {
 func (wp *WithdrawalProcessor) processBroadcastedWithdrawals() error {
 	isProposer, err := wp.utxoProcessor.isCurrentProposer()
 	if err != nil {
+		wp.logger.Errorf("processBroadcastedWithdrawals: isCurrentProposer error: %v", err)
 		return err
 	}
 	if !isProposer {
@@ -497,8 +537,13 @@ func (wp *WithdrawalProcessor) processBroadcastedWithdrawals() error {
 		return fmt.Errorf("list pending withdrawals: %w", err)
 	}
 
+	if len(pending) > 0 {
+		wp.logger.Infof("processBroadcastedWithdrawals: found %d pending withdrawals with tx_id", len(pending))
+	}
+
 	for i := range pending {
 		w := &pending[i]
+		wp.logger.Debugf("processBroadcastedWithdrawals: checking withdrawal %s with tx_id %s", w.ReqTaskId, w.TxId)
 		if err := wp.checkAndSubmit(w); err != nil {
 			wp.logger.Errorf("checkAndSubmit withdrawal %s failed: %v", w.ReqTaskId, err)
 		}
@@ -631,6 +676,8 @@ func (wp *WithdrawalProcessor) registerP2PHandler() {
 				time.Sleep(2 * time.Second)
 				continue
 			}
+
+			// Register withdrawal status handler
 			err := p2pModule.(p2p.P2PSender).RegisterP2PHandler(types.P2PMessageTypeWithdrawalStatus, func(msg *types.P2PBroadcastMessage) error {
 				return wp.handleWithdrawalStatusMessage(msg)
 			})
@@ -639,10 +686,87 @@ func (wp *WithdrawalProcessor) registerP2PHandler() {
 				time.Sleep(2 * time.Second)
 				continue
 			}
+
+			// Register send_order broadcast handler
+			err = p2pModule.(p2p.P2PSender).RegisterP2PHandler(types.P2PMessageTypeSendOrderBroadcasted, func(msg *types.P2PBroadcastMessage) error {
+				return wp.handleSendOrderBroadcastMessage(msg)
+			})
+			if err != nil {
+				wp.logger.Errorf("Failed to register send_order broadcast handler: %v", err)
+				// Continue anyway, withdrawal status handler is more important
+			}
+
+			// Register send_order txid update handler
+			err = p2pModule.(p2p.P2PSender).RegisterP2PHandler(types.P2PMessageTypeSendOrderTxidUpdate, func(msg *types.P2PBroadcastMessage) error {
+				return wp.handleSendOrderTxidUpdateMessage(msg)
+			})
+			if err != nil {
+				wp.logger.Errorf("Failed to register send_order txid update handler: %v", err)
+			}
+
+			wp.logger.Info("Registered P2P handlers for withdrawal status, send_order broadcast and txid update")
 			return
 		}
-		wp.logger.Errorf("Failed to register withdrawal status handler after %d retries", maxRetries)
+		wp.logger.Errorf("Failed to register P2P handlers after %d retries", maxRetries)
 	}()
+}
+
+func (wp *WithdrawalProcessor) broadcastSendOrder(sendOrder *models.SendOrder, vins []*models.VIN, vouts []*models.VOUT) {
+	p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
+	if !ok {
+		wp.logger.Debug("P2P module not available for send_order broadcast")
+		return
+	}
+
+	vinPayloads := make([]types.SendOrderVIN, len(vins))
+	for i, vin := range vins {
+		vinPayloads[i] = types.SendOrderVIN{
+			Txid:     vin.Txid,
+			OutIndex: vin.OutIndex,
+			Source:   vin.Source,
+		}
+	}
+
+	voutPayloads := make([]types.SendOrderVOUT, len(vouts))
+	for i, vout := range vouts {
+		voutPayloads[i] = types.SendOrderVOUT{
+			Txid:       vout.Txid,
+			OutIndex:   vout.OutIndex,
+			WithdrawId: vout.WithdrawId,
+			Amount:     vout.Amount,
+			Receiver:   vout.Receiver,
+			Source:     vout.Source,
+		}
+	}
+
+	payload := types.SendOrderBroadcastPayload{
+		TxId:       sendOrder.Txid,
+		ExternalId: sendOrder.ExternalId,
+		OrderId:    sendOrder.OrderId,
+		OrderType:  sendOrder.OrderType,
+		Status:     sendOrder.Status,
+		VINs:       vinPayloads,
+		VOUTs:      voutPayloads,
+		UpdatedAt:  time.Now().Unix(),
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		wp.logger.Warnf("Failed to marshal send_order broadcast payload: %v", err)
+		return
+	}
+
+	msg := types.P2PBroadcastMessage{
+		Type:      types.P2PMessageTypeSendOrderBroadcasted,
+		SessionID: sendOrder.Txid,
+		Payload:   payloadBytes,
+	}
+
+	if err := p2pModule.(p2p.P2PSender).BroadcastP2PMessage(msg); err != nil {
+		wp.logger.Warnf("Failed to broadcast send_order %s: %v", sendOrder.OrderId, err)
+	} else {
+		wp.logger.Infof("Broadcasted send_order %s (txid=%s) to P2P network", sendOrder.OrderId, sendOrder.Txid)
+	}
 }
 
 func (wp *WithdrawalProcessor) broadcastWithdrawalStatus(w *models.Withdrawal) {
@@ -716,6 +840,152 @@ func (wp *WithdrawalProcessor) handleWithdrawalStatusMessage(msg *types.P2PBroad
 	if err := wp.eventRepo.CreateOrUpdateWithdrawal(nil, w); err != nil {
 		return fmt.Errorf("update withdrawal from p2p: %w", err)
 	}
+	return nil
+}
+
+func (wp *WithdrawalProcessor) handleSendOrderBroadcastMessage(msg *types.P2PBroadcastMessage) error {
+	var payload types.SendOrderBroadcastPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return fmt.Errorf("unmarshal send_order broadcast payload: %w", err)
+	}
+
+	if payload.TxId == "" || payload.OrderId == "" {
+		return fmt.Errorf("send_order broadcast payload missing tx_id or order_id")
+	}
+
+	wp.logger.Infof("Received send_order broadcast: orderId=%s, txId=%s, externalId=%s",
+		payload.OrderId, payload.TxId, payload.ExternalId)
+
+	// Check if send_order already exists
+	stateRepo := models.NewStateRepository(wp.conn.GetDB())
+	existing, err := stateRepo.GetSendOrderByTxIdOrExternalId(payload.TxId)
+	if err == nil && existing != nil {
+		wp.logger.Debugf("Send order %s already exists, skipping", payload.TxId)
+		return nil
+	}
+
+	// Create the send_order and associated VINs/VOUTs
+	err = wp.conn.GetDB().Transaction(func(tx *gorm.DB) error {
+		// Create SendOrder
+		sendOrder := &models.SendOrder{
+			OrderId:    payload.OrderId,
+			OrderType:  payload.OrderType,
+			Txid:       payload.TxId,
+			ExternalId: payload.ExternalId,
+			Status:     payload.Status,
+		}
+		if err := tx.Create(sendOrder).Error; err != nil {
+			return fmt.Errorf("create send_order: %w", err)
+		}
+
+		// Create VINs
+		for _, vinPayload := range payload.VINs {
+			vin := &models.VIN{
+				OrderId:  payload.OrderId,
+				Txid:     vinPayload.Txid,
+				OutIndex: vinPayload.OutIndex,
+				Source:   vinPayload.Source,
+				Status:   payload.Status,
+			}
+			if err := tx.Create(vin).Error; err != nil {
+				return fmt.Errorf("create vin: %w", err)
+			}
+		}
+
+		// Create VOUTs
+		for _, voutPayload := range payload.VOUTs {
+			vout := &models.VOUT{
+				OrderId:    payload.OrderId,
+				Txid:       voutPayload.Txid,
+				OutIndex:   voutPayload.OutIndex,
+				WithdrawId: voutPayload.WithdrawId,
+				Amount:     voutPayload.Amount,
+				Receiver:   voutPayload.Receiver,
+				Source:     voutPayload.Source,
+				Status:     payload.Status,
+			}
+			if err := tx.Create(vout).Error; err != nil {
+				return fmt.Errorf("create vout: %w", err)
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("save send_order from p2p: %w", err)
+	}
+
+	wp.logger.Infof("Created send_order %s (txId=%s) from P2P broadcast", payload.OrderId, payload.TxId)
+	return nil
+}
+
+// broadcastSendOrderTxidUpdate broadcasts a txid update to other nodes after Fireblocks signing
+func (wp *WithdrawalProcessor) broadcastSendOrderTxidUpdate(externalId, oldTxid, newTxid string) {
+	p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
+	if !ok {
+		wp.logger.Debug("P2P module not available for txid update broadcast")
+		return
+	}
+
+	payload := types.SendOrderTxidUpdatePayload{
+		ExternalId: externalId,
+		OldTxid:    oldTxid,
+		NewTxid:    newTxid,
+		UpdatedAt:  time.Now().Unix(),
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		wp.logger.Warnf("Failed to marshal txid update payload: %v", err)
+		return
+	}
+
+	msg := types.P2PBroadcastMessage{
+		Type:      types.P2PMessageTypeSendOrderTxidUpdate,
+		SessionID: externalId,
+		Payload:   payloadBytes,
+	}
+
+	if err := p2pModule.(p2p.P2PSender).BroadcastP2PMessage(msg); err != nil {
+		wp.logger.Warnf("Failed to broadcast txid update for %s: %v", externalId, err)
+	} else {
+		wp.logger.Infof("Broadcasted txid update: externalId=%s, oldTxid=%s, newTxid=%s", externalId, oldTxid, newTxid)
+	}
+}
+
+// handleSendOrderTxidUpdateMessage handles P2P messages for txid updates after signing
+func (wp *WithdrawalProcessor) handleSendOrderTxidUpdateMessage(msg *types.P2PBroadcastMessage) error {
+	var payload types.SendOrderTxidUpdatePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return fmt.Errorf("unmarshal txid update payload: %w", err)
+	}
+
+	if payload.ExternalId == "" || payload.NewTxid == "" {
+		return fmt.Errorf("txid update payload missing external_id or new_txid")
+	}
+
+	wp.logger.Infof("Received txid update: externalId=%s, oldTxid=%s, newTxid=%s",
+		payload.ExternalId, payload.OldTxid, payload.NewTxid)
+
+	// Update send_order.txid by external_id
+	result := wp.conn.GetDB().Model(&models.SendOrder{}).
+		Where("external_id = ?", payload.ExternalId).
+		Updates(map[string]interface{}{
+			"txid":       payload.NewTxid,
+			"updated_at": time.Now(),
+		})
+
+	if result.Error != nil {
+		return fmt.Errorf("update send_order txid: %w", result.Error)
+	}
+
+	if result.RowsAffected > 0 {
+		wp.logger.Infof("Updated send_order txid to %s for externalId=%s", payload.NewTxid, payload.ExternalId)
+	} else {
+		wp.logger.Debugf("No send_order found for externalId=%s", payload.ExternalId)
+	}
+
 	return nil
 }
 
@@ -840,10 +1110,10 @@ func (wp *WithdrawalProcessor) broadcastWithdrawal(w *models.Withdrawal) error {
 		utxoAdapters = append(utxoAdapters, wallet.ToUTXOAdapter(utxo))
 	}
 
-	networkFee := int64(global.GetConfig().Withdraw.FeeRate)
-	if networkFee <= 0 {
-		networkFee = 1
-	}
+	// Get effective fee rate from network or config
+	configFeeRate := int64(global.GetConfig().Withdraw.FeeRate)
+	networkFee := doge.GetEffectiveFeeRate(wp.dogeClient, configFeeRate)
+	wp.logger.Infof("Using fee rate: %d sat/byte", networkFee)
 
 	selectedUTXOs, totalAmount, withdrawAmount, changeAmount, estimatedFee, witnessSize, err := wallet.SelectOptimalUTXOs(
 		utxoAdapters,
@@ -940,7 +1210,13 @@ func (wp *WithdrawalProcessor) handleLocalSigning(w *models.Withdrawal, tx *wire
 
 	txid, err := wp.dogeClient.SendRawTransaction(signedHex)
 	if err != nil {
-		return fmt.Errorf("send raw transaction: %w", err)
+		if errors.Is(err, doge.ErrEmptyRPCResponse) {
+			// Empty response from RPC - compute txid from signed tx and proceed
+			wp.logger.Warn("Empty RPC response for local signing, computing txid from signed tx")
+			txid = tx.TxHash().String()
+		} else {
+			return fmt.Errorf("send raw transaction: %w", err)
+		}
 	}
 
 	if err := wp.conn.GetDB().Transaction(func(db *gorm.DB) error {
@@ -1004,7 +1280,8 @@ func (wp *WithdrawalProcessor) handleFireblocksSigning(w *models.Withdrawal, tx 
 		messages[i] = hex.EncodeToString(msg)
 	}
 
-	// Use SendOrder txid in note for cosigner callback validation
+	// Use simple note format for cosigner callback validation
+	// Format: "withdrawal:txHash" - cosigner will look up send_order by txHash
 	externalId, err := wp.fireblocksClient.postRawSigningRequest(messages, "withdrawal:"+sendOrder.Txid)
 	if err != nil {
 		return fmt.Errorf("fireblocks signing request: %w", err)
@@ -1050,6 +1327,12 @@ func (wp *WithdrawalProcessor) handleFireblocksSigning(w *models.Withdrawal, tx 
 		return fmt.Errorf("update withdrawal after fireblocks request: %w", err)
 	}
 	wp.broadcastWithdrawalStatus(updated)
+
+	// Broadcast send_order to other cosigner nodes so they can validate the Fireblocks callback
+	// Update sendOrder with externalId before broadcasting
+	sendOrder.ExternalId = externalId
+	sendOrder.Status = "pending"
+	wp.broadcastSendOrder(sendOrder, vins, vouts)
 
 	wp.logger.Infof("Submitted Fireblocks signing request %s for withdrawal %s", externalId, w.ReqTaskId)
 	return nil
@@ -1127,19 +1410,81 @@ func (wp *WithdrawalProcessor) finishFireblocksWithdrawal(w *models.Withdrawal) 
 
 		txid, err := wp.dogeClient.SendRawTransaction(signedHex)
 		if err != nil {
-			// Reset UTXOs from pending back to processed on broadcast failure
-			for _, txIn := range tx.TxIn {
-				if resetErr := wp.conn.GetDB().Model(&models.UTXO{}).
-					Where("txid = ? AND out_index = ? AND status = ?", txIn.PreviousOutPoint.Hash.String(), txIn.PreviousOutPoint.Index, models.UTXO_STATUS_PENDING).
-					Update("status", models.UTXO_STATUS_PROCESSED).Error; resetErr != nil {
-					wp.logger.Warnf("Failed to reset UTXO %s:%d to processed: %v", txIn.PreviousOutPoint.Hash.String(), txIn.PreviousOutPoint.Index, resetErr)
+			// If transaction is already in chain, compute txid from signed tx and proceed
+			if errors.Is(err, doge.ErrTxAlreadyInChain) {
+				wp.logger.Infof("Fireblocks withdrawal tx already in chain for %s, computing txid from signed tx", w.ReqTaskId)
+				// Compute txid from signed transaction
+				txid = tx.TxHash().String()
+			} else if errors.Is(err, doge.ErrEmptyRPCResponse) {
+				// Empty response from RPC (transient API issue)
+				// Transaction was likely submitted, compute txid and proceed
+				wp.logger.Warnf("Empty RPC response for withdrawal %s, computing txid from signed tx and proceeding", w.ReqTaskId)
+				txid = tx.TxHash().String()
+			} else {
+				// Reset UTXOs from pending back to processed on broadcast failure
+				for _, txIn := range tx.TxIn {
+					if resetErr := wp.conn.GetDB().Model(&models.UTXO{}).
+						Where("txid = ? AND out_index = ? AND status = ?", txIn.PreviousOutPoint.Hash.String(), txIn.PreviousOutPoint.Index, models.UTXO_STATUS_PENDING).
+						Update("status", models.UTXO_STATUS_PROCESSED).Error; resetErr != nil {
+						wp.logger.Warnf("Failed to reset UTXO %s:%d to processed: %v", txIn.PreviousOutPoint.Hash.String(), txIn.PreviousOutPoint.Index, resetErr)
+					}
 				}
+				return fmt.Errorf("send raw tx: %w", err)
 			}
-			return fmt.Errorf("send raw tx: %w", err)
 		}
 
 		// Note: UTXOs remain in PENDING status until blockchain confirms the transaction
 		// The doge/module.go handleSpendingTransaction() will mark them as SPENT when confirmed
+
+		// Update send_order.txid from unsigned hash to signed hash
+		// This is critical for blockchain scanner to correlate transactions
+		var oldTxid string
+		var sendOrder models.SendOrder
+		if err := wp.conn.GetDB().Where("external_id = ?", w.ExternalId).First(&sendOrder).Error; err == nil {
+			oldTxid = sendOrder.Txid
+			if oldTxid != txid {
+				if updateErr := wp.conn.GetDB().Model(&models.SendOrder{}).
+					Where("external_id = ?", w.ExternalId).
+					Updates(map[string]interface{}{
+						"txid":       txid,
+						"updated_at": time.Now(),
+					}).Error; updateErr != nil {
+					wp.logger.Warnf("Failed to update send_order txid from %s to %s: %v", oldTxid, txid, updateErr)
+				} else {
+					wp.logger.Infof("Updated send_order txid from %s (unsigned) to %s (signed)", oldTxid, txid)
+					// Broadcast txid update to other nodes
+					wp.broadcastSendOrderTxidUpdate(w.ExternalId, oldTxid, txid)
+				}
+			}
+		}
+
+		// Record change UTXO for future withdrawals (required when scan.enabled=false)
+		for idx, output := range tx.TxOut {
+			receiver, extractErr := types.ExtractAddressFromScript(output.PkScript, dogeNet)
+			if extractErr != nil {
+				continue
+			}
+			// If this is the change output (back to our change address)
+			if receiver == wp.changeAddr {
+				changeUid := fmt.Sprintf("%s:%d", txid, idx)
+				changeUtxo := &models.UTXO{
+					Uid:      changeUid,
+					Txid:     txid,
+					PkScript: output.PkScript,
+					OutIndex: idx,
+					Amount:   output.Value,
+					Receiver: receiver,
+					Source:   models.UTXO_SOURCE_WITHDRAWAL,
+					Status:   models.UTXO_STATUS_PROCESSED,
+				}
+				if createErr := wp.conn.GetDB().Create(changeUtxo).Error; createErr != nil {
+					wp.logger.Warnf("Failed to record change UTXO %s: %v", changeUid, createErr)
+				} else {
+					wp.logger.Infof("Recorded change UTXO %s with amount %d for withdrawal %s", changeUid, output.Value, w.ReqTaskId)
+				}
+				break // Only one change output expected
+			}
+		}
 
 		voutIndex := wp.findVoutIndex(tx, w.DestAddress)
 		updated := &models.Withdrawal{
@@ -1219,12 +1564,19 @@ func (wp *WithdrawalProcessor) checkAndSubmit(w *models.Withdrawal) error {
 		return fmt.Errorf("withdrawal %s missing txid", w.ReqTaskId)
 	}
 
+	wp.logger.Infof("checkAndSubmit: querying tx %s for withdrawal %s", w.TxId, w.ReqTaskId)
 	rawHex, confs, err := wp.dogeClient.GetRawTransactionHex(w.TxId)
 	if err != nil {
+		wp.logger.Warnf("checkAndSubmit: GetRawTransactionHex error for tx %s: %v", w.TxId, err)
+		// If transaction not found, try to re-broadcast it
+		if errors.Is(err, doge.ErrTxNotFound) {
+			wp.logger.Warnf("Withdrawal tx %s not found on network, attempting re-broadcast", w.TxId)
+			return wp.rebroadcastWithdrawal(w)
+		}
 		return fmt.Errorf("query tx %s: %w", w.TxId, err)
 	}
+	wp.logger.Infof("checkAndSubmit: tx %s has %d confirmations (required: %d)", w.TxId, confs, wp.requiredConfs)
 	if confs < wp.requiredConfs {
-		wp.logger.Debugf("Withdrawal tx %s confirmations %d/%d", w.TxId, confs, wp.requiredConfs)
 		return nil
 	}
 
@@ -1281,6 +1633,118 @@ func (wp *WithdrawalProcessor) checkAndSubmit(w *models.Withdrawal) error {
 		wp.broadcastWithdrawalStatus(updated)
 	}
 	return nil
+}
+
+// rebroadcastWithdrawal attempts to re-broadcast a withdrawal transaction that is not found on the network.
+// It uses the saved TxBytes (signed transaction) if available.
+func (wp *WithdrawalProcessor) rebroadcastWithdrawal(w *models.Withdrawal) error {
+	// First check if we have the signed transaction bytes
+	if len(w.TxBytes) > 0 {
+		signedHex := hex.EncodeToString(w.TxBytes)
+		txid, err := wp.dogeClient.SendRawTransaction(signedHex)
+		if err != nil {
+			if errors.Is(err, doge.ErrTxAlreadyInChain) {
+				// Transaction is already confirmed, query confirmations
+				wp.logger.Infof("Withdrawal tx %s already in chain, checking confirmations", w.TxId)
+				return nil // Will be picked up on next poll
+			}
+			if errors.Is(err, doge.ErrEmptyRPCResponse) {
+				// Empty response from RPC - transaction may have been submitted
+				wp.logger.Warnf("Empty RPC response for re-broadcast withdrawal %s, assuming submitted", w.ReqTaskId)
+				return nil // Will be picked up on next poll
+			}
+			wp.logger.Warnf("Re-broadcast of signed tx for withdrawal %s failed: %v", w.ReqTaskId, err)
+			// Don't return error, try Fireblocks re-signing below
+		} else {
+			wp.logger.Infof("Re-broadcasted signed tx %s for withdrawal %s", txid, w.ReqTaskId)
+			return nil
+		}
+	}
+
+	// If we have Fireblocks external ID but no valid signed tx, query Fireblocks and re-apply signatures
+	if wp.fireblocksClient != nil && w.ExternalId != "" && len(w.UnsignedTx) > 0 {
+		wp.logger.Infof("Re-querying Fireblocks for withdrawal %s (externalId=%s)", w.ReqTaskId, w.ExternalId)
+		details, err := wp.fireblocksClient.queryTransaction(w.ExternalId)
+		if err != nil {
+			return fmt.Errorf("re-query fireblocks: %w", err)
+		}
+
+		if strings.ToUpper(details.Status) != "COMPLETED" {
+			wp.logger.Warnf("Fireblocks tx %s not completed (status=%s), cannot re-broadcast", w.ExternalId, details.Status)
+			return nil
+		}
+
+		if len(details.SignedMessages) == 0 {
+			return fmt.Errorf("fireblocks returned no signatures for withdrawal %s", w.ReqTaskId)
+		}
+
+		// Deserialize unsigned tx and re-apply signatures
+		tx, err := wallet.DeserializeTransactionFromBytes(w.UnsignedTx)
+		if err != nil {
+			return fmt.Errorf("deserialize unsigned tx: %w", err)
+		}
+
+		dogeNet := types.GetDogeNetwork(global.GetConfig().Doge.NetworkType)
+
+		// Load UTXOs for signature application
+		utxoAdapters := make([]*wallet.UTXOAdapter, 0, len(tx.TxIn))
+		for _, txIn := range tx.TxIn {
+			var utxo models.UTXO
+			if err := wp.conn.GetDB().Where("txid = ? AND out_index = ?", txIn.PreviousOutPoint.Hash.String(), txIn.PreviousOutPoint.Index).First(&utxo).Error; err != nil {
+				return fmt.Errorf("load utxo %s:%d: %w", txIn.PreviousOutPoint.Hash.String(), txIn.PreviousOutPoint.Index, err)
+			}
+			utxoAdapters = append(utxoAdapters, wallet.ToUTXOAdapter(&utxo))
+		}
+
+		if err := wallet.ApplyFireblocksSignaturesToTx(tx, utxoAdapters, details.SignedMessages, dogeNet); err != nil {
+			return fmt.Errorf("apply fireblocks signatures: %w", err)
+		}
+
+		signedHex, signedBytes, err := serializeTx(tx)
+		if err != nil {
+			return fmt.Errorf("serialize signed tx: %w", err)
+		}
+
+		txid, err := wp.dogeClient.SendRawTransaction(signedHex)
+		if err != nil {
+			if errors.Is(err, doge.ErrTxAlreadyInChain) {
+				wp.logger.Infof("Re-signed withdrawal tx already in chain for withdrawal %s", w.ReqTaskId)
+				return nil
+			}
+			if errors.Is(err, doge.ErrEmptyRPCResponse) {
+				// Empty response from RPC - compute txid from signed tx and proceed
+				wp.logger.Warnf("Empty RPC response for re-signed withdrawal %s, computing txid and proceeding", w.ReqTaskId)
+				txid = tx.TxHash().String()
+			} else {
+				return fmt.Errorf("send re-signed tx: %w", err)
+			}
+		}
+
+		// Update withdrawal with new txid and signed bytes
+		updated := &models.Withdrawal{
+			ReqTaskId:   w.ReqTaskId,
+			ReqTxHash:   w.ReqTxHash,
+			ReqBlock:    w.ReqBlock,
+			ReqLogIndex: w.ReqLogIndex,
+			Status:      models.WITHDRAW_STATUS_PENDING,
+			DestAddress: w.DestAddress,
+			DestAmount:  w.DestAmount,
+			TxId:        txid,
+			Vout:        w.Vout,
+			TxBytes:     signedBytes,
+			ExternalId:  w.ExternalId,
+			UnsignedTx:  w.UnsignedTx,
+		}
+		if err := wp.eventRepo.CreateOrUpdateWithdrawal(nil, updated); err != nil {
+			wp.logger.Warnf("Failed to update withdrawal %s after re-broadcast: %v", w.ReqTaskId, err)
+		} else {
+			wp.broadcastWithdrawalStatus(updated)
+		}
+		wp.logger.Infof("Re-broadcasted Fireblocks-signed tx %s for withdrawal %s", txid, w.ReqTaskId)
+		return nil
+	}
+
+	return fmt.Errorf("cannot re-broadcast withdrawal %s: no signed tx and no fireblocks data", w.ReqTaskId)
 }
 
 func isFireblocksFailureStatus(status string) bool {

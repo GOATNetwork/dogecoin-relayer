@@ -525,7 +525,12 @@ func (m *DogeModule) handleDepositUTXOs(tx *wire.MsgTx, dogeBlock types.DogeBloc
 					}
 				}
 				// Also mark UTXO as processed to prevent processor from picking it up again
-				if err := m.conn.GetDB().Model(&models.UTXO{}).Where("txid = ? AND out_index = ?", utxo.Txid, utxo.OutIndex).Update("status", models.UTXO_STATUS_PROCESSED).Error; err != nil {
+				// But only if it's not already in a higher state (pending/spent)
+				if err := m.conn.GetDB().Model(&models.UTXO{}).
+					Where("txid = ? AND out_index = ? AND status NOT IN (?, ?)",
+						utxo.Txid, utxo.OutIndex,
+						models.UTXO_STATUS_PENDING, models.UTXO_STATUS_SPENT).
+					Update("status", models.UTXO_STATUS_PROCESSED).Error; err != nil {
 					m.logger.Errorf("Failed to mark UTXO %s:%d as processed: %v", utxo.Txid, utxo.OutIndex, err)
 				}
 			}

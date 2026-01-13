@@ -18,6 +18,33 @@ func NewUTXORepository(db *gorm.DB) *UTXORepository {
 	return &UTXORepository{db: db}
 }
 
+// utxoStatusRank returns the priority rank of a UTXO status.
+// Higher rank = more advanced state, should not be downgraded.
+func utxoStatusRank(status string) int {
+	switch status {
+	case UTXO_STATUS_UNCONFIRMED:
+		return 0
+	case UTXO_STATUS_CONFIRMED:
+		return 10
+	case UTXO_STATUS_PROCESSED:
+		return 20
+	case UTXO_STATUS_PENDING:
+		return 30
+	case UTXO_STATUS_SPENT:
+		return 100 // Final state, cannot be changed
+	default:
+		return 0
+	}
+}
+
+// canUpdateUTXOStatus checks if status transition is allowed.
+// Returns true if the new status is equal or higher rank than current.
+func canUpdateUTXOStatus(currentStatus, newStatus string) bool {
+	currentRank := utxoStatusRank(currentStatus)
+	newRank := utxoStatusRank(newStatus)
+	return newRank >= currentRank
+}
+
 func (r *UTXORepository) AddUTXO(utxo *UTXO, pubkeyBytes []byte, blockHash string, blockHeight int64, noWitnessTx []byte, merkleRoot string, proofBytes []byte, txIndex int, isDeposit bool) error {
 	// Generate UID for UTXO
 	utxo.Uid = fmt.Sprintf("%s:%d", utxo.Txid, utxo.OutIndex)
@@ -50,7 +77,8 @@ func (r *UTXORepository) AddUTXO(utxo *UTXO, pubkeyBytes []byte, blockHash strin
 	}).Create(utxo).Error
 }
 
-// BatchUpdateUTXOs updates multiple UTXOs in a single transaction
+// BatchUpdateUTXOs updates multiple UTXOs in a single transaction.
+// It respects status hierarchy and will not downgrade a UTXO's status.
 func (r *UTXORepository) BatchUpdateUTXOs(utxos []*UTXO) error {
 	if len(utxos) == 0 {
 		return nil
@@ -59,6 +87,26 @@ func (r *UTXORepository) BatchUpdateUTXOs(utxos []*UTXO) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
 		now := time.Now()
 		for _, utxo := range utxos {
+			// Check current status in database
+			var existing UTXO
+			if err := tx.Where("uid = ?", utxo.Uid).First(&existing).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					// New UTXO, just create it
+					utxo.UpdatedAt = now
+					if err := tx.Create(utxo).Error; err != nil {
+						return fmt.Errorf("failed to create UTXO %s: %w", utxo.Uid, err)
+					}
+					continue
+				}
+				return fmt.Errorf("failed to check existing UTXO %s: %w", utxo.Uid, err)
+			}
+
+			// Check if status transition is allowed
+			if !canUpdateUTXOStatus(existing.Status, utxo.Status) {
+				// Skip update - current status is more advanced
+				continue
+			}
+
 			utxo.UpdatedAt = now
 			if err := tx.Save(utxo).Error; err != nil {
 				return fmt.Errorf("failed to update UTXO %s: %w", utxo.Uid, err)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -16,6 +17,12 @@ import (
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
 	log "github.com/sirupsen/logrus"
 )
+
+// ErrTxNotFound is returned when a transaction is not found in the mempool or blockchain
+var ErrTxNotFound = errors.New("transaction not found")
+
+// ErrTxAlreadyInChain is returned when trying to broadcast a transaction that's already confirmed
+var ErrTxAlreadyInChain = errors.New("transaction already in chain")
 
 // DogeClient represents a Dogecoin RPC client using doged library
 type DogeClient struct {
@@ -320,35 +327,71 @@ func (c *DogeClient) SignRawTransaction(rawHex string) (string, error) {
 	return hex.EncodeToString(buf.Bytes()), nil
 }
 
+// ErrEmptyRPCResponse indicates the RPC returned an empty or null response
+var ErrEmptyRPCResponse = fmt.Errorf("empty RPC response")
+
 // SendRawTransaction broadcasts the given raw tx hex.
+// Returns ErrTxAlreadyInChain if the transaction is already confirmed in the blockchain.
+// Returns ErrEmptyRPCResponse if the RPC returns empty or null response (transient API issue).
 func (c *DogeClient) SendRawTransaction(rawHex string) (string, error) {
 	rawSend, err := c.client.RawRequest("sendrawtransaction", []json.RawMessage{
 		json.RawMessage(fmt.Sprintf("%q", rawHex)),
 	})
 	if err != nil {
+		errStr := err.Error()
+		// Handle "transaction already in block chain" error
+		if strings.Contains(errStr, "already in block chain") || strings.Contains(errStr, "Transaction already in the mempool") {
+			return "", ErrTxAlreadyInChain
+		}
 		return "", fmt.Errorf("sendrawtransaction rpc: %w", err)
 	}
+
+	// Handle empty response (transient API issue, especially with Tatum)
+	if len(rawSend) == 0 || string(rawSend) == "null" || string(rawSend) == "" {
+		c.logger.Warn("sendrawtransaction returned empty response, this is a transient API issue")
+		return "", ErrEmptyRPCResponse
+	}
+
 	var txid string
 	if err := json.Unmarshal(rawSend, &txid); err != nil {
+		// Check if this is due to empty/malformed response
+		if strings.Contains(err.Error(), "unexpected end of JSON input") {
+			c.logger.Warnf("sendrawtransaction response unmarshal failed (empty response): %s", string(rawSend))
+			return "", ErrEmptyRPCResponse
+		}
 		return "", fmt.Errorf("unmarshal send tx: %w", err)
 	}
 	return txid, nil
 }
 
 // GetRawTransactionHex fetches raw tx hex and confirmations (verbose) for the given txid.
+// Returns ErrTxNotFound if the transaction is not found in mempool or blockchain.
 func (c *DogeClient) GetRawTransactionHex(txid string) (string, int64, error) {
 	rawGet, err := c.client.RawRequest("getrawtransaction", []json.RawMessage{
 		json.RawMessage(fmt.Sprintf("%q", txid)),
 		json.RawMessage("true"),
 	})
 	if err != nil {
+		errStr := err.Error()
+		// Handle "No such mempool or blockchain transaction" error
+		if strings.Contains(errStr, "No such mempool") || strings.Contains(errStr, "No information available") {
+			return "", 0, ErrTxNotFound
+		}
 		return "", 0, fmt.Errorf("getrawtransaction rpc: %w", err)
+	}
+	// Handle empty response (tx not found in some RPC implementations)
+	if len(rawGet) == 0 || string(rawGet) == "null" {
+		return "", 0, ErrTxNotFound
 	}
 	var resp struct {
 		Hex           string  `json:"hex"`
 		Confirmations float64 `json:"confirmations"`
 	}
 	if err := json.Unmarshal(rawGet, &resp); err != nil {
+		// Empty JSON or malformed response likely means tx not found
+		if strings.Contains(err.Error(), "unexpected end of JSON input") || strings.Contains(err.Error(), "cannot unmarshal") {
+			return "", 0, ErrTxNotFound
+		}
 		return "", 0, fmt.Errorf("unmarshal getrawtransaction: %w", err)
 	}
 	return resp.Hex, int64(resp.Confirmations), nil
