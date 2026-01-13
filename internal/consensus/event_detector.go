@@ -235,10 +235,16 @@ func (ed *EventDetector) initializeScanStates() error {
 		return nil
 	}
 
-	if state.LastScannedBlock < ed.lastScannedBlock {
+	// Always use the database value if it's more recent (higher block number)
+	// This prevents re-scanning already processed blocks after restart
+	configBlock := ed.lastScannedBlock
+	if state.LastScannedBlock > configBlock {
 		ed.lastScannedBlock = state.LastScannedBlock
+		ed.logger.Infof("Using database scan state: block %d (more recent than config %d)", state.LastScannedBlock, configBlock)
+	} else {
+		ed.logger.Infof("Using config scan state: block %d (database has %d)", configBlock, state.LastScannedBlock)
 	}
-	ed.logger.Infof("Loaded scan state, last scanned block: %d", state.LastScannedBlock)
+	ed.logger.Infof("Loaded scan state, will resume from block: %d", ed.lastScannedBlock)
 
 	return nil
 }
