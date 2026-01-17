@@ -112,7 +112,7 @@ func SendTx(ctx context.Context, privateKey *ecdsa.PrivateKey, chainID *big.Int,
 	}
 
 	// Estimate gas limit
-	gasLimit, err := globalClient.EstimateGas(ctx, ethereum.CallMsg{
+	estimatedGas, err := globalClient.EstimateGas(ctx, ethereum.CallMsg{
 		From:  fromAddr,
 		To:    to,
 		Value: value,
@@ -123,6 +123,10 @@ func SendTx(ctx context.Context, privateKey *ecdsa.PrivateKey, chainID *big.Int,
 		metrics.RecordError("consensus", "gas_estimation_failed")
 		return nil, fmt.Errorf("failed to estimate gas: %w", err)
 	}
+	// Add 30% buffer to estimated gas to prevent out-of-gas errors
+	// Gas estimation can be inaccurate for complex contract calls
+	gasLimit := estimatedGas + (estimatedGas * 30 / 100)
+	log.Debugf("Gas estimation: estimated=%d, with buffer=%d (30%%)", estimatedGas, gasLimit)
 
 	// Get suggested gas price and calculate EIP-1559 fees
 	gasPrice, err := globalClient.SuggestGasPrice(ctx)
@@ -140,6 +144,16 @@ func SendTx(ctx context.Context, privateKey *ecdsa.PrivateKey, chainID *big.Int,
 	maxFeePerGas := new(big.Int).Mul(gasPrice, big.NewInt(2))
 	// Set maxPriorityFeePerGas as a portion of maxFeePerGas
 	maxPriorityFeePerGas := new(big.Int).Div(maxFeePerGas, big.NewInt(10)) // 10% of max fee
+
+	// Ensure minimum gas tip cap (chain requires at least 130000)
+	minGasTipCap := big.NewInt(150000) // Set slightly above minimum
+	if maxPriorityFeePerGas.Cmp(minGasTipCap) < 0 {
+		maxPriorityFeePerGas = minGasTipCap
+	}
+	// Ensure maxFeePerGas is at least maxPriorityFeePerGas
+	if maxFeePerGas.Cmp(maxPriorityFeePerGas) < 0 {
+		maxFeePerGas = new(big.Int).Mul(maxPriorityFeePerGas, big.NewInt(2))
+	}
 
 	// Create and sign the transaction
 	signedTx, err := CreateEIP1559Tx(privateKey, chainID, nonce, gasLimit, to, maxFeePerGas, maxPriorityFeePerGas, value, data)

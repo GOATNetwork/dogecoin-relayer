@@ -28,16 +28,36 @@ http:
   enabled: true
   port: 8080
 
+rpc:
+  enabled: true
+  port: 50051
+
 doge:
   rpc_url: "http://localhost:18443"
   rpc_user: ""
   rpc_password: ""
+  rpc_headers: {} # Optional extra RPC headers, e.g. {x-api-key: "t-..."}
   start_height: 0
   confirmations: 1
   network_type: "regtest"
 
-scan:
+withdraw:
   enabled: true
+  mode: "local"                # local | fireblocks
+  change_address: ""           # optional, default to first watch address
+  fee_rate: 1                  # reserved for future fee tuning
+  min_confirmations: 1
+  fireblocks:
+    api_key: ""
+    secret: ""
+    base_url: "https://api.fireblocks.io"
+    vault_account: ""
+    asset_id: "DOGE_TEST"
+    callback_private: ""
+    callback_public: ""
+
+scan:
+  enabled: false
   interval: 60 # unit: second
   timeout: 30 # unit: second
   range: 1000

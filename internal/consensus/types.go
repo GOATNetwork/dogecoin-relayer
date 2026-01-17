@@ -1,7 +1,6 @@
 package consensus
 
 import (
-	"encoding/json"
 	"math/big"
 
 	"github.com/goat-network/dogecoin-relayer/internal/models"
@@ -66,58 +65,17 @@ func NewDepositProposal(batchID string, utxos []*models.UTXO, totalAmount *big.I
 	}
 }
 
-// P2PDepositProposal is a lightweight version for P2P transmission only
-type P2PDepositProposal struct {
-	BatchID          string             `json:"batch_id"`
-	LightweightUTXOs []*LightweightUTXO `json:"lightweight_utxos"`
-	TotalAmountStr   string             `json:"total_amount"`
-	Proposer         string             `json:"proposer"`
-	SessionID        string             `json:"session_id"`
-	TssNonceStr      string             `json:"tss_nonce"`
-}
-
-func (d *DepositProposal) MarshalJSON() ([]byte, error) {
-	// Create a lightweight version for P2P transmission
-	p2pProposal := &P2PDepositProposal{
-		BatchID:          d.BatchID,
-		LightweightUTXOs: d.LightweightUTXOs,
-		TotalAmountStr:   d.TotalAmountStr,
-		Proposer:         d.Proposer,
-		SessionID:        d.SessionID,
-		TssNonceStr:      d.TssNonceStr,
-	}
-	return json.Marshal(p2pProposal)
-}
-
-func (d *DepositProposal) UnmarshalJSON(data []byte) error {
-	// Unmarshal to lightweight P2P structure first
-	p2pProposal := &P2PDepositProposal{}
-	err := json.Unmarshal(data, p2pProposal)
-	if err != nil {
-		return err
-	}
-
-	// Copy data from P2P structure to full structure
-	d.BatchID = p2pProposal.BatchID
-	d.LightweightUTXOs = p2pProposal.LightweightUTXOs
-	d.TotalAmountStr = p2pProposal.TotalAmountStr
-	d.Proposer = p2pProposal.Proposer
-	d.SessionID = p2pProposal.SessionID
-	d.TssNonceStr = p2pProposal.TssNonceStr
-
-	// Don't set UTXOs, Calldata, TotalAmount - these will be set separately
-	return nil
-}
-
 // WithdrawalProposal represents a batch proposal for processing withdrawal UTXOs
 type WithdrawalProposal struct {
 	BatchID     string         `json:"batch_id"`     // Unique identifier for this batch
 	UTXOs       []*models.UTXO `json:"utxos"`        // List of withdrawal UTXOs in this batch
 	TotalAmount *big.Int       `json:"total_amount"` // Total amount across all UTXOs
 	Calldata    []byte         `json:"calldata"`     // Generated bridgeOutFinish calldata for the batch
-	TaskIds     []*big.Int     `json:"task_ids"`     // Task IDs associated with this withdrawal batch
-	Proposer    string         `json:"proposer"`     // Address of the proposer node
-	SessionID   string         `json:"session_id"`   // TSS session ID for signing
+	TxBytes     []byte         `json:"tx_bytes,omitempty"`
+	TxId        string         `json:"txid,omitempty"`
+	TaskIds     []*big.Int     `json:"task_ids"`   // Task IDs associated with this withdrawal batch
+	Proposer    string         `json:"proposer"`   // Address of the proposer node
+	SessionID   string         `json:"session_id"` // TSS session ID for signing
 	TssNonceStr string         `json:"tss_nonce"`
 	TssNonce    *big.Int       `json:"-"`
 }
@@ -136,10 +94,26 @@ func NewWithdrawalProposal(batchID string, utxos []*models.UTXO, totalAmount *bi
 	}
 }
 
-func (w *WithdrawalProposal) MarshalJSON() ([]byte, error) {
-	return json.Marshal(w)
+// DepositNotification contains all information needed to persist a deposit on receiving nodes
+type DepositNotification struct {
+	TxId      string `json:"tx_id"`      // Transaction ID
+	Vout      int    `json:"vout"`       // Output index
+	EvmAddr   string `json:"evm_addr"`   // EVM address
+	Amount    int64  `json:"amount"`     // Deposit amount in satoshis
+	TxBytes   []byte `json:"tx_bytes"`   // Raw transaction bytes
+	Address   string `json:"address"`    // Deposit address (watch address)
+	SessionID string `json:"session_id"` // Unique session ID for deduplication
 }
 
-func (w *WithdrawalProposal) UnmarshalJSON(data []byte) error {
-	return json.Unmarshal(data, w)
+// NewDepositNotification creates a new DepositNotification instance
+func NewDepositNotification(txId string, vout int, evmAddr string, amount int64, txBytes []byte, address string, sessionID string) *DepositNotification {
+	return &DepositNotification{
+		TxId:      txId,
+		Vout:      vout,
+		EvmAddr:   evmAddr,
+		Amount:    amount,
+		TxBytes:   txBytes,
+		Address:   address,
+		SessionID: sessionID,
+	}
 }

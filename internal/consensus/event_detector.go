@@ -218,41 +218,33 @@ func (ed *EventDetector) initializeScanStates() error {
 		return nil
 	}
 
-	contractAddressesMap := make(map[string]bool)
-
-	// Get unique contract addresses from configs
-	for _, config := range ed.configs {
-		if config.IsActive {
-			contractAddressesMap[config.ContractAddress.Hex()] = true
+	state, err := ed.eventRepo.GetScanState()
+	if err != nil {
+		// If scan state doesn't exist, create it with current last scanned block
+		newState := &models.EventScanState{
+			LastScannedBlock:   ed.lastScannedBlock,
+			ConfirmationBlocks: ed.confirmationBlocks,
+			IsActive:           true,
 		}
+
+		if err := ed.eventRepo.CreateOrUpdateScanState(newState); err != nil {
+			return fmt.Errorf("failed to create scan state: %w", err)
+		}
+
+		ed.logger.Infof("Created initial scan state at block %d", ed.lastScannedBlock)
+		return nil
 	}
 
-	// Initialize scan state for each unique contract address
-	for contractAddress := range contractAddressesMap {
-		state, err := ed.eventRepo.GetScanState(contractAddress)
-		if err != nil {
-			// If scan state doesn't exist, create it with current last scanned block
-			newState := &models.EventScanState{
-				LastScannedBlock:   ed.lastScannedBlock,
-				ConfirmationBlocks: ed.confirmationBlocks,
-				IsActive:           true,
-			}
-
-			if ed.eventRepo != nil {
-				if err := ed.eventRepo.CreateOrUpdateScanState(newState); err != nil {
-					return fmt.Errorf("failed to create scan state for contract %s: %w", contractAddress, err)
-				}
-			}
-
-			ed.logger.Infof("Created initial scan state for contract %s at block %d", contractAddress, ed.lastScannedBlock)
-		} else {
-			// Use the minimum last scanned block from all contracts
-			if state.LastScannedBlock < ed.lastScannedBlock {
-				ed.lastScannedBlock = state.LastScannedBlock
-			}
-			ed.logger.Infof("Loaded scan state for contract %s, last scanned block: %d", contractAddress, state.LastScannedBlock)
-		}
+	// Always use the database value if it's more recent (higher block number)
+	// This prevents re-scanning already processed blocks after restart
+	configBlock := ed.lastScannedBlock
+	if state.LastScannedBlock > configBlock {
+		ed.lastScannedBlock = state.LastScannedBlock
+		ed.logger.Infof("Using database scan state: block %d (more recent than config %d)", state.LastScannedBlock, configBlock)
+	} else {
+		ed.logger.Infof("Using config scan state: block %d (database has %d)", configBlock, state.LastScannedBlock)
 	}
+	ed.logger.Infof("Loaded scan state, will resume from block: %d", ed.lastScannedBlock)
 
 	return nil
 }

@@ -5,25 +5,11 @@ RUN apk add --no-cache gcc musl-dev git
 
 WORKDIR /app
 
-# 1. set github token for private repo
-ARG GITHUB_TOKEN
-# 2. set private repo domain
-ENV GOPRIVATE=github.com/goatnetwork/tss
-
-# 3. set env for private repo
-RUN echo "machine github.com login ${GITHUB_TOKEN} password x-oauth-basic" > ~/.netrc && \
-    chmod 600 ~/.netrc
-
-# 4. go download
-COPY go.mod go.sum ./
-RUN go mod download
-
-# 5. copy source code and build
+# Copy vendored dependencies and source code
 COPY . .
-RUN CGO_ENABLED=1 go build -o /dogecoin-relayer .
 
-# 6. clean git config
-RUN git config --global --remove-section url."https://${GITHUB_TOKEN}:x-oauth-basic@github.com/" || true
+# Build with vendored dependencies (no network access needed)
+RUN CGO_ENABLED=1 go build -mod=vendor -o /dogecoin-relayer .
 
 # =================== 2. Run ===================
 FROM alpine:3.21
@@ -35,6 +21,6 @@ RUN apk add --no-cache tzdata
 
 COPY --from=builder /dogecoin-relayer /app/dogecoin-relayer
 
-EXPOSE 8080 4001
+EXPOSE 8080 4001 5001 50051
 
 CMD ["/app/dogecoin-relayer", "-config", "/app/config/config.yaml"]

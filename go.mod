@@ -12,6 +12,8 @@ require (
 	github.com/prometheus/client_golang v1.22.0
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.10.0
+	google.golang.org/grpc v1.60.1
+	google.golang.org/protobuf v1.36.6
 	gopkg.in/yaml.v2 v2.4.0
 	gorm.io/driver/sqlite v1.6.0
 	gorm.io/gorm v1.30.0
@@ -83,6 +85,8 @@ require (
 	github.com/francoispqt/gojay v1.2.13 // indirect
 	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
+	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/gopacket v1.1.19 // indirect
 	github.com/google/pprof v0.0.0-20250607225305-033d6d78b36a // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
@@ -169,9 +173,11 @@ require (
 	golang.org/x/text v0.26.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
 	golang.org/x/tools v0.34.0 // indirect
-	google.golang.org/protobuf v1.36.6 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20231002182017-d307bd883b97 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
 
 replace github.com/agl/ed25519 => github.com/binance-chain/edwards25519 v0.0.0-20200305024217-f36fc4b53d43
+
+replace github.com/goatnetwork/tss => ../tss

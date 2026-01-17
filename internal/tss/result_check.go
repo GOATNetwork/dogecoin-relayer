@@ -2,6 +2,7 @@ package tss
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
@@ -9,7 +10,9 @@ import (
 )
 
 func (m *TssModule) checkSignHandler(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
+	// Poll every 3 seconds to catch signatures before TSS session closes
+	// TSS sessions are cleaned up shortly after signing completes, so we need fast polling
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -40,6 +43,19 @@ func (m *TssModule) checkSignHandler(ctx context.Context) {
 				// check session status
 				signStatus, err := m.signClient.GetSignStatus(ctx, sessionID)
 				if err != nil {
+					errMsg := err.Error()
+					// If session not found on TSS, fail immediately instead of waiting for timeout
+					if strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "does not exist") {
+						m.logger.Warnf("Session %s not found on TSS, failing immediately", sessionID)
+						m.eventBus.Publish(eventbus.EventTssSigResponse, types.TssSigResponse{
+							SessionID: sessionID,
+							Success:   false,
+							Message:   "session not found on TSS",
+							RawSig:    nil,
+						})
+						m.activeSessions.Delete(sessionID)
+						return true
+					}
 					m.logger.Errorf("Failed to get status for session %s: %v", sessionID, err)
 					return true
 				}

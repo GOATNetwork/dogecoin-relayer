@@ -24,6 +24,7 @@ type TssModule struct {
 
 	activeSessions sync.Map // key: sessionID (string), value: timestamp (time.Time)
 	cancel         context.CancelFunc
+	ctx            context.Context
 }
 
 var _ module.Module = (*TssModule)(nil)
@@ -55,8 +56,7 @@ func (m *TssModule) Run(ctx context.Context) error {
 	metrics.RecordModuleStart("tss")
 
 	// Create cancellable context
-	ctx, cancel := context.WithCancel(ctx)
-	m.cancel = cancel
+	m.ctx, m.cancel = context.WithCancel(ctx)
 
 	// register event bus
 	m.subscribeEvent()

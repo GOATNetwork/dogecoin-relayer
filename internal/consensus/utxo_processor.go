@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"strconv"
@@ -20,6 +21,8 @@ import (
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
 	log "github.com/sirupsen/logrus"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // BridgeInBatch represents a batch of bridge transactions
@@ -36,6 +39,8 @@ type withdrawalRequest struct {
 	UTXO        *models.UTXO // Single UTXO with multiple outputs
 	TotalAmount *big.Int
 	TaskIds     []*big.Int // Task IDs aligned with VOUT outputs
+	TxBytes     []byte
+	TxId        string
 }
 
 // pendingBatch stores batch data while waiting for TSS signature
@@ -147,9 +152,9 @@ func NewUtxoProcessor(conn *models.DBConnection, bridgeContractAddress, entryPoi
 		bridgeContract:         common.HexToAddress(bridgeContractAddress),
 		entryPointContract:     common.HexToAddress(entryPointAddress),
 		abiPath:                abiPath,
-		pollInterval:           10 * time.Second, // Poll every 10 seconds
-		batchSize:              1,                // Process 1 UTXO at a time for debugging
+		batchSize:              1,
 		lastProcessedId:        0,
+		pollInterval:           10 * time.Second,
 		ctx:                    ctx,
 		cancel:                 cancel,
 		isRunning:              false,
@@ -191,6 +196,20 @@ func (up *UtxoProcessor) SetTssClient(client *tss.SignClient) {
 // SetChainID sets the chain ID for transaction signing
 func (up *UtxoProcessor) SetChainID(chainID *big.Int) {
 	up.chainID = chainID
+}
+
+// SubmitWithdrawalRequest allows external components (e.g., withdrawal processor) to trigger a bridgeOutFinish flow directly.
+func (up *UtxoProcessor) SubmitWithdrawalRequest(req *withdrawalRequest) error {
+	if req == nil {
+		return fmt.Errorf("nil withdrawal request")
+	}
+	if len(req.TaskIds) == 0 {
+		return fmt.Errorf("withdrawal request missing task ids")
+	}
+	if req.TotalAmount == nil {
+		return fmt.Errorf("withdrawal request missing amount")
+	}
+	return up.processWithdrawalRequest(req)
 }
 
 // Start begins the UTXO monitoring process
@@ -243,6 +262,11 @@ func (up *UtxoProcessor) Start() error {
 		up.SetChainID(chainID)
 		up.logger.Infof("Chain ID set to %d", globalCfg.Consensus.ChainId)
 
+		if globalCfg.Consensus.UtxoPollingIntervalSec > 0 {
+			up.pollInterval = time.Duration(globalCfg.Consensus.UtxoPollingIntervalSec) * time.Second
+			up.logger.Infof("UTXO polling interval set to %d seconds", globalCfg.Consensus.UtxoPollingIntervalSec)
+		}
+
 		up.logger.Info("TSS client configured for UTXO processor")
 	} else {
 		up.logger.Warn("TSS is not enabled, bridge transactions will not be signed")
@@ -250,6 +274,10 @@ func (up *UtxoProcessor) Start() error {
 
 	up.isRunning = true
 	up.logger.Info("Starting UTXO manager")
+
+	if err := up.loadPendingBatchesFromDB(); err != nil {
+		up.logger.Errorf("Failed to load pending batches from database: %v", err)
+	}
 
 	up.registerP2PHandler()
 	// Subscribe to TSS signature responses
@@ -464,5 +492,245 @@ func (up *UtxoProcessor) removePendingSession(baseID string, pending *pendingBat
 	}
 	if pending.baseSessionID != "" && pending.baseSessionID != baseID {
 		up.tssSessionAliases.Delete(pending.baseSessionID)
+	}
+
+	if err := up.state.UpdatePendingBatchStatus(baseID, models.PENDING_BATCH_STATUS_COMPLETED); err != nil {
+		up.logger.Errorf("Failed to update pending batch %s status to completed: %v", baseID, err)
+	} else {
+		// Broadcast pending_batch status update to other nodes
+		up.broadcastPendingBatchStatus(baseID, pending.batchType, models.PENDING_BATCH_STATUS_COMPLETED)
+	}
+}
+
+func (up *UtxoProcessor) persistPendingBatch(pending *pendingBatch) error {
+	dbBatch := up.pendingBatchToDBModel(pending)
+
+	err := up.state.WithPendingBatchTransactionRetry(func(tx *gorm.DB) error {
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "base_session_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"batch_type",
+				"call_data",
+				"tss_nonce",
+				"next_attempt",
+				"last_attempt",
+				"next_retry_at",
+				"batch_id",
+				"total_amount",
+				"withdrawal_id",
+				"task_ids_json",
+				"tx_id",
+				"updated_at",
+			}),
+			Where: clause.Where{Exprs: []clause.Expression{
+				clause.Expr{SQL: "status = ?", Vars: []interface{}{models.PENDING_BATCH_STATUS_PENDING}},
+			}},
+		}).Create(dbBatch).Error
+	})
+
+	if err != nil {
+		up.logger.Errorf("Failed to persist pending batch %s to database: %v", pending.baseSessionID, err)
+		return err
+	}
+
+	up.logger.Infof("Persisted pending batch %s to database", pending.baseSessionID)
+	return nil
+}
+
+func (up *UtxoProcessor) updatePendingBatchInDB(pending *pendingBatch) error {
+	dbBatch := up.pendingBatchToDBModel(pending)
+
+	err := up.state.WithPendingBatchTransactionRetry(func(tx *gorm.DB) error {
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "base_session_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"batch_type",
+				"call_data",
+				"tss_nonce",
+				"next_attempt",
+				"last_attempt",
+				"next_retry_at",
+				"batch_id",
+				"total_amount",
+				"withdrawal_id",
+				"task_ids_json",
+				"tx_id",
+				"updated_at",
+			}),
+			Where: clause.Where{Exprs: []clause.Expression{
+				clause.Expr{SQL: "status = ?", Vars: []interface{}{models.PENDING_BATCH_STATUS_PENDING}},
+			}},
+		}).Create(dbBatch).Error
+	})
+
+	if err != nil {
+		up.logger.Errorf("Failed to update pending batch %s in database: %v", pending.baseSessionID, err)
+		return err
+	}
+
+	return nil
+}
+
+func (up *UtxoProcessor) loadPendingBatchesFromDB() error {
+	dbBatches, err := up.state.GetAllPendingBatches()
+	if err != nil {
+		return fmt.Errorf("failed to load pending batches from database: %w", err)
+	}
+
+	if len(dbBatches) == 0 {
+		up.logger.Info("No pending batches found in database")
+		return nil
+	}
+
+	up.logger.Infof("Loading %d pending batches from database", len(dbBatches))
+
+	for _, dbBatch := range dbBatches {
+		pending := up.dbModelToPendingBatch(dbBatch)
+
+		if pending.baseSessionID != "" {
+			up.pendingBatches.Store(pending.baseSessionID, pending)
+			if pending.currentSessionID != "" {
+				up.tssSessionAliases.Store(pending.currentSessionID, pending.baseSessionID)
+			}
+			up.logger.Infof("Loaded pending batch %s (type=%s, attempt=%d)",
+				pending.baseSessionID, pending.batchType, pending.nextAttempt)
+		}
+	}
+
+	return nil
+}
+
+func (up *UtxoProcessor) pendingBatchToDBModel(pending *pendingBatch) *models.PendingBatch {
+	dbBatch := &models.PendingBatch{
+		BaseSessionID: pending.baseSessionID,
+		BatchType:     pending.batchType,
+		CallData:      pending.calldata,
+		NextAttempt:   pending.nextAttempt,
+		LastAttempt:   pending.lastAttempt,
+		NextRetryAt:   pending.nextRetryAt,
+		Status:        models.PENDING_BATCH_STATUS_PENDING,
+	}
+
+	if pending.tssNonce != nil {
+		dbBatch.TssNonce = pending.tssNonce.String()
+	}
+
+	if pending.utxos != nil {
+		utxosJSON, _ := json.Marshal(pending.utxos)
+		dbBatch.UtxosJSON = string(utxosJSON)
+	}
+
+	if pending.batchType == "deposit" && pending.depositBatch != nil {
+		dbBatch.BatchID = pending.depositBatch.ID.String()
+		if pending.depositBatch.TotalAmount != nil {
+			dbBatch.TotalAmount = pending.depositBatch.TotalAmount.String()
+		}
+	}
+
+	if pending.batchType == "withdrawal" && pending.withdrawalRequest != nil {
+		dbBatch.WithdrawalID = pending.withdrawalRequest.ID.String()
+		if len(pending.withdrawalRequest.TaskIds) > 0 {
+			taskIdsJSON, _ := json.Marshal(pending.withdrawalRequest.TaskIds)
+			dbBatch.TaskIdsJSON = string(taskIdsJSON)
+		}
+		dbBatch.TxId = pending.withdrawalRequest.TxId
+	}
+
+	return dbBatch
+}
+
+func (up *UtxoProcessor) dbModelToPendingBatch(dbBatch *models.PendingBatch) *pendingBatch {
+	pending := &pendingBatch{
+		batchType:         dbBatch.BatchType,
+		calldata:          dbBatch.CallData,
+		baseSessionID:     dbBatch.BaseSessionID,
+		currentSessionID:  "",
+		nextAttempt:       dbBatch.NextAttempt,
+		lastAttempt:       dbBatch.LastAttempt,
+		nextRetryAt:       dbBatch.NextRetryAt,
+		depositBatch:      nil,
+		withdrawalRequest: nil,
+		utxos:             nil,
+	}
+
+	if dbBatch.TssNonce != "" {
+		if nonce, ok := new(big.Int).SetString(dbBatch.TssNonce, 10); ok {
+			pending.tssNonce = nonce
+		}
+	}
+
+	if dbBatch.UtxosJSON != "" {
+		var utxos []*models.UTXO
+		if err := json.Unmarshal([]byte(dbBatch.UtxosJSON), &utxos); err == nil {
+			pending.utxos = utxos
+		}
+	}
+
+	if dbBatch.BatchType == "deposit" && dbBatch.BatchID != "" {
+		if batchID, ok := new(big.Int).SetString(dbBatch.BatchID, 10); ok {
+			pending.depositBatch = &BridgeInBatch{
+				ID:    batchID,
+				UTXOs: pending.utxos,
+			}
+			if dbBatch.TotalAmount != "" {
+				if amount, ok := new(big.Int).SetString(dbBatch.TotalAmount, 10); ok {
+					pending.depositBatch.TotalAmount = amount
+				}
+			}
+		}
+	}
+
+	if dbBatch.BatchType == "withdrawal" && dbBatch.WithdrawalID != "" {
+		if withdrawalID, ok := new(big.Int).SetString(dbBatch.WithdrawalID, 10); ok {
+			var taskIds []*big.Int
+			if dbBatch.TaskIdsJSON != "" {
+				json.Unmarshal([]byte(dbBatch.TaskIdsJSON), &taskIds)
+			}
+
+			pending.withdrawalRequest = &withdrawalRequest{
+				ID:      withdrawalID,
+				TaskIds: taskIds,
+				TxId:    dbBatch.TxId,
+			}
+			if len(pending.utxos) > 0 {
+				pending.withdrawalRequest.UTXO = pending.utxos[0]
+			}
+		}
+	}
+
+	return pending
+}
+
+// broadcastPendingBatchStatus broadcasts a pending_batch status change to other nodes
+func (up *UtxoProcessor) broadcastPendingBatchStatus(baseSessionID, batchType, status string) {
+	p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
+	if !ok {
+		up.logger.Debug("P2P module not available for pending_batch status broadcast")
+		return
+	}
+
+	payload := types.PendingBatchStatusPayload{
+		BaseSessionID: baseSessionID,
+		BatchType:     batchType,
+		Status:        status,
+		UpdatedAt:     time.Now().Unix(),
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		up.logger.Warnf("Failed to marshal pending_batch status payload: %v", err)
+		return
+	}
+
+	msg := types.P2PBroadcastMessage{
+		Type:      types.P2PMessageTypePendingBatchStatus,
+		SessionID: baseSessionID,
+		Payload:   payloadBytes,
+	}
+
+	if err := p2pModule.(p2p.P2PSender).BroadcastP2PMessage(msg); err != nil {
+		up.logger.Warnf("Failed to broadcast pending_batch status %s: %v", baseSessionID, err)
+	} else {
+		up.logger.Infof("Broadcasted pending_batch status: %s -> %s", baseSessionID, status)
 	}
 }

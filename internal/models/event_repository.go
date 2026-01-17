@@ -7,6 +7,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type EventRepository struct {
@@ -88,10 +89,12 @@ func (r *EventRepository) getDB(tx *gorm.DB) *gorm.DB {
 	return r.db
 }
 
+const eventScanStateID uint = 1
+
 // EventScanState operations
-func (r *EventRepository) GetScanState(contractAddress string) (*EventScanState, error) {
+func (r *EventRepository) GetScanState() (*EventScanState, error) {
 	var state EventScanState
-	err := r.db.Where("contract_address = ?", contractAddress).First(&state).Error
+	err := r.db.First(&state, eventScanStateID).Error
 	if err != nil {
 		return nil, err
 	}
@@ -99,22 +102,27 @@ func (r *EventRepository) GetScanState(contractAddress string) (*EventScanState,
 }
 
 func (r *EventRepository) UpdateScanState(transaction *gorm.DB, lastScannedBlock uint64) error {
-	if transaction == nil {
-		transaction = r.db
-	}
+	db := r.getDB(transaction)
 	state := &EventScanState{
 		LastScannedBlock: lastScannedBlock,
 		LastScannedAt:    time.Now(),
 		IsActive:         true,
 	}
+	state.ID = eventScanStateID
 
-	// Use Upsert (create or update)
-	return transaction.Save(state).Error
+	return db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"last_scanned_block", "last_scanned_at", "is_active"}),
+	}).Create(state).Error
 }
 
 func (r *EventRepository) CreateOrUpdateScanState(state *EventScanState) error {
+	state.ID = eventScanStateID
 	state.LastScannedAt = time.Now()
-	return r.db.Save(state).Error
+	return r.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"last_scanned_block", "last_scanned_at", "confirmation_blocks", "is_active"}),
+	}).Create(state).Error
 }
 
 // New repository operations for Deposit, Withdrawal, and Proposers
@@ -127,7 +135,7 @@ func (r *EventRepository) CreateOrUpdateDeposit(tx *gorm.DB, deposit *Deposit) e
 	if tx != nil {
 		return r.createOrUpdateDepositImpl(tx, deposit)
 	}
-	
+
 	// For non-transactional updates, use retry logic
 	return r.WithTransactionRetry(func(innerTx *gorm.DB) error {
 		return r.createOrUpdateDepositImpl(innerTx, deposit)
@@ -143,6 +151,12 @@ func (r *EventRepository) createOrUpdateDepositImpl(db *gorm.DB, deposit *Deposi
 			return db.Create(deposit).Error
 		}
 		return err
+	}
+
+	// Don't overwrite a deposit that is already confirmed
+	// This prevents re-scanning from resetting a completed deposit
+	if existing.Status == "confirmed" {
+		return nil
 	}
 
 	// Update mutable fields
@@ -184,7 +198,7 @@ func (r *EventRepository) ListDepositsByStatus(tx *gorm.DB, status string, limit
 // UpdateDepositStatus updates status of a deposit by primary key ID with retry on lock errors.
 func (r *EventRepository) UpdateDepositStatus(tx *gorm.DB, id uint, status string) error {
 	db := r.getDB(tx)
-	
+
 	// If we're already in a transaction, don't retry (let the outer transaction handle it)
 	if tx != nil {
 		return db.Model(&Deposit{}).Where("id = ?", id).Updates(map[string]any{
@@ -192,7 +206,7 @@ func (r *EventRepository) UpdateDepositStatus(tx *gorm.DB, id uint, status strin
 			"updated_at": time.Now(),
 		}).Error
 	}
-	
+
 	// For non-transactional updates, use retry logic
 	return r.WithTransactionRetry(func(innerTx *gorm.DB) error {
 		return innerTx.Model(&Deposit{}).Where("id = ?", id).Updates(map[string]any{
@@ -204,16 +218,19 @@ func (r *EventRepository) UpdateDepositStatus(tx *gorm.DB, id uint, status strin
 
 // BatchGetDepositsByTxIds retrieves multiple deposits in a single query
 // Returns a map keyed by "txid:vout" for quick lookup
-func (r *EventRepository) BatchGetDepositsByTxIds(tx *gorm.DB, txidVouts []struct{ TxId string; Vout int }) (map[string]Deposit, error) {
+func (r *EventRepository) BatchGetDepositsByTxIds(tx *gorm.DB, txidVouts []struct {
+	TxId string
+	Vout int
+}) (map[string]Deposit, error) {
 	db := r.getDB(tx)
-	
+
 	if len(txidVouts) == 0 {
 		return make(map[string]Deposit), nil
 	}
 
 	var deposits []Deposit
 	query := db
-	
+
 	// Build OR conditions for batch query
 	for i, tv := range txidVouts {
 		if i == 0 {
@@ -222,21 +239,20 @@ func (r *EventRepository) BatchGetDepositsByTxIds(tx *gorm.DB, txidVouts []struc
 			query = query.Or("tx_id = ? AND vout = ?", tv.TxId, tv.Vout)
 		}
 	}
-	
+
 	if err := query.Find(&deposits).Error; err != nil {
 		return nil, err
 	}
-	
+
 	// Build result map
 	result := make(map[string]Deposit, len(deposits))
 	for _, dep := range deposits {
 		key := fmt.Sprintf("%s:%d", dep.TxId, dep.Vout)
 		result[key] = dep
 	}
-	
+
 	return result, nil
 }
-
 
 // Withdrawal operations
 
@@ -257,9 +273,13 @@ func (r *EventRepository) CreateOrUpdateWithdrawal(tx *gorm.DB, w *Withdrawal) e
 		"req_block":        w.ReqBlock,
 		"req_log_index":    w.ReqLogIndex,
 		"status":           w.Status,
+		"dest_address":     w.DestAddress,
+		"dest_amount":      w.DestAmount,
 		"tx_id":            w.TxId,
+		"external_id":      w.ExternalId,
 		"vout":             w.Vout,
 		"tx_bytes":         w.TxBytes,
+		"unsigned_tx":      w.UnsignedTx,
 		"finish_tx_hash":   w.FinishTxHash,
 		"finish_block":     w.FinishBlock,
 		"finish_log_index": w.FinishLogIndex,
@@ -278,10 +298,30 @@ func (r *EventRepository) GetWithdrawalByTask(tx *gorm.DB, reqTaskId string) (*W
 	return &w, nil
 }
 
+// ListWithdrawalsByStatus lists withdrawals filtered by status with optional limit.
+func (r *EventRepository) ListWithdrawalsByStatus(tx *gorm.DB, status string, limit int) ([]Withdrawal, error) {
+	db := r.getDB(tx)
+	var list []Withdrawal
+	query := db.Where("status = ?", status).Order("created_at ASC")
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+	return list, query.Find(&list).Error
+}
+
 // UpdateWithdrawalStatus updates withdrawal status by ID.
 func (r *EventRepository) UpdateWithdrawalStatus(tx *gorm.DB, id uint, status string) error {
 	db := r.getDB(tx)
 	return db.Model(&Withdrawal{}).Where("id = ?", id).Updates(map[string]any{
+		"status":     status,
+		"updated_at": time.Now(),
+	}).Error
+}
+
+// UpdateWithdrawalStatusByTask updates withdrawal status by req_task_id.
+func (r *EventRepository) UpdateWithdrawalStatusByTask(tx *gorm.DB, reqTaskId, status string) error {
+	db := r.getDB(tx)
+	return db.Model(&Withdrawal{}).Where("req_task_id = ?", reqTaskId).Updates(map[string]any{
 		"status":     status,
 		"updated_at": time.Now(),
 	}).Error

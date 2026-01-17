@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 
-	"github.com/dogecoinw/doged/btcutil"
 	"github.com/dogecoinw/doged/chaincfg/chainhash"
 	"github.com/dogecoinw/doged/rpcclient"
 	"github.com/dogecoinw/doged/wire"
@@ -16,6 +18,12 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// ErrTxNotFound is returned when a transaction is not found in the mempool or blockchain
+var ErrTxNotFound = errors.New("transaction not found")
+
+// ErrTxAlreadyInChain is returned when trying to broadcast a transaction that's already confirmed
+var ErrTxAlreadyInChain = errors.New("transaction already in chain")
+
 // DogeClient represents a Dogecoin RPC client using doged library
 type DogeClient struct {
 	cfg    config.DogeConfig
@@ -23,18 +31,72 @@ type DogeClient struct {
 	logger *log.Entry
 }
 
+func normalizeRPCConfig(raw string) (string, bool, error) {
+	rpcUrl := strings.TrimSpace(raw)
+	if rpcUrl == "" {
+		return "", true, fmt.Errorf("rpc_url is empty")
+	}
+
+	parsed, err := url.Parse(rpcUrl)
+	if err != nil {
+		return "", true, fmt.Errorf("parse rpc_url %q: %w", raw, err)
+	}
+
+	disableTLS := true
+	switch parsed.Scheme {
+	case "https":
+		disableTLS = false
+	case "http":
+		disableTLS = true
+	default:
+		return "", true, fmt.Errorf("rpc_url must start with http:// or https:// : %q", raw)
+	}
+
+	if parsed.Host == "" {
+		return "", disableTLS, fmt.Errorf("rpc_url missing host: %q", raw)
+	}
+
+	host := parsed.Host
+	if reqURI := parsed.RequestURI(); reqURI != "" && reqURI != "/" {
+		host += reqURI
+	}
+
+	return host, disableTLS, nil
+}
+
 // NewDogeClient creates a new Dogecoin RPC client using doged library
 func NewDogeClient(cfg config.DogeConfig) (*DogeClient, error) {
-	// Create RPC client configuration
+	host, disableTLS, err := normalizeRPCConfig(cfg.RpcUrl)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create RPC client configuration for doged client
 	connCfg := &rpcclient.ConnConfig{
-		Host:         cfg.RpcUrl,
+		Host:         host,
 		User:         cfg.RpcUser,
 		Pass:         cfg.RpcPassword,
 		HTTPPostMode: true,
-		DisableTLS:   true,
+		DisableTLS:   disableTLS,
+	}
+	// If using header-based auth (like Tatum API) and no User/Pass is set,
+	// set a dummy Pass to prevent the client from trying cookie authentication
+	// which would fail with "stat : no such file or directory".
+	if connCfg.Pass == "" && len(cfg.RpcHeaders) > 0 {
+		connCfg.Pass = "__header_auth__"
+	}
+	if len(cfg.RpcHeaders) > 0 {
+		connCfg.ExtraHeaders = make(map[string]string, len(cfg.RpcHeaders))
+		for key, value := range cfg.RpcHeaders {
+			trimmedKey := strings.TrimSpace(key)
+			if trimmedKey == "" {
+				continue
+			}
+			connCfg.ExtraHeaders[trimmedKey] = value
+		}
 	}
 
-	// Create the RPC client
+	// Create the doged RPC client
 	client, err := rpcclient.New(connCfg, nil)
 	if err != nil {
 		metrics.RecordError("doge", "connection_failed")
@@ -91,10 +153,6 @@ func (c *DogeClient) GetBlockHash(height int64) (*chainhash.Hash, error) {
 
 // GetBlock returns block information
 func (c *DogeClient) GetBlock(blockHash *chainhash.Hash) (*wire.MsgBlock, error) {
-	// NOTE: doged/rpcclient.GetBlock uses an integer verbosity param (0),
-	// which Dogecoin Core rejects with code -1 (expects boolean).
-	// To ensure compatibility, explicitly call RawRequest with boolean false
-	// and decode the returned hex ourselves.
 	timer := metrics.NewTimer("doge", "get_block")
 
 	if blockHash == nil {
@@ -103,72 +161,17 @@ func (c *DogeClient) GetBlock(blockHash *chainhash.Hash) (*wire.MsgBlock, error)
 		return nil, fmt.Errorf("nil block hash")
 	}
 
-	// Build JSON-RPC params: [hash, false]
-	hashJSON, err := json.Marshal(blockHash.String())
+	block, err := c.client.GetBlock(blockHash)
 	if err != nil {
 		timer.RecordFailure()
 		metrics.DogeRPCCalls.WithLabelValues("GetBlock", "failure").Inc()
-		metrics.RecordError("doge", "marshal_failed")
-		return nil, fmt.Errorf("marshal hash: %w", err)
-	}
-	// Use explicit boolean false for non-verbose (hex) response
-	verboseJSON := json.RawMessage([]byte("false"))
-
-	res, err := c.client.RawRequest("getblock", []json.RawMessage{json.RawMessage(hashJSON), verboseJSON})
-	if err != nil {
-		timer.RecordFailure()
-		metrics.DogeRPCCalls.WithLabelValues("GetBlock", "failure").Inc()
-		metrics.RecordError("doge", "rpc_call_failed")
-		return nil, err
-	}
-
-	// Unmarshal result as hex string
-	var blockHex string
-	if err := json.Unmarshal(res, &blockHex); err != nil {
-		timer.RecordFailure()
-		metrics.DogeRPCCalls.WithLabelValues("GetBlock", "failure").Inc()
-		metrics.RecordError("doge", "unmarshal_failed")
-		return nil, fmt.Errorf("unmarshal getblock result: %w", err)
-	}
-
-	// Decode hex and deserialize to wire.MsgBlock
-	serializedBlock, err := hex.DecodeString(blockHex)
-	if err != nil {
-		timer.RecordFailure()
-		metrics.DogeRPCCalls.WithLabelValues("GetBlock", "failure").Inc()
-		metrics.RecordError("doge", "hex_decode_failed")
-		return nil, fmt.Errorf("decode block hex: %w", err)
-	}
-
-	var msgBlock wire.MsgBlock
-	if err := msgBlock.Deserialize(bytes.NewReader(serializedBlock)); err != nil {
-		timer.RecordFailure()
-		metrics.DogeRPCCalls.WithLabelValues("GetBlock", "failure").Inc()
-		metrics.RecordError("doge", "deserialize_failed")
-		return nil, fmt.Errorf("deserialize block: %w", err)
-	}
-
-	timer.RecordSuccess()
-	metrics.DogeRPCCalls.WithLabelValues("GetBlock", "success").Inc()
-	return &msgBlock, nil
-}
-
-// GetRawTransaction returns raw transaction information
-func (c *DogeClient) GetRawTransaction(txHash *chainhash.Hash) (*btcutil.Tx, error) {
-	timer := metrics.NewTimer("doge", "get_raw_transaction")
-
-	result, err := c.client.GetRawTransaction(txHash)
-	if err != nil {
-		timer.RecordFailure()
-		metrics.DogeRPCCalls.WithLabelValues("GetRawTransaction", "failure").Inc()
 		metrics.RecordError("doge", "rpc_call_failed")
 		return nil, err
 	}
 
 	timer.RecordSuccess()
-	metrics.DogeRPCCalls.WithLabelValues("GetRawTransaction", "success").Inc()
-
-	return result, nil
+	metrics.DogeRPCCalls.WithLabelValues("GetBlock", "success").Inc()
+	return block, nil
 }
 
 // GetBlockByHeight returns a block by height
@@ -209,23 +212,200 @@ func (c *DogeClient) GetBlockByHeight(height int64) (*types.DogeBlockExt, error)
 func (c *DogeClient) Close() {
 	if c.client != nil {
 		c.client.Shutdown()
-		metrics.DogeConnectionStatus.Set(0)
-		c.logger.Info("Doge client connection closed")
 	}
+	metrics.DogeConnectionStatus.Set(0)
+	c.logger.Info("Doge client connection closed")
 }
 
-// HealthCheck performs a health check on the Dogecoin connection
-func (c *DogeClient) HealthCheck() error {
-	timer := metrics.NewTimer("doge", "health_check")
+type TransactionInput struct {
+	Txid string `json:"txid"`
+	Vout int    `json:"vout"`
+}
 
-	_, err := c.GetBlockCount()
-	if err != nil {
-		timer.RecordFailure()
-		metrics.DogeConnectionStatus.Set(0)
-		return fmt.Errorf("health check failed: %w", err)
+// CreateAndFundRawTx builds a raw transaction with the given outputs (amounts expressed as numeric DOGE values)
+// and lets the node pick inputs/change. Returns the funded hex string.
+func (c *DogeClient) CreateAndFundRawTx(outputs map[string]json.RawMessage, changeAddr string) (string, error) {
+	if len(outputs) == 0 {
+		return "", fmt.Errorf("no outputs provided")
 	}
 
-	timer.RecordSuccess()
-	metrics.DogeConnectionStatus.Set(1)
-	return nil
+	outputJSON, err := json.Marshal(outputs)
+	if err != nil {
+		return "", fmt.Errorf("marshal outputs: %w", err)
+	}
+
+	rawCreate, err := c.client.RawRequest("createrawtransaction", []json.RawMessage{
+		json.RawMessage("[]"), // empty inputs, wallet will fund
+		json.RawMessage(outputJSON),
+	})
+	if err != nil {
+		return "", fmt.Errorf("createrawtransaction rpc: %w", err)
+	}
+
+	var unsignedHex string
+	if err := json.Unmarshal(rawCreate, &unsignedHex); err != nil {
+		return "", fmt.Errorf("unmarshal create tx: %w", err)
+	}
+
+	options := map[string]any{
+		"changeAddress": changeAddr,
+	}
+	optJSON, _ := json.Marshal(options)
+
+	rawFund, err := c.client.RawRequest("fundrawtransaction", []json.RawMessage{
+		json.RawMessage(fmt.Sprintf("%q", unsignedHex)),
+		json.RawMessage(optJSON),
+	})
+	if err != nil {
+		return "", fmt.Errorf("fundrawtransaction rpc: %w", err)
+	}
+
+	var fundResp struct {
+		Hex    string  `json:"hex"`
+		Fee    float64 `json:"fee"`
+		ChgPos int     `json:"changepos"`
+	}
+	if err := json.Unmarshal(rawFund, &fundResp); err != nil {
+		return "", fmt.Errorf("unmarshal fund tx: %w", err)
+	}
+
+	return fundResp.Hex, nil
+}
+
+func (c *DogeClient) CreateRawTransaction(inputs []TransactionInput, outputs map[string]json.RawMessage) (string, error) {
+	if len(outputs) == 0 {
+		return "", fmt.Errorf("no outputs provided")
+	}
+	inputJSON, err := json.Marshal(inputs)
+	if err != nil {
+		return "", fmt.Errorf("marshal inputs: %w", err)
+	}
+	outputJSON, err := json.Marshal(outputs)
+	if err != nil {
+		return "", fmt.Errorf("marshal outputs: %w", err)
+	}
+	rawCreate, err := c.client.RawRequest("createrawtransaction", []json.RawMessage{
+		json.RawMessage(inputJSON),
+		json.RawMessage(outputJSON),
+	})
+	if err != nil {
+		return "", fmt.Errorf("createrawtransaction rpc: %w", err)
+	}
+	var unsignedHex string
+	if err := json.Unmarshal(rawCreate, &unsignedHex); err != nil {
+		return "", fmt.Errorf("unmarshal create tx: %w", err)
+	}
+	return unsignedHex, nil
+}
+
+// SignRawTransaction signs a raw transaction using the node wallet.
+func (c *DogeClient) SignRawTransaction(rawHex string) (string, error) {
+	// Decode the hex string into a wire.MsgTx
+	decoded, err := hex.DecodeString(strings.TrimSpace(rawHex))
+	if err != nil {
+		return "", fmt.Errorf("decode raw tx hex: %w", err)
+	}
+	var tx wire.MsgTx
+	if err := tx.Deserialize(bytes.NewReader(decoded)); err != nil {
+		return "", fmt.Errorf("deserialize raw tx: %w", err)
+	}
+
+	// Sign using the library's built-in method
+	signedTx, complete, err := c.client.SignRawTransactionWithWallet(&tx)
+	if err != nil {
+		return "", fmt.Errorf("sign raw transaction with wallet: %w", err)
+	}
+	if !complete {
+		return "", fmt.Errorf("transaction signing incomplete")
+	}
+
+	// Serialize back to hex
+	var buf bytes.Buffer
+	if err := signedTx.Serialize(&buf); err != nil {
+		return "", fmt.Errorf("serialize signed tx: %w", err)
+	}
+	return hex.EncodeToString(buf.Bytes()), nil
+}
+
+// ErrEmptyRPCResponse indicates the RPC returned an empty or null response
+var ErrEmptyRPCResponse = fmt.Errorf("empty RPC response")
+
+// SendRawTransaction broadcasts the given raw tx hex.
+// Returns ErrTxAlreadyInChain if the transaction is already confirmed in the blockchain.
+// Returns ErrEmptyRPCResponse if the RPC returns empty or null response (transient API issue).
+func (c *DogeClient) SendRawTransaction(rawHex string) (string, error) {
+	rawSend, err := c.client.RawRequest("sendrawtransaction", []json.RawMessage{
+		json.RawMessage(fmt.Sprintf("%q", rawHex)),
+	})
+	if err != nil {
+		errStr := err.Error()
+		// Handle "transaction already in block chain" error
+		if strings.Contains(errStr, "already in block chain") || strings.Contains(errStr, "Transaction already in the mempool") {
+			return "", ErrTxAlreadyInChain
+		}
+		return "", fmt.Errorf("sendrawtransaction rpc: %w", err)
+	}
+
+	// Handle empty response (transient API issue, especially with Tatum)
+	if len(rawSend) == 0 || string(rawSend) == "null" || string(rawSend) == "" {
+		c.logger.Warn("sendrawtransaction returned empty response, this is a transient API issue")
+		return "", ErrEmptyRPCResponse
+	}
+
+	var txid string
+	if err := json.Unmarshal(rawSend, &txid); err != nil {
+		// Check if this is due to empty/malformed response
+		if strings.Contains(err.Error(), "unexpected end of JSON input") {
+			c.logger.Warnf("sendrawtransaction response unmarshal failed (empty response): %s", string(rawSend))
+			return "", ErrEmptyRPCResponse
+		}
+		return "", fmt.Errorf("unmarshal send tx: %w", err)
+	}
+	return txid, nil
+}
+
+// GetRawTransactionHex fetches raw tx hex and confirmations (verbose) for the given txid.
+// Returns ErrTxNotFound if the transaction is not found in mempool or blockchain.
+func (c *DogeClient) GetRawTransactionHex(txid string) (string, int64, error) {
+	rawGet, err := c.client.RawRequest("getrawtransaction", []json.RawMessage{
+		json.RawMessage(fmt.Sprintf("%q", txid)),
+		json.RawMessage("true"),
+	})
+	if err != nil {
+		errStr := err.Error()
+		// Handle "No such mempool or blockchain transaction" error
+		if strings.Contains(errStr, "No such mempool") || strings.Contains(errStr, "No information available") {
+			return "", 0, ErrTxNotFound
+		}
+		return "", 0, fmt.Errorf("getrawtransaction rpc: %w", err)
+	}
+	// Handle empty response (tx not found in some RPC implementations)
+	if len(rawGet) == 0 || string(rawGet) == "null" {
+		return "", 0, ErrTxNotFound
+	}
+	var resp struct {
+		Hex           string  `json:"hex"`
+		Confirmations float64 `json:"confirmations"`
+	}
+	if err := json.Unmarshal(rawGet, &resp); err != nil {
+		// Empty JSON or malformed response likely means tx not found
+		if strings.Contains(err.Error(), "unexpected end of JSON input") || strings.Contains(err.Error(), "cannot unmarshal") {
+			return "", 0, ErrTxNotFound
+		}
+		return "", 0, fmt.Errorf("unmarshal getrawtransaction: %w", err)
+	}
+	return resp.Hex, int64(resp.Confirmations), nil
+}
+
+// DecodeRawTransaction decodes a hex-encoded tx into wire.MsgTx.
+func (c *DogeClient) DecodeRawTransaction(rawHex string) (*wire.MsgTx, error) {
+	decoded, err := hex.DecodeString(strings.TrimSpace(rawHex))
+	if err != nil {
+		return nil, fmt.Errorf("decode raw tx hex: %w", err)
+	}
+	var msg wire.MsgTx
+	if err := msg.Deserialize(bytes.NewReader(decoded)); err != nil {
+		return nil, fmt.Errorf("deserialize raw tx: %w", err)
+	}
+	return &msg, nil
 }

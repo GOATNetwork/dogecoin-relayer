@@ -1,16 +1,22 @@
 package consensus
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
 	"reflect"
 	"strings"
+	"time"
 
+	"github.com/dogecoinw/doged/btcutil"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
+	"github.com/goat-network/dogecoin-relayer/internal/p2p"
+	"github.com/goat-network/dogecoin-relayer/internal/wallet"
 	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
 	"github.com/goat-network/dogecoin-relayer/pkg/global"
+	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
 	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
@@ -118,9 +124,9 @@ func (eh *EventHandler) processBridgeIn(event BlockchainEvent) error {
 	txId := fmt.Sprintf("%x", txIdBytes)
 
 	logger.Infof("Processing BridgeIn for Dogecoin txId=%s", txId)
-	
-	// Use repository's transaction wrapper for automatic rollback on error
-	return eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+
+	// Use repository's transaction wrapper with automatic retry on database lock errors
+	return eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
 		var matchingDeposits []models.Deposit
 		if err := tx.Where("tx_id = ?", txId).Find(&matchingDeposits).Error; err != nil {
 			return fmt.Errorf("query deposits by tx_id failed: %w", err)
@@ -137,7 +143,17 @@ func (eh *EventHandler) processBridgeIn(event BlockchainEvent) error {
 		if err := eh.eventRepo.UpdateDepositStatus(tx, dep.ID, "confirmed"); err != nil {
 			return fmt.Errorf("failed updating deposit status: %w", err)
 		}
-		
+
+		// Only update to processed if not already in a higher state (pending/spent)
+		if err := tx.Model(&models.UTXO{}).
+			Where("txid = ? AND out_index = ? AND status NOT IN (?, ?)",
+				dep.TxId, dep.Vout,
+				models.UTXO_STATUS_PENDING, models.UTXO_STATUS_SPENT).
+			Update("status", models.UTXO_STATUS_PROCESSED).Error; err != nil {
+			return fmt.Errorf("failed updating UTXO status: %w", err)
+		}
+		logger.Infof("Updated UTXO %s:%d status to processed (if not already pending/spent)", dep.TxId, dep.Vout)
+
 		// Also set EVM fields
 		dep.EvmTxHash = event.TxHash.Hex()
 		dep.EvmBlock = event.BlockNumber
@@ -149,7 +165,7 @@ func (eh *EventHandler) processBridgeIn(event BlockchainEvent) error {
 		}).Error; err != nil {
 			return fmt.Errorf("failed updating deposit EVM fields: %w", err)
 		}
-		
+
 		logger.Infof("Updated deposit %d for txId=%s to confirmed with EVM fields", dep.ID, txIdHex)
 		return nil
 	})
@@ -173,15 +189,50 @@ func (eh *EventHandler) processBridgeOutProposed(event BlockchainEvent) error {
 		return fmt.Errorf("failed to parse BridgeOutProposed.taskId: %w", err)
 	}
 
-	// Create withdrawal record with retry transaction
-	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
-		withdrawal := &models.Withdrawal{
-			ReqTaskId:   taskId,
-			ReqTxHash:   event.TxHash.Hex(),
-			ReqBlock:    event.BlockNumber,
-			ReqLogIndex: event.LogIndex,
-			Status:      "init", // Initial status when BridgeOutProposed is detected
+	// Optional fields: destination amount/address for Dogecoin withdrawal
+	var destAmountStr string
+	if rawAmt, ok := event.EventData["destAmount"]; ok {
+		if amtStr, err := toUint256String(rawAmt); err == nil {
+			destAmountStr = amtStr
+		} else {
+			logger.Warnf("Failed to parse destAmount for task %s: %v", taskId, err)
 		}
+	}
+	destDogeAddr, err := parseDestDogecoinAddress(event.EventData["destDogecoinAddress"])
+	if err != nil {
+		logger.Warnf("Failed to parse destDogecoinAddress for task %s: %v", taskId, err)
+	}
+
+	withdrawal := &models.Withdrawal{
+		ReqTaskId:   taskId,
+		ReqTxHash:   event.TxHash.Hex(),
+		ReqBlock:    event.BlockNumber,
+		ReqLogIndex: event.LogIndex,
+		Status:      models.WITHDRAW_STATUS_CREATE,
+		DestAmount:  destAmountStr,
+		DestAddress: destDogeAddr,
+	}
+
+	// Check if withdrawal already exists and is in progress
+	// Don't overwrite withdrawals that have already started processing
+	existing, findErr := eh.eventRepo.GetWithdrawalByTask(nil, taskId)
+	if findErr == nil && existing != nil {
+		// Withdrawal exists - check if it's already being processed
+		status := existing.Status
+		if status == models.WITHDRAW_STATUS_INIT ||
+			status == models.WITHDRAW_STATUS_PENDING ||
+			status == models.WITHDRAW_STATUS_CONFIRMED ||
+			status == models.WITHDRAW_STATUS_PROCESSED {
+			// Don't overwrite - withdrawal is already in progress
+			logger.Infof("Withdrawal taskId=%s already exists with status=%s, skipping update", taskId, status)
+			eh.eventBus.Publish(eventbus.EventBridgeOutProposed, event)
+			return nil
+		}
+		// Only update if status is CREATE or AGGREGATING (early stages)
+		logger.Infof("Updating existing withdrawal taskId=%s (status=%s)", taskId, status)
+	}
+
+	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
 		return eh.eventRepo.CreateOrUpdateWithdrawal(tx, withdrawal)
 	})
 
@@ -190,6 +241,7 @@ func (eh *EventHandler) processBridgeOutProposed(event BlockchainEvent) error {
 	}
 
 	logger.Infof("Created/updated withdrawal record for taskId=%s", taskId)
+	eh.broadcastWithdrawalStatus(withdrawal)
 
 	// Publish to event bus for other modules (like UTXO processor)
 	eh.eventBus.Publish(eventbus.EventBridgeOutProposed, event)
@@ -213,8 +265,11 @@ func (eh *EventHandler) processBridgeOutFinished(event BlockchainEvent) error {
 		return fmt.Errorf("failed to parse BridgeOutFinished.taskIds: %w", err)
 	}
 
-	// Update withdrawal to final state using transaction wrapper
-	err = eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+	// Collect closed orders for broadcasting after transaction commits
+	var allClosedOrders []wallet.ClosedOrderInfo
+
+	// Update withdrawal to final state using transaction wrapper with retry on lock errors
+	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
 		for _, taskId := range taskIds {
 			if err := eh.eventRepo.SetWithdrawalFinishInfo(tx, taskId,
 				event.TxHash.Hex(), event.BlockNumber, event.LogIndex); err != nil {
@@ -225,10 +280,19 @@ func (eh *EventHandler) processBridgeOutFinished(event BlockchainEvent) error {
 			if err != nil {
 				return fmt.Errorf("failed to get withdrawal (taskId=%s): %w", taskId, err)
 			}
-			if err := eh.eventRepo.UpdateWithdrawalStatus(tx, withdrawal.ID, "confirmed"); err != nil {
+			if err := eh.eventRepo.UpdateWithdrawalStatus(tx, withdrawal.ID, models.WITHDRAW_STATUS_PROCESSED); err != nil {
 				return fmt.Errorf("failed to update withdrawal status (taskId=%s): %w", taskId, err)
 			}
-			logger.Infof("Updated withdrawal %s to confirmed state", taskId)
+			logger.Infof("Updated withdrawal %s to processed state", taskId)
+
+			// Close associated send_orders when withdrawal is processed
+			closedOrders, closeErr := wallet.CloseSendOrdersForWithdrawal(tx, taskId)
+			if closeErr != nil {
+				logger.Warnf("Failed to close send_orders for withdrawal %s: %v", taskId, closeErr)
+			} else if len(closedOrders) > 0 {
+				allClosedOrders = append(allClosedOrders, closedOrders...)
+				logger.Infof("Closed %d send_orders for withdrawal %s", len(closedOrders), taskId)
+			}
 		}
 		return nil
 	})
@@ -236,7 +300,21 @@ func (eh *EventHandler) processBridgeOutFinished(event BlockchainEvent) error {
 		return err
 	}
 
-	// Publish to event bus
+	// Broadcast withdrawal status updates
+	for _, taskId := range taskIds {
+		withdrawal, err := eh.eventRepo.GetWithdrawalByTask(nil, taskId)
+		if err != nil {
+			logger.Warnf("Failed to load withdrawal %s for status sync: %v", taskId, err)
+			continue
+		}
+		eh.broadcastWithdrawalStatus(withdrawal)
+	}
+
+	// Broadcast send_order status updates
+	for _, closedOrder := range allClosedOrders {
+		eh.broadcastSendOrderStatusUpdate(closedOrder.OrderId, closedOrder.Txid, closedOrder.OldStatus, "closed", "withdrawal_processed")
+	}
+
 	eh.eventBus.Publish(eventbus.EventBridgeOutFinished, event)
 	return nil
 }
@@ -315,7 +393,7 @@ func (eh *EventHandler) processAddProposerRequested(event BlockchainEvent) error
 	// Save pending state with serialized event data
 	payload, _ := json.Marshal(event.EventData)
 
-	err = eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
 		proposer := &models.Proposers{
 			Address:      proposerAddr,
 			Status:       "pending",
@@ -341,7 +419,7 @@ func (eh *EventHandler) processRemoveProposerRequested(event BlockchainEvent) er
 
 	payload, _ := json.Marshal(event.EventData)
 
-	err = eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
 		// keep status pending, store pending event, set exit block when confirmed later
 		proposer := &models.Proposers{
 			Address:      proposerAddr,
@@ -366,7 +444,7 @@ func (eh *EventHandler) processProposerConfirmed(event BlockchainEvent) error {
 	}
 
 	var finalStatus string
-	err = eh.eventRepo.WithTransaction(func(tx *gorm.DB) error {
+	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
 		rec, err := eh.eventRepo.GetProposer(tx, proposerAddr)
 		if err != nil {
 			return fmt.Errorf("failed to load proposer %s: %w", proposerAddr, err)
@@ -503,5 +581,114 @@ func readAddress(v any) (string, error) {
 		return t.Hex(), nil
 	default:
 		return "", fmt.Errorf("unsupported address type: %T", v)
+	}
+}
+
+// parseDestDogecoinAddress attempts to convert the bytes20 payload emitted in BridgeOutProposed
+// into a base58 Dogecoin address (P2PKH). Returns empty string when parsing fails.
+func parseDestDogecoinAddress(raw any) (string, error) {
+	if raw == nil {
+		return "", fmt.Errorf("nil dest dogecoin address")
+	}
+
+	var payload []byte
+	switch v := raw.(type) {
+	case []byte:
+		payload = v
+	case [20]byte:
+		payload = v[:]
+	case string:
+		// allow hex string input (with or without 0x)
+		s := strings.TrimPrefix(v, "0x")
+		if len(s) != 40 {
+			return "", fmt.Errorf("unexpected string length for dest doge address: %d", len(s))
+		}
+		bs, err := hex.DecodeString(s)
+		if err != nil {
+			return "", fmt.Errorf("decode dest address hex: %w", err)
+		}
+		payload = bs
+	default:
+		return "", fmt.Errorf("unsupported dest doge address type: %T", raw)
+	}
+
+	if len(payload) != 20 {
+		return "", fmt.Errorf("dest doge address payload size mismatch: %d", len(payload))
+	}
+
+	cfg := global.GetConfig()
+	network := types.GetDogeNetwork(cfg.Doge.NetworkType)
+	addr, err := btcutil.NewAddressPubKeyHash(payload, network)
+	if err != nil {
+		return "", fmt.Errorf("build doge address: %w", err)
+	}
+	return addr.EncodeAddress(), nil
+}
+
+func (eh *EventHandler) broadcastWithdrawalStatus(w *models.Withdrawal) {
+	p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
+	if !ok {
+		return
+	}
+	payload := types.WithdrawalStatusPayload{
+		ReqTaskId:      w.ReqTaskId,
+		Status:         w.Status,
+		ReqTxHash:      w.ReqTxHash,
+		ReqBlock:       w.ReqBlock,
+		ReqLogIndex:    w.ReqLogIndex,
+		DestAddress:    w.DestAddress,
+		DestAmount:     w.DestAmount,
+		TxId:           w.TxId,
+		ExternalId:     w.ExternalId,
+		Vout:           w.Vout,
+		TxBytes:        w.TxBytes,
+		UnsignedTx:     w.UnsignedTx,
+		FinishTxHash:   w.FinishTxHash,
+		FinishBlock:    w.FinishBlock,
+		FinishLogIndex: w.FinishLogIndex,
+		UpdatedAt:      time.Now().Unix(),
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		eh.logger.Warnf("Failed to marshal withdrawal status payload: %v", err)
+		return
+	}
+	msg := types.P2PBroadcastMessage{
+		Type:      types.P2PMessageTypeWithdrawalStatus,
+		SessionID: w.ReqTaskId,
+		Payload:   payloadBytes,
+	}
+	if err := p2pModule.(p2p.P2PSender).BroadcastP2PMessage(msg); err != nil {
+		eh.logger.Warnf("Failed to broadcast withdrawal status %s: %v", w.ReqTaskId, err)
+	}
+}
+
+func (eh *EventHandler) broadcastSendOrderStatusUpdate(orderId, txid, oldStatus, newStatus, reason string) {
+	p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
+	if !ok {
+		return
+	}
+	payload := types.SendOrderStatusUpdatePayload{
+		OrderId:   orderId,
+		Txid:      txid,
+		OldStatus: oldStatus,
+		NewStatus: newStatus,
+		Reason:    reason,
+		UpdatedAt: time.Now().Unix(),
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		eh.logger.Warnf("Failed to marshal send_order status update payload: %v", err)
+		return
+	}
+	msg := types.P2PBroadcastMessage{
+		Type:      types.P2PMessageTypeSendOrderStatusUpdate,
+		SessionID: orderId,
+		Payload:   payloadBytes,
+	}
+	if err := p2pModule.(p2p.P2PSender).BroadcastP2PMessage(msg); err != nil {
+		eh.logger.Warnf("Failed to broadcast send_order status update %s: %v", orderId, err)
+	} else {
+		eh.logger.Debugf("Broadcast send_order %s status: %s → %s (reason: %s)", orderId, oldStatus, newStatus, reason)
 	}
 }

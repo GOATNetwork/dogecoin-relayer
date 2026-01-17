@@ -14,7 +14,14 @@ import (
 type BridgeTransaction struct {
 	DestEvmAddress common.Address
 	Amount         *big.Int
+	Txout          uint32
 	TxBytes        []byte
+}
+
+// BridgeOutTransaction matches IDogechain.BridgeOutTransaction
+type BridgeOutTransaction struct {
+	Amount  *big.Int
+	TxBytes []byte
 }
 
 // NewEntryPoint creates a new instance of an EntryPoint contract
@@ -89,6 +96,7 @@ func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction) 
 	bridgeTransactionArrayType, err := abi.NewType("tuple[]", "struct BridgeTransaction[]", []abi.ArgumentMarshaling{
 		{Name: "destEvmAddress", Type: "address"},
 		{Name: "amount", Type: "uint256"},
+		{Name: "txout", Type: "uint32"},
 		{Name: "txBytes", Type: "bytes"},
 	})
 	if err != nil {
@@ -99,6 +107,7 @@ func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction) 
 	bridgeTransactionStructs := make([]struct {
 		DestEvmAddress common.Address
 		Amount         *big.Int
+		Txout          uint32
 		TxBytes        []byte
 	}, len(bridgeTxs))
 
@@ -106,10 +115,12 @@ func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction) 
 		bridgeTransactionStructs[i] = struct {
 			DestEvmAddress common.Address
 			Amount         *big.Int
+			Txout          uint32
 			TxBytes        []byte
 		}{
 			DestEvmAddress: bridgeTx.DestEvmAddress,
 			Amount:         bridgeTx.Amount,
+			Txout:          bridgeTx.Txout,
 			TxBytes:        bridgeTx.TxBytes,
 		}
 	}
@@ -126,7 +137,7 @@ func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction) 
 	}
 
 	// Get the function selector for bridgeIn
-	bridgeInSelector := crypto.Keccak256([]byte("bridgeIn((address,uint256,bytes)[])"))[:4]
+	bridgeInSelector := crypto.Keccak256([]byte("bridgeIn((address,uint256,uint32,bytes)[])"))[:4]
 
 	// Combine function selector with calldata
 	txData := append(bridgeInSelector, calldata...)
@@ -134,56 +145,42 @@ func (contract *Contract) GenerateBridgeInTxData(bridgeTxs []BridgeTransaction) 
 	return txData, nil
 }
 
-func (contract *Contract) GenerateBridgeOutFinishTxData(batchId *big.Int, bridgeTx BridgeTransaction, taskIds []*big.Int) ([]byte, error) {
-	// The bridgeOutFinish function expects: bridgeOutFinish(uint256 batchId, IDogechain.BridgeTransaction memory bridgeTx, uint256[] memory taskIds)
+func (contract *Contract) GenerateBridgeOutFinishTxData(bridgeTx BridgeOutTransaction, taskIds []*big.Int) ([]byte, error) {
+	// The bridgeOutFinish function expects: bridgeOutFinish(IDogechain.BridgeOutTransaction memory bridgeTx, uint256[] memory taskIds)
 
-	// Create the tuple type for BridgeTransaction struct
-	bridgeTransactionType, err := abi.NewType("tuple", "struct BridgeTransaction", []abi.ArgumentMarshaling{
-		{Name: "destEvmAddress", Type: "address"},
+	bridgeOutType, err := abi.NewType("tuple", "struct BridgeOutTransaction", []abi.ArgumentMarshaling{
 		{Name: "amount", Type: "uint256"},
 		{Name: "txBytes", Type: "bytes"},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create BridgeTransaction type: %w", err)
+		return nil, fmt.Errorf("failed to create BridgeOutTransaction type: %w", err)
 	}
 
-	// Create the uint256 array type for taskIds
 	uint256ArrayType, err := abi.NewType("uint256[]", "", nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create uint256[] type: %w", err)
 	}
 
-	// Convert Go struct to ABI-compatible format
-	bridgeTransactionStruct := struct {
-		DestEvmAddress common.Address
-		Amount         *big.Int
-		TxBytes        []byte
+	bridgeOutStruct := struct {
+		Amount  *big.Int
+		TxBytes []byte
 	}{
-		DestEvmAddress: bridgeTx.DestEvmAddress,
-		Amount:         bridgeTx.Amount,
-		TxBytes:        bridgeTx.TxBytes,
+		Amount:  bridgeTx.Amount,
+		TxBytes: bridgeTx.TxBytes,
 	}
 
-	// Create arguments for the bridgeOutFinish function
 	arguments := abi.Arguments{
-		{Type: Uint256Type, Name: "batchId"},
-		{Type: bridgeTransactionType, Name: "bridgeTx"},
+		{Type: bridgeOutType, Name: "bridgeTx"},
 		{Type: uint256ArrayType, Name: "taskIds"},
 	}
 
-	// Pack the arguments
-	calldata, err := arguments.Pack(batchId, bridgeTransactionStruct, taskIds)
+	calldata, err := arguments.Pack(bridgeOutStruct, taskIds)
 	if err != nil {
 		return nil, fmt.Errorf("failed to pack bridgeOutFinish arguments: %w", err)
 	}
 
-	// Get the function selector for bridgeOutFinish
-	bridgeOutFinishSelector := crypto.Keccak256([]byte("bridgeOutFinish(uint256,(address,uint256,bytes),uint256[])"))[:4]
-
-	// Combine function selector with calldata
-	txData := append(bridgeOutFinishSelector, calldata...)
-
-	return txData, nil
+	bridgeOutFinishSelector := crypto.Keccak256([]byte("bridgeOutFinish((uint256,bytes),uint256[])"))[:4]
+	return append(bridgeOutFinishSelector, calldata...), nil
 }
 
 // GenerateVerifyAndCallTxData generates the complete transaction data with signature

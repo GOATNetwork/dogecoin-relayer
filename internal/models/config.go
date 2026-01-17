@@ -75,7 +75,8 @@ func (conn *DBConnection) initDB(sqliteCfg *config.SqliteConfig, gormCfg *config
 	gLogger := gormlogger.Default.LogMode(logMode)
 
 	// Configure SQLite with optimized settings for concurrent access
-	dsn := dbPath + "?cache=shared&mode=rwc&_journal_mode=WAL&_synchronous=NORMAL&_timeout=5000&_busy_timeout=5000"
+	// Increase timeout to 30s to avoid "database is locked" errors during heavy contention
+	dsn := dbPath + "?cache=shared&mode=rwc&_journal_mode=WAL&_synchronous=NORMAL&_timeout=30000&_busy_timeout=30000"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: gLogger})
 	if err != nil {
 		// If open fails due to corruption, try recovery
@@ -97,7 +98,7 @@ func (conn *DBConnection) initDB(sqliteCfg *config.SqliteConfig, gormCfg *config
 	db.Exec("PRAGMA cache_size=10000")
 	db.Exec("PRAGMA temp_store=memory")
 	db.Exec("PRAGMA mmap_size=268435456") // 256MB
-	db.Exec("PRAGMA busy_timeout=5000")
+	db.Exec("PRAGMA busy_timeout=30000")
 	db.Exec("PRAGMA wal_autocheckpoint=1000") // Checkpoint every 1000 pages
 
 	// Run integrity check after opening

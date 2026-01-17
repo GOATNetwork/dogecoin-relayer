@@ -18,6 +18,7 @@ import (
 	// import modules
 	_ "github.com/goat-network/dogecoin-relayer/internal/consensus"
 	_ "github.com/goat-network/dogecoin-relayer/internal/doge"
+	_ "github.com/goat-network/dogecoin-relayer/internal/grpc"
 	_ "github.com/goat-network/dogecoin-relayer/internal/http"
 	_ "github.com/goat-network/dogecoin-relayer/internal/p2p"
 	_ "github.com/goat-network/dogecoin-relayer/internal/tss"
@@ -73,6 +74,9 @@ func Run() {
 	if cfg.Consensus.Enabled {
 		enabledModules = append(enabledModules, "consensus")
 	}
+	if cfg.Grpc.Enabled {
+		enabledModules = append(enabledModules, "grpc")
+	}
 
 	log.Infof("Enabled modules: %v", enabledModules)
 
@@ -107,6 +111,8 @@ func Run() {
 			moduleConfig = cfg.Consensus
 		case "tss":
 			moduleConfig = cfg.Tss
+		case "grpc":
+			moduleConfig = cfg.Grpc
 		default:
 			log.Fatalf("Module %s not found, skipping...", moduleName)
 			continue

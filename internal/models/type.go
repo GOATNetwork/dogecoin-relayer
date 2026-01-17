@@ -16,18 +16,18 @@ type MigrateLog struct {
 }
 
 type Deposit struct {
-    gorm.Model `swaggerignore:"true"`
+	gorm.Model `swaggerignore:"true"`
 
-    TxId        string `gorm:"type:varchar(66);not null;index" json:"txid"`
-    Vout        int    `gorm:"type:int;not null" json:"vout"`
-    Address     string `gorm:"type:varchar(60)" json:"address"`
-    EvmAddr     string `gorm:"type:varchar(255)" json:"evm_addr"`
-    Amount      int64  `gorm:"type:bigint" json:"amount"`
-    TxBytes     []byte `gorm:"type:blob" json:"tx_bytes"`
-    Status      string `gorm:"type:varchar(20)" json:"status"`
-    EvmTxHash   string `gorm:"type:varchar(66)" json:"evm_tx_hash"`
-    EvmBlock    uint64 `gorm:"type:bigint" json:"evm_block"`
-    EvmLogIndex uint   `gorm:"type:int" json:"evm_log_index"`
+	TxId        string `gorm:"type:varchar(66);not null;index" json:"txid"`
+	Vout        int    `gorm:"type:int;not null" json:"vout"`
+	Address     string `gorm:"type:varchar(60)" json:"address"`
+	EvmAddr     string `gorm:"type:varchar(255)" json:"evm_addr"`
+	Amount      int64  `gorm:"type:bigint" json:"amount"`
+	TxBytes     []byte `gorm:"type:blob" json:"tx_bytes"`
+	Status      string `gorm:"type:varchar(20)" json:"status"`
+	EvmTxHash   string `gorm:"type:varchar(66)" json:"evm_tx_hash"`
+	EvmBlock    uint64 `gorm:"type:bigint" json:"evm_block"`
+	EvmLogIndex uint   `gorm:"type:int" json:"evm_log_index"`
 }
 
 type Withdrawal struct {
@@ -38,9 +38,13 @@ type Withdrawal struct {
 	ReqBlock       uint64 `gorm:"type:bigint" json:"req_block"`
 	ReqLogIndex    uint   `gorm:"type:int" json:"req_log_index"`
 	Status         string `gorm:"type:varchar(20)" json:"status"`
+	DestAddress    string `gorm:"type:varchar(100)" json:"dest_address"`
+	DestAmount     string `gorm:"type:varchar(80)" json:"dest_amount"`
 	TxId           string `gorm:"type:varchar(66)" json:"txid"`
+	ExternalId     string `gorm:"type:varchar(255)" json:"external_id"`
 	Vout           int    `gorm:"type:int" json:"vout"`
 	TxBytes        []byte `gorm:"type:blob" json:"tx_bytes"`
+	UnsignedTx     []byte `gorm:"type:blob" json:"unsigned_tx"`
 	FinishTxHash   string `gorm:"type:varchar(66)" json:"finish_tx_hash"`
 	FinishBlock    uint64 `gorm:"type:bigint" json:"finish_block"`
 	FinishLogIndex uint   `gorm:"type:int" json:"finish_log_index"`
@@ -66,11 +70,20 @@ type EventScanState struct {
 	IsActive           bool      `gorm:"default:true" json:"is_active"`
 }
 
+// UTXOScanState tracks the scanning progress for Doge UTXO scanning
+type UTXOScanState struct {
+	gorm.Model `swaggerignore:"true"`
+
+	LastScannedBlock uint64    `gorm:"type:bigint;not null;default:0" json:"last_scanned_block"`
+	LastScannedAt    time.Time `gorm:"type:timestamp" json:"last_scanned_at,omitempty"`
+	IsActive         bool      `gorm:"default:true" json:"is_active"`
+}
+
 // UTXO represents an unspent transaction output
 type UTXO struct {
 	gorm.Model `swaggerignore:"true"`
 
-	Uid           string    `gorm:"primaryKey;type:varchar(255)" json:"uid"`
+	Uid           string    `gorm:"uniqueIndex:idx_utxo_uid;type:varchar(255)" json:"uid"`
 	Txid          string    `gorm:"index;type:varchar(255)" json:"txid"`
 	PkScript      []byte    `gorm:"type:blob" json:"pk_script"`
 	OutIndex      int       `gorm:"index" json:"out_index"`
@@ -144,7 +157,9 @@ const (
 const (
 	UTXO_STATUS_UNCONFIRMED = "unconfirmed"
 	UTXO_STATUS_CONFIRMED   = "confirmed"
-	UTXO_STATUS_SPENT       = "spent"
+	UTXO_STATUS_PROCESSED   = "processed"
+	UTXO_STATUS_PENDING     = "pending" // Selected for withdrawal, waiting for signature/broadcast
+	UTXO_STATUS_SPENT       = "spent"   // Transaction broadcasted to Dogecoin network
 )
 
 // Constants for wallet types
@@ -160,4 +175,54 @@ const (
 	ORDER_TYPE_WITHDRAWAL    = "withdrawal"
 	ORDER_TYPE_CONSOLIDATION = "consolidation"
 	ORDER_TYPE_SAFEBOX       = "safebox"
+)
+
+const (
+	WITHDRAW_STATUS_CREATE      = "create"
+	WITHDRAW_STATUS_AGGREGATING = "aggregating"
+	WITHDRAW_STATUS_INIT        = "init"
+	WITHDRAW_STATUS_PENDING     = "pending"
+	WITHDRAW_STATUS_CONFIRMED   = "confirmed"
+	WITHDRAW_STATUS_PROCESSED   = "processed"
+)
+
+// Constants for send order status
+const (
+	ORDER_STATUS_AGGREGATING = "aggregating"
+	ORDER_STATUS_INIT        = "init"
+	ORDER_STATUS_PENDING     = "pending"
+	ORDER_STATUS_CONFIRMED   = "confirmed"
+	ORDER_STATUS_PROCESSED   = "processed"
+	ORDER_STATUS_CLOSED      = "closed"
+)
+
+// PendingBatch represents a batch waiting for TSS signature
+type PendingBatch struct {
+	gorm.Model `swaggerignore:"true"`
+
+	BaseSessionID string    `gorm:"uniqueIndex:idx_pending_batch_base_session;type:varchar(255);not null" json:"base_session_id"`
+	BatchType     string    `gorm:"type:varchar(20);not null" json:"batch_type"` // "deposit" or "withdrawal"
+	CallData      []byte    `gorm:"type:blob" json:"calldata"`
+	TssNonce      string    `gorm:"type:varchar(80)" json:"tss_nonce"`
+	NextAttempt   int       `gorm:"type:int;default:0" json:"next_attempt"`
+	LastAttempt   time.Time `gorm:"type:timestamp" json:"last_attempt"`
+	NextRetryAt   time.Time `gorm:"type:timestamp" json:"next_retry_at"`
+	Status        string    `gorm:"type:varchar(20);default:'pending'" json:"status"` // "pending", "completed", "failed"
+
+	// Deposit-specific fields (nullable)
+	BatchID     string `gorm:"type:varchar(80)" json:"batch_id,omitempty"`
+	TotalAmount string `gorm:"type:varchar(80)" json:"total_amount,omitempty"`
+
+	// Withdrawal-specific fields (nullable)
+	WithdrawalID string `gorm:"type:varchar(255)" json:"withdrawal_id,omitempty"`
+	TaskIdsJSON  string `gorm:"type:text" json:"task_ids_json,omitempty"`
+	TxId         string `gorm:"type:varchar(66)" json:"txid,omitempty"`
+	UtxosJSON    string `gorm:"type:text" json:"utxos_json,omitempty"`
+}
+
+// Constants for pending batch status
+const (
+	PENDING_BATCH_STATUS_PENDING   = "pending"
+	PENDING_BATCH_STATUS_COMPLETED = "completed"
+	PENDING_BATCH_STATUS_FAILED    = "failed"
 )

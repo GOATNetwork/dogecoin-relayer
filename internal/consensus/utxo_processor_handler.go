@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"strconv"
@@ -152,24 +153,39 @@ func (up *UtxoProcessor) handleTssSignature(data any) {
 		}
 
 		up.logger.Infof("TSS signature successful for session %s", resp.SessionID)
-		// Remove from pending batches on success
-		up.pendingBatches.Delete(key)
-		up.tssSessionAliases.Delete(resp.SessionID)
+		up.logger.Infof("TSS signature successful for session %s", resp.SessionID)
 
 		up.logger.Debugf("verifyAndCall target: %s", up.bridgeContract.Hex())
 		up.logger.Debugf("verifyAndCall calldata: %x", pending.calldata)
 		up.logger.Debugf("verifyAndCall digest: %x", resp.RawSig)
 
-		// Continue with transaction submission
+		// Only delete from pending batches AFTER successful transaction submission
 		err = up.completeBatchWithSignature(pending, resp.RawSig)
 		if err != nil {
 			up.logger.Errorf("Failed to complete batch with signature: %v", err)
+			return
 		}
+
+		// Remove from pending batches on success
+		up.pendingBatches.Delete(key)
+		up.tssSessionAliases.Delete(resp.SessionID)
 	} else {
 		up.logger.Errorf("TSS signing failed for session %s: %s", resp.SessionID, resp.Message)
 
-		// For timeout errors, keep the batch for retry; for other errors, remove it
+		isTransient := false
+
 		if strings.Contains(resp.Message, "timeout") || strings.Contains(resp.Message, "timed out") {
+			isTransient = true
+		}
+
+		if strings.Contains(resp.Message, "403") || strings.Contains(resp.Message, "Forbidden") {
+			isTransient = true
+		}
+		if strings.Contains(resp.Message, "503") || strings.Contains(resp.Message, "Service Unavailable") {
+			isTransient = true
+		}
+
+		if isTransient {
 			now := time.Now()
 			retryDelay := up.tssRequestRetryBackoff
 			if retryDelay <= 0 {
@@ -178,11 +194,15 @@ func (up *UtxoProcessor) handleTssSignature(data any) {
 			pending.lastAttempt = now
 			pending.nextRetryAt = now.Add(retryDelay)
 			up.pendingBatches.Store(key, pending)
-			up.logger.Infof("Keeping batch %s for retry due to timeout", resp.SessionID)
+
+			if err := up.updatePendingBatchInDB(pending); err != nil {
+				up.logger.Warnf("Failed to update pending batch %s in database after transient error (continuing anyway): %v", key, err)
+			}
+
+			up.logger.Infof("Keeping batch %s for retry due to transient error: %s", resp.SessionID, resp.Message)
 		} else {
-			// Remove from pending batches for non-timeout errors
 			up.pendingBatches.Delete(key)
-			up.logger.Infof("Removed batch %s due to non-timeout error", baseSessionID)
+			up.logger.Infof("Removed batch %s due to fatal error: %s", baseSessionID, resp.Message)
 		}
 		up.tssSessionAliases.Delete(resp.SessionID)
 
@@ -239,7 +259,7 @@ func stripRetrySuffix(sessionID string) (string, bool) {
 
 func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage) error {
 	proposal := &DepositProposal{}
-	err := proposal.UnmarshalJSON(msg.Payload)
+	err := json.Unmarshal(msg.Payload, proposal)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal proposal: %v", err)
 	}
@@ -280,11 +300,15 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 		if err := up.conn.GetDB().Where("tx_id = ? AND vout = ?", utxo.Txid, utxo.OutIndex).First(&dep).Error; err == nil && len(dep.TxBytes) > 0 {
 			txBytes = dep.TxBytes
 		} else {
-			up.logger.Warnf("Deposit tx bytes missing for %s:%d, falling back to txid bytes", utxo.Txid, utxo.OutIndex)
+			up.logger.Warnf("Deposit tx bytes missing for %s:%d - cannot process without raw transaction bytes", utxo.Txid, utxo.OutIndex)
+			return fmt.Errorf("deposit tx bytes missing for %s:%d", utxo.Txid, utxo.OutIndex)
 		}
+		// Convert satoshis (8 decimals) to ERC20 wei (18 decimals)
+		amountWei := new(big.Int).Mul(big.NewInt(utxo.Amount), big.NewInt(10000000000))
 		txParams[i] = contract.BridgeTransaction{
 			DestEvmAddress: common.HexToAddress(utxo.EvmAddr),
-			Amount:         big.NewInt(utxo.Amount),
+			Amount:         amountWei,
+			Txout:          uint32(utxo.OutIndex),
 			TxBytes:        txBytes,
 		}
 	}
@@ -337,6 +361,10 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 	up.registerExistingTssSession(pending, proposal.SessionID)
 	up.pendingBatches.Store(key, pending)
 
+	if err := up.persistPendingBatch(pending); err != nil {
+		up.logger.Warnf("Failed to persist pending batch %s from P2P proposal to database (continuing anyway): %v", key, err)
+	}
+
 	// Create hash to sign for verifyAndCall function
 	digest, baseHash, err := up.computeVerifyAndCallDigest(calldata, pending.tssNonce)
 	if err != nil {
@@ -365,7 +393,7 @@ func (up *UtxoProcessor) handleP2PDepositProposal(msg *types.P2PBroadcastMessage
 
 func (up *UtxoProcessor) handleP2PWithdrawalProposal(msg *types.P2PBroadcastMessage) error {
 	proposal := &WithdrawalProposal{}
-	err := proposal.UnmarshalJSON(msg.Payload)
+	err := json.Unmarshal(msg.Payload, proposal)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal withdrawal proposal: %v", err)
 	}
@@ -379,10 +407,17 @@ func (up *UtxoProcessor) handleP2PWithdrawalProposal(msg *types.P2PBroadcastMess
 
 	// Create pending request entry for tracking
 	request := &withdrawalRequest{
-		ID:          big.NewInt(0),     // Will be set based on request ID
-		UTXO:        proposal.UTXOs[0], // Single UTXO from proposal
+		ID:          big.NewInt(0), // Will be set based on request ID
 		TotalAmount: proposal.TotalAmount,
 		TaskIds:     proposal.TaskIds,
+		TxBytes:     proposal.TxBytes,
+		TxId:        proposal.TxId,
+	}
+	if len(proposal.UTXOs) > 0 {
+		request.UTXO = proposal.UTXOs[0]
+		if request.TxId == "" {
+			request.TxId = proposal.UTXOs[0].Txid
+		}
 	}
 
 	derivedID, err := deriveDeterministicIDFromSession(proposal.SessionID)
@@ -393,13 +428,17 @@ func (up *UtxoProcessor) handleP2PWithdrawalProposal(msg *types.P2PBroadcastMess
 	request.ID = derivedID
 	up.logger.Infof("Handler: derived withdrawal ID %s from session %s", request.ID.String(), proposal.SessionID)
 
-	calldata, err := up.generateBridgeOutFinishCalldata(request)
-	if err != nil {
-		return fmt.Errorf("failed to regenerate withdrawal calldata: %w", err)
-	}
-
-	if len(proposal.Calldata) > 0 && !bytes.Equal(proposal.Calldata, calldata) {
-		return fmt.Errorf("withdrawal proposal calldata mismatch for session %s", proposal.SessionID)
+	calldata := proposal.Calldata
+	if len(calldata) == 0 {
+		calldata, err = up.generateBridgeOutFinishCalldata(request)
+		if err != nil {
+			return fmt.Errorf("failed to regenerate withdrawal calldata: %w", err)
+		}
+	} else {
+		// Optional integrity check: regenerate when we have the data to ensure consistency
+		if regenerated, err := up.generateBridgeOutFinishCalldata(request); err == nil && !bytes.Equal(regenerated, calldata) {
+			return fmt.Errorf("withdrawal proposal calldata mismatch for session %s", proposal.SessionID)
+		}
 	}
 
 	baseSessionID := proposal.SessionID
@@ -427,6 +466,10 @@ func (up *UtxoProcessor) handleP2PWithdrawalProposal(msg *types.P2PBroadcastMess
 	pending.tssNonce = new(big.Int).Set(proposal.TssNonce)
 	up.registerExistingTssSession(pending, proposal.SessionID)
 	up.pendingBatches.Store(key, pending)
+
+	if err := up.persistPendingBatch(pending); err != nil {
+		up.logger.Warnf("Failed to persist pending withdrawal batch %s from P2P proposal to database (continuing anyway): %v", key, err)
+	}
 
 	// Create hash to sign for verifyAndCall function
 	digest, baseHash, err := up.computeVerifyAndCallDigest(calldata, pending.tssNonce)
@@ -481,7 +524,9 @@ func (up *UtxoProcessor) validateDepositProposal(proposal *DepositProposal) erro
 		if lightUTXO.Amount <= 0 {
 			return fmt.Errorf("UTXO amount must be positive")
 		}
-		calculatedTotal.Add(calculatedTotal, big.NewInt(lightUTXO.Amount))
+		// Convert satoshis (8 decimals) to ERC20 wei (18 decimals)
+		amountWei := new(big.Int).Mul(big.NewInt(lightUTXO.Amount), big.NewInt(10000000000))
+		calculatedTotal.Add(calculatedTotal, amountWei)
 	}
 
 	if calculatedTotal.Cmp(totalAmount) != 0 {
@@ -520,9 +565,6 @@ func (up *UtxoProcessor) validateWithdrawalProposal(proposal *WithdrawalProposal
 	if proposal.SessionID == "" {
 		return fmt.Errorf("session ID is required")
 	}
-	if len(proposal.UTXOs) == 0 {
-		return fmt.Errorf("UTXOs list cannot be empty")
-	}
 	if proposal.TotalAmount == nil || proposal.TotalAmount.Cmp(big.NewInt(0)) <= 0 {
 		return fmt.Errorf("total amount must be positive")
 	}
@@ -545,18 +587,22 @@ func (up *UtxoProcessor) validateWithdrawalProposal(proposal *WithdrawalProposal
 	}
 	proposal.TssNonce = tssNonce
 
-	// Calculate total amount from UTXOs and verify it matches proposal
-	calculatedTotal := big.NewInt(0)
-	for _, utxo := range proposal.UTXOs {
-		if utxo.Amount <= 0 {
-			return fmt.Errorf("UTXO amount must be positive")
+	// When UTXOs are provided, validate amounts; otherwise rely on calldata/tx bytes
+	if len(proposal.UTXOs) > 0 {
+		calculatedTotal := big.NewInt(0)
+		for _, utxo := range proposal.UTXOs {
+			if utxo.Amount <= 0 {
+				return fmt.Errorf("UTXO amount must be positive")
+			}
+			// Convert satoshis (8 decimals) to ERC20 wei (18 decimals)
+			amountWei := new(big.Int).Mul(big.NewInt(utxo.Amount), big.NewInt(10000000000))
+			calculatedTotal.Add(calculatedTotal, amountWei)
 		}
-		calculatedTotal.Add(calculatedTotal, big.NewInt(utxo.Amount))
-	}
 
-	if calculatedTotal.Cmp(proposal.TotalAmount) != 0 {
-		return fmt.Errorf("calculated total amount (%s) does not match proposal total amount (%s)",
-			calculatedTotal.String(), proposal.TotalAmount.String())
+		if calculatedTotal.Cmp(proposal.TotalAmount) != 0 {
+			return fmt.Errorf("calculated total amount (%s) does not match proposal total amount (%s)",
+				calculatedTotal.String(), proposal.TotalAmount.String())
+		}
 	}
 
 	// TODO: Add more sophisticated validation:
@@ -595,19 +641,37 @@ func (up *UtxoProcessor) completeBatchWithSignature(pending *pendingBatch, signa
 	// Send the calldata to the bridge contract
 	txHash, err := up.sendCalldataToBridge(pending.calldata, signature)
 	if err != nil {
+		// Check if the error is "Tx output already processed" - this means the deposit
+		// was already processed on-chain (likely by another node or a previous attempt).
+		// We just log and return nil - the EventHandler will update status when BridgeIn event is received.
+		if strings.Contains(err.Error(), "Tx output already processed") {
+			up.logger.Warnf("Tx output already processed on-chain for batch %s, EventHandler will update status via BridgeIn event", batchID)
+			return nil
+		}
 		return fmt.Errorf("failed to send calldata to bridge: %w", err)
 	}
 
 	up.logger.Infof("Bridge transaction sent successfully. TxHash: %s", txHash.Hex())
-
-	// Mark UTXOs as processed
-	err = up.markUTXOsAsProcessed(pending.utxos)
-	if err != nil {
-		up.logger.Errorf("Failed to mark UTXOs as processed: %v", err)
-		return err
-	}
+	// Status updates (UTXO and Deposit) will be handled by EventHandler when BridgeIn event is received
 
 	return nil
+}
+
+// updateDepositsToConfirmed updates the Deposit records status to 'confirmed' after successful on-chain processing
+func (up *UtxoProcessor) updateDepositsToConfirmed(utxos []*models.UTXO, evmTxHash string) {
+	for _, utxo := range utxos {
+		result := up.conn.GetDB().Model(&models.Deposit{}).
+			Where("tx_id = ? AND vout = ?", utxo.Txid, utxo.OutIndex).
+			Updates(map[string]interface{}{
+				"status":      "confirmed",
+				"evm_tx_hash": evmTxHash,
+			})
+		if result.Error != nil {
+			up.logger.Errorf("Failed to update deposit status for %s:%d: %v", utxo.Txid, utxo.OutIndex, result.Error)
+		} else if result.RowsAffected > 0 {
+			up.logger.Infof("Updated deposit %s:%d status to 'confirmed' with evm_tx_hash=%s", utxo.Txid, utxo.OutIndex, evmTxHash)
+		}
+	}
 }
 
 // sendCalldataToBridge sends the signed calldata to the bridge contract using the node's private key

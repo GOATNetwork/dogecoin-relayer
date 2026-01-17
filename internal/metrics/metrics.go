@@ -156,6 +156,18 @@ func RecordOperation(moduleName, operation, status string, duration time.Duratio
 	OperationDuration.WithLabelValues(moduleName, operation).Observe(duration.Seconds())
 }
 
+// RecordGRPCRequest records a gRPC request
+func RecordGRPCRequest(method, status string, isError bool) {
+	if !IsEnabled() {
+		return
+	}
+	operation := "grpc_" + method
+	if isError {
+		ErrorsTotal.WithLabelValues("rpc", operation).Inc()
+	}
+	OperationsTotal.WithLabelValues("rpc", operation, status).Inc()
+}
+
 // Timer helper for measuring operation duration
 type Timer struct {
 	start  time.Time

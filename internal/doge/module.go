@@ -2,6 +2,7 @@ package doge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -15,21 +16,34 @@ import (
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
 	"github.com/goat-network/dogecoin-relayer/pkg/types"
 	log "github.com/sirupsen/logrus"
+	"gorm.io/gorm"
 )
 
 type DogeModule struct {
-	cfg           config.DogeConfig
-	scanCfg       config.ScanConfig
-	conn          *models.DBConnection
-	logger        *log.Entry
-	client        *DogeClient
-	state         *models.StateRepository
-	eventRepo     *models.EventRepository
-	blockCh       chan *types.DogeBlockExt
-	currentHeight int64
+	cfg            config.DogeConfig
+	scanCfg        config.ScanConfig
+	conn           *models.DBConnection
+	logger         *log.Entry
+	client         *DogeClient
+	electrsClient  *ElectrsClient
+	state          *models.StateRepository
+	eventRepo      *models.EventRepository
+	utxoScanRepo   *models.UTXOScanStateRepository
+	blockCh        chan *types.DogeBlockExt
+	currentHeight  int64
 }
 
 var _ module.Module = (*DogeModule)(nil)
+
+// DogeClientProvider exposes the initialized Dogecoin RPC client.
+type DogeClientProvider interface {
+	DogeClient() *DogeClient
+}
+
+// DogeClient returns the initialized client instance for other modules.
+func (m *DogeModule) DogeClient() *DogeClient {
+	return m.client
+}
 
 type txProcessingResult struct {
 	txid            string
@@ -87,16 +101,27 @@ func (m *DogeModule) Init(cfg any, conn *models.DBConnection) error {
 	// Initialize event repository for deposit/withdrawal bookkeeping
 	m.eventRepo = models.NewEventRepository(conn.GetDB())
 
+	// Initialize UTXO scan state repository
+	m.utxoScanRepo = models.NewUTXOScanStateRepository(conn.GetDB())
+
 	// Initialize block channel
 	m.blockCh = make(chan *types.DogeBlockExt, 100)
-
-	// Set current height from config
-	m.currentHeight = int64(m.cfg.StartHeight)
 
 	// Set scan config from global config
 	globalCfg := global.GetConfig()
 	if globalCfg != nil {
 		m.scanCfg = globalCfg.Scan
+	}
+
+	// Initialize electrs client if enabled
+	if m.scanCfg.ElectrsEnabled && m.scanCfg.ElectrsUrl != "" {
+		timeout := time.Duration(m.scanCfg.Timeout) * time.Second
+		m.electrsClient = NewElectrsClient(m.scanCfg.ElectrsUrl, timeout)
+		m.logger.Infof("Electrs client initialized with URL: %s", m.scanCfg.ElectrsUrl)
+	}
+
+	if err := m.initializeScanHeight(); err != nil {
+		return fmt.Errorf("initialize scan height: %w", err)
 	}
 
 	return nil
@@ -145,6 +170,15 @@ func (m *DogeModule) blockFetchLoop(ctx context.Context) {
 
 // fetchNewBlocks fetches new blocks from the current height
 func (m *DogeModule) fetchNewBlocks(ctx context.Context) error {
+	// Use electrs-based scanning if enabled
+	if m.electrsClient != nil {
+		return m.fetchNewBlocksWithElectrs(ctx)
+	}
+	return m.fetchNewBlocksWithRPC(ctx)
+}
+
+// fetchNewBlocksWithRPC fetches new blocks using traditional RPC
+func (m *DogeModule) fetchNewBlocksWithRPC(ctx context.Context) error {
 	// Get current block count from node
 	currentBlockCount, err := m.client.GetBlockCount()
 	if err != nil {
@@ -157,12 +191,18 @@ func (m *DogeModule) fetchNewBlocks(ctx context.Context) error {
 		endHeight = currentBlockCount
 	}
 
+	blockCache := make(map[int64]*types.DogeBlockExt, int(endHeight-m.currentHeight+1))
+
 	// Fetch blocks in range
 	for height := m.currentHeight; height <= endHeight; height++ {
-		block, err := m.client.GetBlockByHeight(height)
-		if err != nil {
-			m.logger.Errorf("Failed to get block at height %d: %v", height, err)
-			continue
+		block, ok := blockCache[height]
+		if !ok {
+			block, err = m.client.GetBlockByHeight(height)
+			if err != nil {
+				m.logger.Errorf("Failed to get block at height %d: %v", height, err)
+				continue
+			}
+			blockCache[height] = block
 		}
 
 		// Send block to processing channel
@@ -179,6 +219,117 @@ func (m *DogeModule) fetchNewBlocks(ctx context.Context) error {
 	return nil
 }
 
+// fetchNewBlocksWithElectrs fetches new blocks using electrs API
+// This is more efficient as it allows filtering blocks by tx_count
+// Only blocks with tx_count > 1 (more than just coinbase) are fetched via RPC
+func (m *DogeModule) fetchNewBlocksWithElectrs(ctx context.Context) error {
+	// Get current block height from electrs
+	tipHeight, err := m.electrsClient.GetBlockHeight()
+	if err != nil {
+		m.logger.Warnf("Failed to get tip height from electrs, falling back to RPC: %v", err)
+		return m.fetchNewBlocksWithRPC(ctx)
+	}
+
+	// Calculate end height for this batch
+	endHeight := m.currentHeight + int64(m.scanCfg.Range)
+	if endHeight > tipHeight {
+		endHeight = tipHeight
+	}
+
+	if m.currentHeight > endHeight {
+		m.logger.Debugf("No new blocks to scan (current: %d, tip: %d)", m.currentHeight, tipHeight)
+		return nil
+	}
+
+	// Fetch blocks from electrs in batches of 10 (electrs returns 10 blocks per request)
+	// We need to iterate from currentHeight to endHeight
+	blocksToFetch := make(map[int64]ElectrsBlock)
+
+	// Electrs /blocks/[height] returns blocks from [height] down to [height-9]
+	// We need to request at the right heights to cover our range
+	for queryHeight := endHeight; queryHeight >= m.currentHeight; {
+		electrsBlocks, err := m.electrsClient.GetBlocks(queryHeight)
+		if err != nil {
+			m.logger.Warnf("Failed to get blocks from electrs at height %d: %v", queryHeight, err)
+			// Fall back to RPC for this batch
+			break
+		}
+
+		for _, eb := range electrsBlocks {
+			if eb.Height >= m.currentHeight && eb.Height <= endHeight {
+				blocksToFetch[eb.Height] = eb
+			}
+		}
+
+		// Move to the next batch (10 blocks earlier)
+		queryHeight -= 10
+		if queryHeight < m.currentHeight-9 {
+			break
+		}
+	}
+
+	// Process blocks in order, only fetching full block data for blocks with tx_count > 1
+	blocksProcessed := int64(0)
+	for height := m.currentHeight; height <= endHeight; height++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		eb, found := blocksToFetch[height]
+		if !found {
+			// Block not in electrs cache, fetch via RPC
+			m.logger.Debugf("Block %d not found in electrs cache, fetching via RPC", height)
+			block, err := m.client.GetBlockByHeight(height)
+			if err != nil {
+				m.logger.Errorf("Failed to get block at height %d via RPC: %v", height, err)
+				continue
+			}
+			select {
+			case m.blockCh <- block:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			blocksProcessed++
+			continue
+		}
+
+		// Skip blocks with only coinbase transaction (tx_count == 1)
+		if eb.TxCount <= 1 {
+			m.logger.Debugf("Skipping block %d with tx_count=%d (only coinbase)", height, eb.TxCount)
+			// Still need to update scan state for skipped blocks
+			if err := m.updateUTXOScanState(height); err != nil {
+				m.logger.Errorf("Failed to update UTXO scan state for skipped block %d: %v", height, err)
+			}
+			continue
+		}
+
+		// Block has transactions, fetch full block via RPC
+		m.logger.Debugf("Fetching block %d with tx_count=%d via RPC", height, eb.TxCount)
+		block, err := m.client.GetBlockByHeight(height)
+		if err != nil {
+			m.logger.Errorf("Failed to get block at height %d via RPC: %v", height, err)
+			continue
+		}
+
+		// Send block to processing channel
+		select {
+		case m.blockCh <- block:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		blocksProcessed++
+	}
+
+	// Update current height
+	m.currentHeight = endHeight + 1
+	m.logger.Infof("Electrs scan: processed %d/%d blocks (skipped %d empty blocks)",
+		blocksProcessed, endHeight-m.currentHeight+1+blocksProcessed, endHeight-m.currentHeight+1-blocksProcessed+1)
+
+	return nil
+}
+
 // blockScanLoop processes blocks from the channel
 func (m *DogeModule) blockScanLoop(ctx context.Context) {
 	for {
@@ -189,9 +340,47 @@ func (m *DogeModule) blockScanLoop(ctx context.Context) {
 		case block := <-m.blockCh:
 			if block != nil {
 				m.processBlock(*block)
+				if err := m.updateUTXOScanState(block.BlockNumber); err != nil {
+					m.logger.Errorf("Failed to update UTXO scan state at height %d: %v", block.BlockNumber, err)
+				}
 			}
 		}
 	}
+}
+
+func (m *DogeModule) initializeScanHeight() error {
+	if m.utxoScanRepo == nil {
+		m.currentHeight = int64(m.cfg.StartHeight)
+		return nil
+	}
+
+	state, err := m.utxoScanRepo.GetUTXOScanState()
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			m.currentHeight = int64(m.cfg.StartHeight)
+			m.logger.Infof("UTXO scan state not found, starting from configured height %d", m.currentHeight)
+			return nil
+		}
+		return err
+	}
+
+	startFrom := int64(state.LastScannedBlock)
+	if int64(m.cfg.StartHeight) > startFrom {
+		startFrom = int64(m.cfg.StartHeight)
+	}
+	m.currentHeight = startFrom + 1
+	m.logger.Infof("Resuming UTXO scan from height %d (last scanned %d)", m.currentHeight, state.LastScannedBlock)
+	return nil
+}
+
+func (m *DogeModule) updateUTXOScanState(height int64) error {
+	if m.utxoScanRepo == nil {
+		return nil
+	}
+	if height < 0 {
+		return nil
+	}
+	return m.utxoScanRepo.UpdateUTXOScanState(uint64(height))
 }
 
 // processBlock processes a single block and extracts P2PKH transactions
@@ -232,14 +421,9 @@ func (m *DogeModule) processBlock(dogeBlock types.DogeBlockExt) {
 			m.logger.Errorf("Failed to generate P2PKH address: %v", err)
 			return
 		}
-		p2wpkhAddress, err := types.GenerateP2WPKHAddress(pubkeyBytes, network)
-		if err != nil {
-			m.logger.Errorf("Failed to generate P2WPKH address: %v", err)
-			return
-		}
 		watchAddrSet[p2pkhAddress] = struct{}{}
-		watchAddrSet[p2wpkhAddress] = struct{}{}
-		m.logger.Debugf("Using derived watch addresses - P2PKH: %s, P2WPKH: %s", p2pkhAddress, p2wpkhAddress)
+		// Dogecoin does not support segwit outputs; skip derived P2WPKH here.
+		m.logger.Debugf("Using derived watch address (P2PKH only for Doge): %s", p2pkhAddress)
 	} else {
 		// No addresses configured; continue scanning but skip ownership-based classification
 		m.logger.Debug("No watch addresses or pubkey configured; scanning without address filter")
@@ -371,6 +555,8 @@ func (m *DogeModule) analyzeTransaction(tx *wire.MsgTx, dogeBlock types.DogeBloc
 		if extractErr != nil {
 			m.logger.Debugf("Failed to extract address from script: %v", extractErr)
 			receiver = "unknown"
+		} else if receiver == "" {
+			receiver = "unknown"
 		}
 
 		receiverType := models.WALLET_TYPE_UNKNOWN
@@ -458,6 +644,23 @@ func (m *DogeModule) handleDepositUTXOs(tx *wire.MsgTx, dogeBlock types.DogeBloc
 		if result.isDeposit {
 			if err := m.recordDeposit(utxo, result.txid, noWitnessTx); err != nil {
 				m.logger.Errorf("Record deposit for %s:%d failed: %v", utxo.Txid, utxo.OutIndex, err)
+			} else if utxo.EvmAddr == "" {
+				m.logger.Warnf("Deposit %s:%d recorded with empty EVM address, marking as skipped. Transaction may lack OP_RETURN or magic bytes mismatch.", utxo.Txid, utxo.OutIndex)
+				// Mark deposit as skipped in the event database
+				if dep, err := m.eventRepo.GetDeposit(nil, utxo.Txid, utxo.OutIndex); err == nil {
+					if err := m.eventRepo.UpdateDepositStatus(nil, dep.ID, "skipped"); err != nil {
+						m.logger.Errorf("Failed to mark deposit %s:%d as skipped: %v", utxo.Txid, utxo.OutIndex, err)
+					}
+				}
+				// Also mark UTXO as processed to prevent processor from picking it up again
+				// But only if it's not already in a higher state (pending/spent)
+				if err := m.conn.GetDB().Model(&models.UTXO{}).
+					Where("txid = ? AND out_index = ? AND status NOT IN (?, ?)",
+						utxo.Txid, utxo.OutIndex,
+						models.UTXO_STATUS_PENDING, models.UTXO_STATUS_SPENT).
+					Update("status", models.UTXO_STATUS_PROCESSED).Error; err != nil {
+					m.logger.Errorf("Failed to mark UTXO %s:%d as processed: %v", utxo.Txid, utxo.OutIndex, err)
+				}
 			}
 		}
 	}
@@ -520,24 +723,24 @@ func (m *DogeModule) handleSpendingTransaction(txid string, vins []*models.VIN, 
 }
 
 func (m *DogeModule) recordDeposit(utxo *models.UTXO, txid string, txBytes []byte) error {
-    if m.eventRepo == nil {
-        return nil
-    }
+	if m.eventRepo == nil {
+		return nil
+	}
 
-    deposit := &models.Deposit{
-        TxId:        txid,
-        Vout:        utxo.OutIndex,
-        Address:     utxo.Receiver,
-        EvmAddr:     utxo.EvmAddr,
-        Amount:      utxo.Amount,
-        TxBytes:     txBytes,
-        Status:      "pending",
-        EvmTxHash:   "",
-        EvmBlock:    0,
-        EvmLogIndex: 0,
-    }
+	deposit := &models.Deposit{
+		TxId:        txid,
+		Vout:        utxo.OutIndex,
+		Address:     utxo.Receiver,
+		EvmAddr:     utxo.EvmAddr,
+		Amount:      utxo.Amount,
+		TxBytes:     txBytes,
+		Status:      "pending",
+		EvmTxHash:   "",
+		EvmBlock:    0,
+		EvmLogIndex: 0,
+	}
 
-    return m.eventRepo.CreateOrUpdateDeposit(nil, deposit)
+	return m.eventRepo.CreateOrUpdateDeposit(nil, deposit)
 }
 
 // parseHexOrRaw parses a hex string like "0xdeadbeef" or "deadbeef" into bytes.
