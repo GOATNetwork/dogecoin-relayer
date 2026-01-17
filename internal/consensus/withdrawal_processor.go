@@ -579,8 +579,13 @@ func (wp *WithdrawalProcessor) processRetryWithdrawals() error {
 		if time.Since(w.UpdatedAt) < retryDelay {
 			continue
 		}
-		if err := wallet.CloseSendOrdersForWithdrawal(wp.conn.GetDB(), w.ReqTaskId); err != nil {
+		closedOrders, err := wallet.CloseSendOrdersForWithdrawal(wp.conn.GetDB(), w.ReqTaskId)
+		if err != nil {
 			return fmt.Errorf("close send orders for %s: %w", w.ReqTaskId, err)
+		}
+		// Broadcast SendOrder status updates for closed orders
+		for _, order := range closedOrders {
+			wp.broadcastSendOrderStatusUpdate(order.OrderId, order.Txid, order.OldStatus, "closed", "withdrawal_retry")
 		}
 		w.Status = models.WITHDRAW_STATUS_INIT
 		w.ExternalId = ""
@@ -627,8 +632,13 @@ func (wp *WithdrawalProcessor) resetFireblocksWithdrawals() error {
 	}
 	for i := range withdrawals {
 		w := &withdrawals[i]
-		if err := wallet.CloseSendOrdersForWithdrawal(wp.conn.GetDB(), w.ReqTaskId); err != nil {
+		closedOrders, err := wallet.CloseSendOrdersForWithdrawal(wp.conn.GetDB(), w.ReqTaskId)
+		if err != nil {
 			return fmt.Errorf("close send orders for %s: %w", w.ReqTaskId, err)
+		}
+		// Broadcast SendOrder status updates for closed orders
+		for _, order := range closedOrders {
+			wp.broadcastSendOrderStatusUpdate(order.OrderId, order.Txid, order.OldStatus, "closed", "fireblocks_reset")
 		}
 		w.Status = models.WITHDRAW_STATUS_INIT
 		w.ExternalId = ""
@@ -644,8 +654,13 @@ func (wp *WithdrawalProcessor) resetFireblocksWithdrawals() error {
 }
 
 func (wp *WithdrawalProcessor) markWithdrawalRetry(w *models.Withdrawal) {
-	if err := wallet.CloseSendOrdersForWithdrawal(wp.conn.GetDB(), w.ReqTaskId); err != nil {
+	closedOrders, err := wallet.CloseSendOrdersForWithdrawal(wp.conn.GetDB(), w.ReqTaskId)
+	if err != nil {
 		wp.logger.Warnf("Failed to close send orders for %s: %v", w.ReqTaskId, err)
+	}
+	// Broadcast SendOrder status updates for closed orders
+	for _, order := range closedOrders {
+		wp.broadcastSendOrderStatusUpdate(order.OrderId, order.Txid, order.OldStatus, "closed", "withdrawal_retry")
 	}
 	w.Status = models.WITHDRAW_STATUS_INIT
 	w.ExternalId = ""
@@ -704,7 +719,31 @@ func (wp *WithdrawalProcessor) registerP2PHandler() {
 				wp.logger.Errorf("Failed to register send_order txid update handler: %v", err)
 			}
 
-			wp.logger.Info("Registered P2P handlers for withdrawal status, send_order broadcast and txid update")
+			// Register UTXO status update handler
+			err = p2pModule.(p2p.P2PSender).RegisterP2PHandler(types.P2PMessageTypeUTXOStatusUpdate, func(msg *types.P2PBroadcastMessage) error {
+				return wp.handleUTXOStatusUpdateMessage(msg)
+			})
+			if err != nil {
+				wp.logger.Errorf("Failed to register UTXO status update handler: %v", err)
+			}
+
+			// Register SendOrder status update handler
+			err = p2pModule.(p2p.P2PSender).RegisterP2PHandler(types.P2PMessageTypeSendOrderStatusUpdate, func(msg *types.P2PBroadcastMessage) error {
+				return wp.handleSendOrderStatusUpdateMessage(msg)
+			})
+			if err != nil {
+				wp.logger.Errorf("Failed to register SendOrder status update handler: %v", err)
+			}
+
+			// Register PendingBatch status update handler
+			err = p2pModule.(p2p.P2PSender).RegisterP2PHandler(types.P2PMessageTypePendingBatchStatus, func(msg *types.P2PBroadcastMessage) error {
+				return wp.handlePendingBatchStatusMessage(msg)
+			})
+			if err != nil {
+				wp.logger.Errorf("Failed to register PendingBatch status handler: %v", err)
+			}
+
+			wp.logger.Info("Registered P2P handlers for withdrawal status, send_order, UTXO, pending_batch and status updates")
 			return
 		}
 		wp.logger.Errorf("Failed to register P2P handlers after %d retries", maxRetries)
@@ -989,6 +1028,292 @@ func (wp *WithdrawalProcessor) handleSendOrderTxidUpdateMessage(msg *types.P2PBr
 	return nil
 }
 
+// handleUTXOStatusUpdateMessage handles P2P messages for UTXO status changes
+func (wp *WithdrawalProcessor) handleUTXOStatusUpdateMessage(msg *types.P2PBroadcastMessage) error {
+	var payload types.UTXOStatusUpdatePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return fmt.Errorf("unmarshal utxo status update payload: %w", err)
+	}
+
+	if payload.Txid == "" {
+		return fmt.Errorf("utxo status update payload missing txid")
+	}
+
+	wp.logger.Infof("Received UTXO status update: txid=%s:%d, %s->%s, reason=%s",
+		payload.Txid, payload.OutIndex, payload.OldStatus, payload.NewStatus, payload.Reason)
+
+	// Check current status and apply hierarchy rules
+	var utxo models.UTXO
+	err := wp.conn.GetDB().Where("txid = ? AND out_index = ?", payload.Txid, payload.OutIndex).First(&utxo).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			wp.logger.Debugf("UTXO %s:%d not found, skipping update", payload.Txid, payload.OutIndex)
+			return nil
+		}
+		return fmt.Errorf("query utxo: %w", err)
+	}
+
+	// Apply status hierarchy: only allow forward transitions or same rank updates
+	if !shouldApplyUTXOStatusUpdate(utxo.Status, payload.NewStatus) {
+		wp.logger.Debugf("Skipping UTXO status update %s:%d: current=%s, incoming=%s (hierarchy violation)",
+			payload.Txid, payload.OutIndex, utxo.Status, payload.NewStatus)
+		return nil
+	}
+
+	// Update UTXO status
+	result := wp.conn.GetDB().Model(&models.UTXO{}).
+		Where("txid = ? AND out_index = ?", payload.Txid, payload.OutIndex).
+		Update("status", payload.NewStatus)
+
+	if result.Error != nil {
+		return fmt.Errorf("update utxo status: %w", result.Error)
+	}
+
+	if result.RowsAffected > 0 {
+		wp.logger.Infof("Updated UTXO %s:%d status to %s via P2P", payload.Txid, payload.OutIndex, payload.NewStatus)
+	}
+
+	return nil
+}
+
+// handleSendOrderStatusUpdateMessage handles P2P messages for SendOrder status changes
+func (wp *WithdrawalProcessor) handleSendOrderStatusUpdateMessage(msg *types.P2PBroadcastMessage) error {
+	var payload types.SendOrderStatusUpdatePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return fmt.Errorf("unmarshal send_order status update payload: %w", err)
+	}
+
+	if payload.OrderId == "" && payload.Txid == "" {
+		return fmt.Errorf("send_order status update payload missing order_id and txid")
+	}
+
+	wp.logger.Infof("Received SendOrder status update: orderId=%s, txid=%s, %s->%s, reason=%s",
+		payload.OrderId, payload.Txid, payload.OldStatus, payload.NewStatus, payload.Reason)
+
+	// Build query based on available identifiers
+	query := wp.conn.GetDB().Model(&models.SendOrder{})
+	if payload.OrderId != "" {
+		query = query.Where("order_id = ?", payload.OrderId)
+	} else {
+		query = query.Where("txid = ?", payload.Txid)
+	}
+
+	// Check current status
+	var sendOrder models.SendOrder
+	if err := query.First(&sendOrder).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			wp.logger.Debugf("SendOrder not found (orderId=%s, txid=%s), skipping update", payload.OrderId, payload.Txid)
+			return nil
+		}
+		return fmt.Errorf("query send_order: %w", err)
+	}
+
+	// Apply status hierarchy for send orders
+	if !shouldApplySendOrderStatusUpdate(sendOrder.Status, payload.NewStatus) {
+		wp.logger.Debugf("Skipping SendOrder status update: current=%s, incoming=%s (hierarchy violation)",
+			sendOrder.Status, payload.NewStatus)
+		return nil
+	}
+
+	// Update SendOrder and associated VINs/VOUTs
+	err := wp.conn.GetDB().Transaction(func(tx *gorm.DB) error {
+		now := time.Now()
+		if err := tx.Model(&models.SendOrder{}).
+			Where("order_id = ?", sendOrder.OrderId).
+			Updates(map[string]interface{}{
+				"status":     payload.NewStatus,
+				"updated_at": now,
+			}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Model(&models.VIN{}).
+			Where("order_id = ?", sendOrder.OrderId).
+			Updates(map[string]interface{}{
+				"status":     payload.NewStatus,
+				"updated_at": now,
+			}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Model(&models.VOUT{}).
+			Where("order_id = ?", sendOrder.OrderId).
+			Updates(map[string]interface{}{
+				"status":     payload.NewStatus,
+				"updated_at": now,
+			}).Error; err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("update send_order status: %w", err)
+	}
+
+	wp.logger.Infof("Updated SendOrder %s status to %s via P2P", sendOrder.OrderId, payload.NewStatus)
+	return nil
+}
+
+// handlePendingBatchStatusMessage handles P2P messages for pending_batch status changes
+func (wp *WithdrawalProcessor) handlePendingBatchStatusMessage(msg *types.P2PBroadcastMessage) error {
+	var payload types.PendingBatchStatusPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return fmt.Errorf("unmarshal pending_batch status payload: %w", err)
+	}
+
+	if payload.BaseSessionID == "" {
+		return fmt.Errorf("pending_batch status payload missing base_session_id")
+	}
+
+	wp.logger.Infof("Received PendingBatch status update: baseSessionId=%s, batchType=%s, status=%s",
+		payload.BaseSessionID, payload.BatchType, payload.Status)
+
+	// Update pending_batch status in database
+	result := wp.conn.GetDB().Model(&models.PendingBatch{}).
+		Where("base_session_id = ?", payload.BaseSessionID).
+		Update("status", payload.Status)
+
+	if result.Error != nil {
+		return fmt.Errorf("update pending_batch status: %w", result.Error)
+	}
+
+	if result.RowsAffected > 0 {
+		wp.logger.Infof("Updated PendingBatch %s status to %s via P2P", payload.BaseSessionID, payload.Status)
+	} else {
+		wp.logger.Debugf("PendingBatch %s not found, skipping update", payload.BaseSessionID)
+	}
+
+	return nil
+}
+
+// broadcastUTXOStatusUpdate broadcasts a UTXO status change to other nodes
+func (wp *WithdrawalProcessor) broadcastUTXOStatusUpdate(txid string, outIndex int, oldStatus, newStatus, reason string) {
+	p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
+	if !ok {
+		wp.logger.Debug("P2P module not available for UTXO status broadcast")
+		return
+	}
+
+	payload := types.UTXOStatusUpdatePayload{
+		Txid:      txid,
+		OutIndex:  outIndex,
+		OldStatus: oldStatus,
+		NewStatus: newStatus,
+		Reason:    reason,
+		UpdatedAt: time.Now().Unix(),
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		wp.logger.Warnf("Failed to marshal UTXO status update payload: %v", err)
+		return
+	}
+
+	msg := types.P2PBroadcastMessage{
+		Type:      types.P2PMessageTypeUTXOStatusUpdate,
+		SessionID: fmt.Sprintf("%s:%d", txid, outIndex),
+		Payload:   payloadBytes,
+	}
+
+	if err := p2pModule.(p2p.P2PSender).BroadcastP2PMessage(msg); err != nil {
+		wp.logger.Warnf("Failed to broadcast UTXO status update %s:%d: %v", txid, outIndex, err)
+	} else {
+		wp.logger.Infof("Broadcasted UTXO status update: %s:%d %s->%s (%s)", txid, outIndex, oldStatus, newStatus, reason)
+	}
+}
+
+// broadcastSendOrderStatusUpdate broadcasts a SendOrder status change to other nodes
+func (wp *WithdrawalProcessor) broadcastSendOrderStatusUpdate(orderId, txid, oldStatus, newStatus, reason string) {
+	p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
+	if !ok {
+		wp.logger.Debug("P2P module not available for SendOrder status broadcast")
+		return
+	}
+
+	payload := types.SendOrderStatusUpdatePayload{
+		OrderId:   orderId,
+		Txid:      txid,
+		OldStatus: oldStatus,
+		NewStatus: newStatus,
+		Reason:    reason,
+		UpdatedAt: time.Now().Unix(),
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		wp.logger.Warnf("Failed to marshal SendOrder status update payload: %v", err)
+		return
+	}
+
+	msg := types.P2PBroadcastMessage{
+		Type:      types.P2PMessageTypeSendOrderStatusUpdate,
+		SessionID: orderId,
+		Payload:   payloadBytes,
+	}
+
+	if err := p2pModule.(p2p.P2PSender).BroadcastP2PMessage(msg); err != nil {
+		wp.logger.Warnf("Failed to broadcast SendOrder status update %s: %v", orderId, err)
+	} else {
+		wp.logger.Infof("Broadcasted SendOrder status update: %s %s->%s (%s)", orderId, oldStatus, newStatus, reason)
+	}
+}
+
+// shouldApplyUTXOStatusUpdate checks if the status update should be applied based on hierarchy
+// Status hierarchy: unconfirmed (0) < confirmed (10) < processed (20) < pending (30) < spent (100)
+func shouldApplyUTXOStatusUpdate(currentStatus, newStatus string) bool {
+	currentRank := utxoStatusRank(currentStatus)
+	newRank := utxoStatusRank(newStatus)
+	// Allow forward transitions or same rank updates (for idempotency)
+	return newRank >= currentRank
+}
+
+func utxoStatusRank(status string) int {
+	switch status {
+	case models.UTXO_STATUS_UNCONFIRMED:
+		return 0
+	case models.UTXO_STATUS_CONFIRMED:
+		return 10
+	case models.UTXO_STATUS_PROCESSED:
+		return 20
+	case models.UTXO_STATUS_PENDING:
+		return 30
+	case models.UTXO_STATUS_SPENT:
+		return 100
+	default:
+		return 0
+	}
+}
+
+// shouldApplySendOrderStatusUpdate checks if the status update should be applied based on hierarchy
+// Status hierarchy: aggregating (0) < init (10) < pending (20) < confirmed (30) < processed (40) < closed (50)
+func shouldApplySendOrderStatusUpdate(currentStatus, newStatus string) bool {
+	currentRank := sendOrderStatusRank(currentStatus)
+	newRank := sendOrderStatusRank(newStatus)
+	// Allow forward transitions or same rank updates (for idempotency)
+	return newRank >= currentRank
+}
+
+func sendOrderStatusRank(status string) int {
+	switch status {
+	case "aggregating":
+		return 0
+	case "init":
+		return 10
+	case "pending":
+		return 20
+	case "confirmed":
+		return 30
+	case "processed":
+		return 40
+	case "closed":
+		return 50
+	default:
+		return 0
+	}
+}
+
 func shouldApplyWithdrawalUpdate(current *models.Withdrawal, payload *types.WithdrawalStatusPayload) bool {
 	if current == nil {
 		return true
@@ -1067,8 +1392,13 @@ func (wp *WithdrawalProcessor) broadcastWithdrawal(w *models.Withdrawal) error {
 	}
 	wp.broadcastWithdrawalStatus(aggregating)
 
-	if err := wallet.CloseSendOrdersForWithdrawal(wp.conn.GetDB(), w.ReqTaskId); err != nil {
+	closedOrders, err := wallet.CloseSendOrdersForWithdrawal(wp.conn.GetDB(), w.ReqTaskId)
+	if err != nil {
 		return fmt.Errorf("cleanup send orders for withdrawal %s: %w", w.ReqTaskId, err)
+	}
+	// Broadcast SendOrder status updates for closed orders
+	for _, order := range closedOrders {
+		wp.broadcastSendOrderStatusUpdate(order.OrderId, order.Txid, order.OldStatus, "closed", "withdrawal_cleanup")
 	}
 
 	var utxos []*models.UTXO
@@ -1238,6 +1568,11 @@ func (wp *WithdrawalProcessor) handleLocalSigning(w *models.Withdrawal, tx *wire
 		return fmt.Errorf("update send order and utxo status: %w", err)
 	}
 
+	// Broadcast UTXO status updates to other nodes (after transaction commits)
+	for _, vin := range vins {
+		wp.broadcastUTXOStatusUpdate(vin.Txid, vin.OutIndex, models.UTXO_STATUS_PROCESSED, models.UTXO_STATUS_PENDING, "selected_for_withdrawal")
+	}
+
 	updated := &models.Withdrawal{
 		ReqTaskId:   w.ReqTaskId,
 		ReqTxHash:   w.ReqTxHash,
@@ -1304,6 +1639,11 @@ func (wp *WithdrawalProcessor) handleFireblocksSigning(w *models.Withdrawal, tx 
 		return nil
 	}); err != nil {
 		return fmt.Errorf("update send order and utxo status: %w", err)
+	}
+
+	// Broadcast UTXO status updates to other nodes (after transaction commits)
+	for _, vin := range vins {
+		wp.broadcastUTXOStatusUpdate(vin.Txid, vin.OutIndex, models.UTXO_STATUS_PROCESSED, models.UTXO_STATUS_PENDING, "selected_for_withdrawal")
 	}
 
 	var buf bytes.Buffer
@@ -1423,10 +1763,16 @@ func (wp *WithdrawalProcessor) finishFireblocksWithdrawal(w *models.Withdrawal) 
 			} else {
 				// Reset UTXOs from pending back to processed on broadcast failure
 				for _, txIn := range tx.TxIn {
-					if resetErr := wp.conn.GetDB().Model(&models.UTXO{}).
-						Where("txid = ? AND out_index = ? AND status = ?", txIn.PreviousOutPoint.Hash.String(), txIn.PreviousOutPoint.Index, models.UTXO_STATUS_PENDING).
-						Update("status", models.UTXO_STATUS_PROCESSED).Error; resetErr != nil {
-						wp.logger.Warnf("Failed to reset UTXO %s:%d to processed: %v", txIn.PreviousOutPoint.Hash.String(), txIn.PreviousOutPoint.Index, resetErr)
+					utxoTxid := txIn.PreviousOutPoint.Hash.String()
+					utxoOutIndex := int(txIn.PreviousOutPoint.Index)
+					result := wp.conn.GetDB().Model(&models.UTXO{}).
+						Where("txid = ? AND out_index = ? AND status = ?", utxoTxid, utxoOutIndex, models.UTXO_STATUS_PENDING).
+						Update("status", models.UTXO_STATUS_PROCESSED)
+					if result.Error != nil {
+						wp.logger.Warnf("Failed to reset UTXO %s:%d to processed: %v", utxoTxid, utxoOutIndex, result.Error)
+					} else if result.RowsAffected > 0 {
+						// Broadcast UTXO status reset to other nodes
+						wp.broadcastUTXOStatusUpdate(utxoTxid, utxoOutIndex, models.UTXO_STATUS_PENDING, models.UTXO_STATUS_PROCESSED, "broadcast_failed")
 					}
 				}
 				return fmt.Errorf("send raw tx: %w", err)
@@ -1549,14 +1895,30 @@ func (wp *WithdrawalProcessor) resetPendingUTXOsForWithdrawal(w *models.Withdraw
 		wp.logger.Warnf("Failed to deserialize unsigned tx for UTXO reset: %v", err)
 		return
 	}
+	var resetUTXOs []struct {
+		txid     string
+		outIndex int
+	}
 	for _, txIn := range tx.TxIn {
-		if err := wp.conn.GetDB().Model(&models.UTXO{}).
-			Where("txid = ? AND out_index = ? AND status = ?", txIn.PreviousOutPoint.Hash.String(), txIn.PreviousOutPoint.Index, models.UTXO_STATUS_PENDING).
-			Update("status", models.UTXO_STATUS_PROCESSED).Error; err != nil {
-			wp.logger.Warnf("Failed to reset UTXO %s:%d to processed: %v", txIn.PreviousOutPoint.Hash.String(), txIn.PreviousOutPoint.Index, err)
+		txid := txIn.PreviousOutPoint.Hash.String()
+		outIndex := int(txIn.PreviousOutPoint.Index)
+		result := wp.conn.GetDB().Model(&models.UTXO{}).
+			Where("txid = ? AND out_index = ? AND status = ?", txid, outIndex, models.UTXO_STATUS_PENDING).
+			Update("status", models.UTXO_STATUS_PROCESSED)
+		if result.Error != nil {
+			wp.logger.Warnf("Failed to reset UTXO %s:%d to processed: %v", txid, outIndex, result.Error)
+		} else if result.RowsAffected > 0 {
+			resetUTXOs = append(resetUTXOs, struct {
+				txid     string
+				outIndex int
+			}{txid, outIndex})
 		}
 	}
-	wp.logger.Infof("Reset pending UTXOs for withdrawal %s", w.ReqTaskId)
+	// Broadcast UTXO status updates for successfully reset UTXOs
+	for _, utxo := range resetUTXOs {
+		wp.broadcastUTXOStatusUpdate(utxo.txid, utxo.outIndex, models.UTXO_STATUS_PENDING, models.UTXO_STATUS_PROCESSED, "withdrawal_failed")
+	}
+	wp.logger.Infof("Reset %d pending UTXOs for withdrawal %s", len(resetUTXOs), w.ReqTaskId)
 }
 
 func (wp *WithdrawalProcessor) checkAndSubmit(w *models.Withdrawal) error {

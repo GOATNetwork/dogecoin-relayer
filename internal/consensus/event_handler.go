@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/goat-network/dogecoin-relayer/internal/models"
 	"github.com/goat-network/dogecoin-relayer/internal/p2p"
+	"github.com/goat-network/dogecoin-relayer/internal/wallet"
 	"github.com/goat-network/dogecoin-relayer/pkg/eventbus"
 	"github.com/goat-network/dogecoin-relayer/pkg/global"
 	"github.com/goat-network/dogecoin-relayer/pkg/module"
@@ -264,6 +265,9 @@ func (eh *EventHandler) processBridgeOutFinished(event BlockchainEvent) error {
 		return fmt.Errorf("failed to parse BridgeOutFinished.taskIds: %w", err)
 	}
 
+	// Collect closed orders for broadcasting after transaction commits
+	var allClosedOrders []wallet.ClosedOrderInfo
+
 	// Update withdrawal to final state using transaction wrapper with retry on lock errors
 	err = eh.eventRepo.WithTransactionRetry(func(tx *gorm.DB) error {
 		for _, taskId := range taskIds {
@@ -280,6 +284,15 @@ func (eh *EventHandler) processBridgeOutFinished(event BlockchainEvent) error {
 				return fmt.Errorf("failed to update withdrawal status (taskId=%s): %w", taskId, err)
 			}
 			logger.Infof("Updated withdrawal %s to processed state", taskId)
+
+			// Close associated send_orders when withdrawal is processed
+			closedOrders, closeErr := wallet.CloseSendOrdersForWithdrawal(tx, taskId)
+			if closeErr != nil {
+				logger.Warnf("Failed to close send_orders for withdrawal %s: %v", taskId, closeErr)
+			} else if len(closedOrders) > 0 {
+				allClosedOrders = append(allClosedOrders, closedOrders...)
+				logger.Infof("Closed %d send_orders for withdrawal %s", len(closedOrders), taskId)
+			}
 		}
 		return nil
 	})
@@ -287,6 +300,7 @@ func (eh *EventHandler) processBridgeOutFinished(event BlockchainEvent) error {
 		return err
 	}
 
+	// Broadcast withdrawal status updates
 	for _, taskId := range taskIds {
 		withdrawal, err := eh.eventRepo.GetWithdrawalByTask(nil, taskId)
 		if err != nil {
@@ -294,6 +308,11 @@ func (eh *EventHandler) processBridgeOutFinished(event BlockchainEvent) error {
 			continue
 		}
 		eh.broadcastWithdrawalStatus(withdrawal)
+	}
+
+	// Broadcast send_order status updates
+	for _, closedOrder := range allClosedOrders {
+		eh.broadcastSendOrderStatusUpdate(closedOrder.OrderId, closedOrder.Txid, closedOrder.OldStatus, "closed", "withdrawal_processed")
 	}
 
 	eh.eventBus.Publish(eventbus.EventBridgeOutFinished, event)
@@ -641,5 +660,35 @@ func (eh *EventHandler) broadcastWithdrawalStatus(w *models.Withdrawal) {
 	}
 	if err := p2pModule.(p2p.P2PSender).BroadcastP2PMessage(msg); err != nil {
 		eh.logger.Warnf("Failed to broadcast withdrawal status %s: %v", w.ReqTaskId, err)
+	}
+}
+
+func (eh *EventHandler) broadcastSendOrderStatusUpdate(orderId, txid, oldStatus, newStatus, reason string) {
+	p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
+	if !ok {
+		return
+	}
+	payload := types.SendOrderStatusUpdatePayload{
+		OrderId:   orderId,
+		Txid:      txid,
+		OldStatus: oldStatus,
+		NewStatus: newStatus,
+		Reason:    reason,
+		UpdatedAt: time.Now().Unix(),
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		eh.logger.Warnf("Failed to marshal send_order status update payload: %v", err)
+		return
+	}
+	msg := types.P2PBroadcastMessage{
+		Type:      types.P2PMessageTypeSendOrderStatusUpdate,
+		SessionID: orderId,
+		Payload:   payloadBytes,
+	}
+	if err := p2pModule.(p2p.P2PSender).BroadcastP2PMessage(msg); err != nil {
+		eh.logger.Warnf("Failed to broadcast send_order status update %s: %v", orderId, err)
+	} else {
+		eh.logger.Debugf("Broadcast send_order %s status: %s → %s (reason: %s)", orderId, oldStatus, newStatus, reason)
 	}
 }

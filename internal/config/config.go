@@ -43,6 +43,12 @@ type ScanConfig struct {
 	Interval int  `yaml:"interval"` // in seconds
 	Timeout  int  `yaml:"timeout"`  // in seconds
 	Range    int  `yaml:"range"`    // number of blocks to scan at once
+
+	// Electrs-based scanning configuration
+	// When enabled, uses electrs API instead of RPC for block scanning
+	// This is more efficient as it allows filtering blocks by tx_count
+	ElectrsEnabled bool   `yaml:"electrs_enabled"`
+	ElectrsUrl     string `yaml:"electrs_url"` // e.g., "https://doge-electrs-testnet-demo.qed.me"
 }
 
 type P2PConfig struct {

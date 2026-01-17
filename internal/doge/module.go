@@ -20,16 +20,17 @@ import (
 )
 
 type DogeModule struct {
-	cfg           config.DogeConfig
-	scanCfg       config.ScanConfig
-	conn          *models.DBConnection
-	logger        *log.Entry
-	client        *DogeClient
-	state         *models.StateRepository
-	eventRepo     *models.EventRepository
-	utxoScanRepo  *models.UTXOScanStateRepository
-	blockCh       chan *types.DogeBlockExt
-	currentHeight int64
+	cfg            config.DogeConfig
+	scanCfg        config.ScanConfig
+	conn           *models.DBConnection
+	logger         *log.Entry
+	client         *DogeClient
+	electrsClient  *ElectrsClient
+	state          *models.StateRepository
+	eventRepo      *models.EventRepository
+	utxoScanRepo   *models.UTXOScanStateRepository
+	blockCh        chan *types.DogeBlockExt
+	currentHeight  int64
 }
 
 var _ module.Module = (*DogeModule)(nil)
@@ -112,6 +113,13 @@ func (m *DogeModule) Init(cfg any, conn *models.DBConnection) error {
 		m.scanCfg = globalCfg.Scan
 	}
 
+	// Initialize electrs client if enabled
+	if m.scanCfg.ElectrsEnabled && m.scanCfg.ElectrsUrl != "" {
+		timeout := time.Duration(m.scanCfg.Timeout) * time.Second
+		m.electrsClient = NewElectrsClient(m.scanCfg.ElectrsUrl, timeout)
+		m.logger.Infof("Electrs client initialized with URL: %s", m.scanCfg.ElectrsUrl)
+	}
+
 	if err := m.initializeScanHeight(); err != nil {
 		return fmt.Errorf("initialize scan height: %w", err)
 	}
@@ -162,6 +170,15 @@ func (m *DogeModule) blockFetchLoop(ctx context.Context) {
 
 // fetchNewBlocks fetches new blocks from the current height
 func (m *DogeModule) fetchNewBlocks(ctx context.Context) error {
+	// Use electrs-based scanning if enabled
+	if m.electrsClient != nil {
+		return m.fetchNewBlocksWithElectrs(ctx)
+	}
+	return m.fetchNewBlocksWithRPC(ctx)
+}
+
+// fetchNewBlocksWithRPC fetches new blocks using traditional RPC
+func (m *DogeModule) fetchNewBlocksWithRPC(ctx context.Context) error {
 	// Get current block count from node
 	currentBlockCount, err := m.client.GetBlockCount()
 	if err != nil {
@@ -198,6 +215,117 @@ func (m *DogeModule) fetchNewBlocks(ctx context.Context) error {
 
 	// Update current height
 	m.currentHeight = endHeight + 1
+
+	return nil
+}
+
+// fetchNewBlocksWithElectrs fetches new blocks using electrs API
+// This is more efficient as it allows filtering blocks by tx_count
+// Only blocks with tx_count > 1 (more than just coinbase) are fetched via RPC
+func (m *DogeModule) fetchNewBlocksWithElectrs(ctx context.Context) error {
+	// Get current block height from electrs
+	tipHeight, err := m.electrsClient.GetBlockHeight()
+	if err != nil {
+		m.logger.Warnf("Failed to get tip height from electrs, falling back to RPC: %v", err)
+		return m.fetchNewBlocksWithRPC(ctx)
+	}
+
+	// Calculate end height for this batch
+	endHeight := m.currentHeight + int64(m.scanCfg.Range)
+	if endHeight > tipHeight {
+		endHeight = tipHeight
+	}
+
+	if m.currentHeight > endHeight {
+		m.logger.Debugf("No new blocks to scan (current: %d, tip: %d)", m.currentHeight, tipHeight)
+		return nil
+	}
+
+	// Fetch blocks from electrs in batches of 10 (electrs returns 10 blocks per request)
+	// We need to iterate from currentHeight to endHeight
+	blocksToFetch := make(map[int64]ElectrsBlock)
+
+	// Electrs /blocks/[height] returns blocks from [height] down to [height-9]
+	// We need to request at the right heights to cover our range
+	for queryHeight := endHeight; queryHeight >= m.currentHeight; {
+		electrsBlocks, err := m.electrsClient.GetBlocks(queryHeight)
+		if err != nil {
+			m.logger.Warnf("Failed to get blocks from electrs at height %d: %v", queryHeight, err)
+			// Fall back to RPC for this batch
+			break
+		}
+
+		for _, eb := range electrsBlocks {
+			if eb.Height >= m.currentHeight && eb.Height <= endHeight {
+				blocksToFetch[eb.Height] = eb
+			}
+		}
+
+		// Move to the next batch (10 blocks earlier)
+		queryHeight -= 10
+		if queryHeight < m.currentHeight-9 {
+			break
+		}
+	}
+
+	// Process blocks in order, only fetching full block data for blocks with tx_count > 1
+	blocksProcessed := int64(0)
+	for height := m.currentHeight; height <= endHeight; height++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		eb, found := blocksToFetch[height]
+		if !found {
+			// Block not in electrs cache, fetch via RPC
+			m.logger.Debugf("Block %d not found in electrs cache, fetching via RPC", height)
+			block, err := m.client.GetBlockByHeight(height)
+			if err != nil {
+				m.logger.Errorf("Failed to get block at height %d via RPC: %v", height, err)
+				continue
+			}
+			select {
+			case m.blockCh <- block:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			blocksProcessed++
+			continue
+		}
+
+		// Skip blocks with only coinbase transaction (tx_count == 1)
+		if eb.TxCount <= 1 {
+			m.logger.Debugf("Skipping block %d with tx_count=%d (only coinbase)", height, eb.TxCount)
+			// Still need to update scan state for skipped blocks
+			if err := m.updateUTXOScanState(height); err != nil {
+				m.logger.Errorf("Failed to update UTXO scan state for skipped block %d: %v", height, err)
+			}
+			continue
+		}
+
+		// Block has transactions, fetch full block via RPC
+		m.logger.Debugf("Fetching block %d with tx_count=%d via RPC", height, eb.TxCount)
+		block, err := m.client.GetBlockByHeight(height)
+		if err != nil {
+			m.logger.Errorf("Failed to get block at height %d via RPC: %v", height, err)
+			continue
+		}
+
+		// Send block to processing channel
+		select {
+		case m.blockCh <- block:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		blocksProcessed++
+	}
+
+	// Update current height
+	m.currentHeight = endHeight + 1
+	m.logger.Infof("Electrs scan: processed %d/%d blocks (skipped %d empty blocks)",
+		blocksProcessed, endHeight-m.currentHeight+1+blocksProcessed, endHeight-m.currentHeight+1-blocksProcessed+1)
 
 	return nil
 }

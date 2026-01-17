@@ -146,11 +146,19 @@ func UpdateSendOrderPending(txid, externalId string, db *gorm.DB, vins []*models
 	})
 }
 
-func CloseSendOrdersForWithdrawal(db *gorm.DB, withdrawId string) error {
+// ClosedOrderInfo contains information about a closed send order for P2P broadcast
+type ClosedOrderInfo struct {
+	OrderId   string
+	Txid      string
+	OldStatus string
+}
+
+func CloseSendOrdersForWithdrawal(db *gorm.DB, withdrawId string) ([]ClosedOrderInfo, error) {
 	if withdrawId == "" {
-		return nil
+		return nil, nil
 	}
-	return db.Transaction(func(tx *gorm.DB) error {
+	var closedOrders []ClosedOrderInfo
+	err := db.Transaction(func(tx *gorm.DB) error {
 		var orderIds []string
 		if err := tx.Model(&models.VOUT{}).
 			Distinct("order_id").
@@ -161,6 +169,22 @@ func CloseSendOrdersForWithdrawal(db *gorm.DB, withdrawId string) error {
 		if len(orderIds) == 0 {
 			return nil
 		}
+
+		// Get current status of orders before closing them
+		var orders []models.SendOrder
+		if err := tx.Where("order_id IN ? AND status IN ?", orderIds, []string{"aggregating", "init", "pending"}).
+			Find(&orders).Error; err != nil {
+			return err
+		}
+
+		for _, order := range orders {
+			closedOrders = append(closedOrders, ClosedOrderInfo{
+				OrderId:   order.OrderId,
+				Txid:      order.Txid,
+				OldStatus: order.Status,
+			})
+		}
+
 		now := time.Now()
 		if err := tx.Model(&models.SendOrder{}).
 			Where("order_id IN ? AND status IN ?", orderIds, []string{"aggregating", "init", "pending"}).
@@ -188,6 +212,7 @@ func CloseSendOrdersForWithdrawal(db *gorm.DB, withdrawId string) error {
 		}
 		return nil
 	})
+	return closedOrders, err
 }
 
 // CleanProcessingSendOrders cleans up "aggregating" status send orders and their associated UTXOs on startup.

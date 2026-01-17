@@ -19,6 +19,12 @@ const (
 	P2PMessageTypeSendOrderBroadcasted P2PMessageType = "send-order-broadcasted"
 	// P2PMessageTypeSendOrderTxidUpdate is for updating send_order txid after Fireblocks signing
 	P2PMessageTypeSendOrderTxidUpdate P2PMessageType = "send-order-txid-update"
+	// P2PMessageTypeUTXOStatusUpdate is for broadcasting UTXO status changes (off-chain)
+	P2PMessageTypeUTXOStatusUpdate P2PMessageType = "utxo-status-update"
+	// P2PMessageTypeSendOrderStatusUpdate is for broadcasting SendOrder status changes
+	P2PMessageTypeSendOrderStatusUpdate P2PMessageType = "send-order-status-update"
+	// P2PMessageTypePendingBatchStatus is for broadcasting pending_batch status changes
+	P2PMessageTypePendingBatchStatus P2PMessageType = "pending-batch-status"
 )
 
 type WithdrawalStatusPayload struct {
@@ -74,6 +80,34 @@ type SendOrderTxidUpdatePayload struct {
 	ExternalId    string `json:"external_id"`     // Fireblocks transaction ID
 	OldTxid       string `json:"old_txid"`        // Unsigned transaction hash
 	NewTxid       string `json:"new_txid"`        // Signed transaction hash (on-chain)
+	UpdatedAt     int64  `json:"updated_at"`
+}
+
+// UTXOStatusUpdatePayload is the payload for UTXO status changes
+type UTXOStatusUpdatePayload struct {
+	Txid      string `json:"txid"`
+	OutIndex  int    `json:"out_index"`
+	OldStatus string `json:"old_status"`
+	NewStatus string `json:"new_status"`
+	Reason    string `json:"reason"` // "selected_for_withdrawal", "withdrawal_failed", "cleanup"
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+// SendOrderStatusUpdatePayload is the payload for SendOrder status changes
+type SendOrderStatusUpdatePayload struct {
+	OrderId   string `json:"order_id"`
+	Txid      string `json:"txid"`
+	OldStatus string `json:"old_status"`
+	NewStatus string `json:"new_status"`
+	Reason    string `json:"reason"` // "withdrawal_completed", "cleanup", "failure"
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+// PendingBatchStatusPayload is the payload for pending_batch status changes
+type PendingBatchStatusPayload struct {
+	BaseSessionID string `json:"base_session_id"`
+	BatchType     string `json:"batch_type"`
+	Status        string `json:"status"`
 	UpdatedAt     int64  `json:"updated_at"`
 }
 

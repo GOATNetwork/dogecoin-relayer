@@ -496,6 +496,9 @@ func (up *UtxoProcessor) removePendingSession(baseID string, pending *pendingBat
 
 	if err := up.state.UpdatePendingBatchStatus(baseID, models.PENDING_BATCH_STATUS_COMPLETED); err != nil {
 		up.logger.Errorf("Failed to update pending batch %s status to completed: %v", baseID, err)
+	} else {
+		// Broadcast pending_batch status update to other nodes
+		up.broadcastPendingBatchStatus(baseID, pending.batchType, models.PENDING_BATCH_STATUS_COMPLETED)
 	}
 }
 
@@ -696,4 +699,38 @@ func (up *UtxoProcessor) dbModelToPendingBatch(dbBatch *models.PendingBatch) *pe
 	}
 
 	return pending
+}
+
+// broadcastPendingBatchStatus broadcasts a pending_batch status change to other nodes
+func (up *UtxoProcessor) broadcastPendingBatchStatus(baseSessionID, batchType, status string) {
+	p2pModule, ok := module.GetModule((&p2p.P2PModule{}).Name())
+	if !ok {
+		up.logger.Debug("P2P module not available for pending_batch status broadcast")
+		return
+	}
+
+	payload := types.PendingBatchStatusPayload{
+		BaseSessionID: baseSessionID,
+		BatchType:     batchType,
+		Status:        status,
+		UpdatedAt:     time.Now().Unix(),
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		up.logger.Warnf("Failed to marshal pending_batch status payload: %v", err)
+		return
+	}
+
+	msg := types.P2PBroadcastMessage{
+		Type:      types.P2PMessageTypePendingBatchStatus,
+		SessionID: baseSessionID,
+		Payload:   payloadBytes,
+	}
+
+	if err := p2pModule.(p2p.P2PSender).BroadcastP2PMessage(msg); err != nil {
+		up.logger.Warnf("Failed to broadcast pending_batch status %s: %v", baseSessionID, err)
+	} else {
+		up.logger.Infof("Broadcasted pending_batch status: %s -> %s", baseSessionID, status)
+	}
 }
